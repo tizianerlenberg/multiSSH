@@ -5,7 +5,7 @@ import socket
 
 def server():
     dock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    dock_socket.bind(('127.0.0.1', 2233))
+    dock_socket.bind(('0.0.0.0', 2233))
     dock_socket.listen(5)
     client_socket = dock_socket.accept()[0]
     while True:
