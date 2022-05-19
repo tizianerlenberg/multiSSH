@@ -3,19 +3,32 @@
 import threading
 import socket
 import json
+import time
 
 SERVER = ("127.0.0.1", 2233)
 LOCAL_SSH = ("127.0.0.1", 2222)
 REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+ERROR = "start"
+#ERROR_QUEUE = []
 
 def startOfProgram():
+    global REMOTE_SOCK
+    global LOCAL_SOCK
+    global ERROR
+
     while True:
-        try:
-            server()
-        except Exception as e:
-            #TODO: Close sockets
-            print("Error: ", e)
+        if ERROR != "":
+            REMOTE_SOCK.close()
+            LOCAL_SOCK.close()
+            ERROR = ""
+            try:
+                server()
+            except Exception as e:
+                ERROR = e
+                print("Error in Thread MAIN: ", e)
+        print("Active Threads: ", threading.active_count())
+        time.sleep(1)
 
 def selectFrom(myList):
     outList = []
@@ -50,23 +63,27 @@ def server():
         sock = LOCAL_SOCK.accept()[0]
         threading.Thread(target=forward, args=(sock, REMOTE_SOCK,)).start();
         threading.Thread(target=forward, args=(REMOTE_SOCK, sock,)).start();
-        while True:
-            pass
     else:
         print("ERROR")
 
 def forward(source, destination):
-    string = ' '
-    while string:
-        string = source.recv(1024)
-        if string:
-            destination.sendall(string)
-        else:
-            source.shutdown(socket.SHUT_RD)
-            destination.shutdown(socket.SHUT_WR)
+    global ERROR
+    try:
+        string = ' '
+        while string:
+            string = source.recv(1024)
+            if string:
+                destination.sendall(string)
+            else:
+                source.shutdown(socket.SHUT_RD)
+                destination.shutdown(socket.SHUT_WR)
+    except Exception as e:
+        print(f"Error in Thread {threading.get_ident()}: {e}")
+        time.sleep(1)
+        ERROR = e
 
 def main():
-    server()
+    startOfProgram()
 
 if __name__ == '__main__':
     main()
