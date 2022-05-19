@@ -4,6 +4,7 @@ import threading
 import socket
 import time
 import queue
+import atexit
 
 LOCAL = ("0.0.0.0", 2233)
 LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -11,9 +12,16 @@ HOSTS = {}
 CLIENTS = queue.Queue()
 ERROR = "start"
 
+def exit_handler():
+    for value in HOSTS.values():
+        value.close()
+    LOCAL_SOCK.close()
+
 def startOfProgram():
     global LOCAL_SOCK
     global ERROR
+
+    atexit.register(exit_handler)
 
     while True:
         if ERROR != "":

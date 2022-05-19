@@ -3,6 +3,7 @@
 import threading
 import socket
 import time
+import atexit
 
 SERVER= ("127.0.0.1", 2233)
 LOCAL_SSH = ("127.0.0.1", 22)
@@ -11,10 +12,16 @@ LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 ERROR = "start"
 #ERROR_QUEUE = []
 
+def exit_handler():
+    REMOTE_SOCK.close()
+    LOCAL_SOCK.close()
+
 def startOfProgram():
     global REMOTE_SOCK
     global LOCAL_SOCK
     global ERROR
+
+    atexit.register(exit_handler)
 
     while True:
         if ERROR != "":
