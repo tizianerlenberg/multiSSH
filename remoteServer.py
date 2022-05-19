@@ -9,19 +9,24 @@ LOCAL = ("0.0.0.0", 2233)
 LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 HOSTS = {}
 CLIENTS = queue.Queue()
-EROOR = ""
+ERROR = "start"
 
 def startOfProgram():
     global LOCAL_SOCK
     global ERROR
 
-    server()
     while True:
         if ERROR != "":
-            #LOCAL_SOCK.close()
-            print("Error: ", ERROR)
+            LOCAL_SOCK.close()
             ERROR = ""
-            #server()
+            try:
+                server()
+            except Exception as e:
+                ERROR = e
+                print("Error in Thread MAIN: ", e)
+        print("Active Threads: ", threading.active_count())
+        print(HOSTS)
+        time.sleep(1)
 
 def server():
     global LOCAL
@@ -32,10 +37,6 @@ def server():
     LOCAL_SOCK.bind(LOCAL)
 
     threading.Thread(target=listener).start();
-
-    while True:
-        print(HOSTS)
-        time.sleep(1)
 
 def forward(source, destination):
     global ERROR
@@ -49,26 +50,31 @@ def forward(source, destination):
                 source.shutdown(socket.SHUT_RD)
                 destination.shutdown(socket.SHUT_WR)
     except Exception as e:
-        print(e)
-        source.close()
-        destination.close()
+        print(f"Error in Thread {threading.get_ident()}: {e}")
         ERROR = e
 
 def listener():
     global LOCAL_SOCK
     global HOSTS
     global CLIENTS
-    while True:
-        LOCAL_SOCK.listen()
-        sock = LOCAL_SOCK.accept()[0]
-        print("hi")
-        msg = sock.recv(1024).decode()
-        print(msg)
-        if msg.startswith("offer"):
-            HOSTS[msg[7:]] = sock
-        elif msg.startswith("query"):
-            sock.sendall(("\n".join(HOSTS.keys())).encode())
-            threading.Thread(target=handleRequests, args=(sock,)).start()
+    try:
+        while True:
+            LOCAL_SOCK.listen()
+            sock = LOCAL_SOCK.accept()[0]
+            print("hi")
+            msg = sock.recv(1024).decode()
+            print(msg)
+            if msg.startswith("offer"):
+                HOSTS[msg[7:]] = sock
+            elif msg.startswith("query"):
+                sock.sendall(("\n".join(HOSTS.keys())).encode())
+                threading.Thread(target=handleRequests, args=(sock,)).start()
+    except Exception as e:
+        print(f"Error in Thread {threading.get_ident()}: {e}")
+        ERROR = e
+        sock.close()
+        threading.Thread(target=listener).start();
+
 
 def handleRequests(sock):
     global HOSTS
@@ -80,15 +86,15 @@ def handleRequests(sock):
     hostSock.sendall(b"request")
     response = hostSock.recv(1024).decode()
     if response == "go":
+        print("RECEIVED GO")
         sock.sendall(b"go")
+        print("SENT MY GO")
         threading.Thread(target=forward, args=(hostSock, sock,)).start()
         threading.Thread(target=forward, args=(sock, hostSock,)).start()
-        while True:
-            pass
 
 
 def main():
-    server()
+    startOfProgram()
 
 if __name__ == '__main__':
     main()
