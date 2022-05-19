@@ -5,7 +5,8 @@ import socket
 import time
 import atexit
 
-SERVER= ("127.0.0.1", 2233)
+#SERVER= ("127.0.0.1", 2233)
+SERVER = ("192.52.45.151", 2233)
 LOCAL_SSH = ("127.0.0.1", 22)
 REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
