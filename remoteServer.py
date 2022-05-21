@@ -48,6 +48,7 @@ def server():
 
 def forward(source, destination):
     global ERROR
+    myError = "LIGHT ERROR"
     try:
         string = ' '
         while string:
@@ -58,13 +59,16 @@ def forward(source, destination):
                 source.shutdown(socket.SHUT_RD)
                 destination.shutdown(socket.SHUT_WR)
     except Exception as e:
-        print(f"Error in Thread {threading.get_ident()}: {e}")
-        ERROR = e
+        myError = e
+    finally:
+        print(f"Error in Thread {threading.get_ident()}: {myError}")
+        ERROR = myError
 
 def listener():
     global LOCAL_SOCK
     global HOSTS
     global CLIENTS
+    myError = "LIGHT ERROR"
     try:
         while True:
             LOCAL_SOCK.listen()
@@ -78,8 +82,10 @@ def listener():
                 sock.sendall(("\n".join(HOSTS.keys())).encode())
                 threading.Thread(target=handleRequests, args=(sock,)).start()
     except Exception as e:
-        print(f"Error in Thread {threading.get_ident()}: {e}")
-        ERROR = e
+        myError = e
+    finally:
+        print(f"Error in Thread {threading.get_ident()}: {myError}")
+        ERROR = myError
         sock.close()
         threading.Thread(target=listener).start();
 
