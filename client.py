@@ -6,10 +6,10 @@ import json
 import time
 import atexit
 
-SERVER = ("127.0.0.1", 2233)
-#SERVER = ("192.52.45.151", 2233)
-LOCAL_SSH = ("127.0.0.1", 2222)
-#LOCAL_SSH = ("0.0.0.0", 2222)
+#SERVER = ("127.0.0.1", 2233)
+SERVER = ("192.52.45.151", 2233)
+#LOCAL_SSH = ("127.0.0.1", 2222)
+LOCAL_SSH = ("0.0.0.0", 2222)
 REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 ERROR = "start"
