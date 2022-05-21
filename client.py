@@ -6,10 +6,10 @@ import json
 import time
 import atexit
 
-#SERVER = ("127.0.0.1", 2233)
-SERVER = ("192.52.45.151", 2233)
-#LOCAL_SSH = ("127.0.0.1", 2222)
-LOCAL_SSH = ("0.0.0.0", 2222)
+SERVER = ("127.0.0.1", 2233)
+#SERVER = ("192.52.45.151", 2233)
+LOCAL_SSH = ("127.0.0.1", 2222)
+#LOCAL_SSH = ("0.0.0.0", 2222)
 REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 ERROR = "start"
@@ -77,6 +77,7 @@ def server():
 
 def forward(source, destination):
     global ERROR
+    myError = "LIGHT ERROR"
     try:
         string = ' '
         while string:
@@ -87,9 +88,11 @@ def forward(source, destination):
                 source.shutdown(socket.SHUT_RD)
                 destination.shutdown(socket.SHUT_WR)
     except Exception as e:
-        print(f"Error in Thread {threading.get_ident()}: {e}")
-        time.sleep(5)
-        ERROR = e
+        myError = e
+    finally:
+        print(f"Error in Thread {threading.get_ident()}: {myError}")
+        ERROR = myError
+        time.sleep(2)
 
 def main():
     startOfProgram()
