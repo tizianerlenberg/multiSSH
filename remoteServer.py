@@ -7,7 +7,7 @@ import queue
 import atexit
 
 LOCAL = ("0.0.0.0", 2233)
-LOCAL_SOCK = ""
+LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 HOSTS = {}
 CLIENTS = queue.Queue()
 ERROR = "start"
@@ -15,8 +15,7 @@ ERROR = "start"
 def exit_handler():
     for value in HOSTS.values():
         value.close()
-    if LOCAL_SOCK != "":
-        LOCAL_SOCK.close()
+    LOCAL_SOCK.close()
 
 def startOfProgram():
     global LOCAL_SOCK
@@ -26,6 +25,7 @@ def startOfProgram():
 
     while True:
         if ERROR != "":
+            LOCAL_SOCK.close()
             ERROR = ""
             try:
                 server()
@@ -41,9 +41,8 @@ def server():
     global LOCAL_SOCK
     global HOSTS
 
-    if LOCAL_SOCK == "":
-        LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        LOCAL_SOCK.bind(LOCAL)
+    LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    LOCAL_SOCK.bind(LOCAL)
 
     threading.Thread(target=listener).start();
 
