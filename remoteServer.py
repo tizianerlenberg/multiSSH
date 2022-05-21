@@ -77,7 +77,7 @@ def listener():
             msg = sock.recv(1024).decode()
             print(msg)
             if msg.startswith("offer"):
-                if HOSTS.has_keys(msg[7:]):
+                if (msg[7:] in HOSTS):
                     HOSTS[msg[7:]].close()
                 HOSTS[msg[7:]] = sock
             elif msg.startswith("query"):
