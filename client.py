@@ -84,14 +84,13 @@ def forward(source, destination):
             string = source.recv(1024)
             if string:
                 destination.sendall(string)
-            else:
-                source.shutdown(socket.SHUT_RD)
-                destination.shutdown(socket.SHUT_WR)
     except Exception as e:
         myError = e
     finally:
         print(f"Error in Thread {threading.get_ident()}: {myError}")
         ERROR = myError
+        source.shutdown(socket.SHUT_RD)
+        destination.shutdown(socket.SHUT_WR)
         time.sleep(2)
 
 def main():

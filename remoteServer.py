@@ -30,26 +30,34 @@ logger.addHandler(stream_handler)
 #-------------------------------------------------------------------------------
 
 def requestHandler(sock, addr, hosts, clients):
-    logger.info(f"sending host list to client: {addr}")
-    sock.sendall(("\n".join(hosts.keys())).encode())
-    request = sock.recv(1024).decode()
-    request = request[9:]
-    logger.info(f"received request for host: {request}")
-    hostSock = hosts[request]
-
-    logger.info(f"requesting connection from host: {request}")
-    hostSock.sendall(b"request")
-    response = hostSock.recv(1024).decode()
-    if response == "go":
-        logger.info(f"received ok from host: {request}")
-        logger.info(f"sending go to client: {addr}")
-        sock.sendall(b"go")
-        logger.info(f"connecting client: {addr} with host: {request}")
-        utils.combinedForward(sock, hostSock)
-        clients[addr]=sock
-
-def listener(sock, waitingConnections):
-    pass
+    logger.info("startet requestHandler")
+    try:
+        logger.info(f"sending host list to client: {addr}")
+        sock.sendall(("\n".join(hosts.keys())).encode())
+        request = sock.recv(1024).decode()
+        request = request[9:]
+        logger.info(f"received request for host: {request}")
+        hostSock = hosts[request][0]
+        logger.info(f"requesting connection from host: {request}")
+        try:
+            hostSock.sendall(b"request")
+            response = hostSock.recv(1024).decode()
+        except:
+            logger.exception("ERROR IN REQUEST_HANDLER: HOST UNREACHABLE")
+            logger.info(f"closing unreachable host socket")
+            hostSock.close()
+            logger.info(f"closing unreachable client socket")
+            sock.close()
+        else:
+            if response == "go":
+                logger.info(f"received ok from host: {request}")
+                logger.info(f"sending go to client: {addr}")
+                sock.sendall(b"go")
+                logger.info(f"connecting client: {addr} with host: {request}")
+                utils.combinedForward(sock, hostSock)
+                clients[addr]=sock
+    except:
+        logger.exception("ERROR IN REQUEST_HANDLER")
 
 def server(sock):
     waitingConnections= queue.Queue()
@@ -57,7 +65,7 @@ def server(sock):
     availableHosts= {}
     try:
         logger.info(f"starting listener")
-        listener(sock, waitingConnections)
+        threading.Thread(target=utils.listener, args=(sock, waitingConnections,)).start()
         while True:
             try:
                 conn, msg= waitingConnections.get(block=False)
@@ -68,8 +76,7 @@ def server(sock):
                 if msg.startswith("offer"):
                     availableHosts[msg[7:]] = conn
                 elif msg.startswith("query"):
-                    requestHandler(conn[0], conn[1], availableHosts, connectedClients)
-            logger.debug(f"nothing to do")
+                    threading.Thread(target=requestHandler, args=(conn[0], conn[1], availableHosts, connectedClients,)).start()
             time.sleep(1)
     except:
         logger.exception(f"CRITICAL ERROR IN SERVER")
@@ -92,7 +99,7 @@ def server(sock):
         logger.info(f"cleaning up connected hosts")
         for key, host in availableHosts.items():
             logger.info(f"closing host connection: {key}")
-            host.close()
+            host[0].close()
 
 def startOfProgram():
     addr = ("0.0.0.0", 2233)

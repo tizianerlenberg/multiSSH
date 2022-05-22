@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import threading
+import socket
 import queue
 import logging
 import sys
@@ -36,11 +37,11 @@ class LockedVar():
     def get(self):
         return self.var
     def set(self, val):
-        self.lock.aquire()
+        self.lock.acquire()
         self.var=val
         self.lock.release()
     def set_nowait(self, val):
-        if self.lock.aquire(False):
+        if self.lock.acquire(False):
             self.var=val
             self.lock.release()
         else:
@@ -53,11 +54,11 @@ class LockedDict():
     def get(self, key):
         return self.dict[key]
     def put(self, key, val):
-        self.lock.aquire()
+        self.lock.acquire()
         self.dict[key]=val
         self.lock.release()
     def put_nowait(self, key, val):
-        if self.lock.aquire(False):
+        if self.lock.acquire(False):
             self.dict[key]=val
             self.lock.release()
         else:
@@ -66,6 +67,7 @@ class LockedDict():
         pass
 
 def forward(source, destination):
+    threadName=threading.current_thread().name
     try:
         string = ' '
         while string:
@@ -73,8 +75,11 @@ def forward(source, destination):
             if string:
                 destination.sendall(string)
     except:
-        logger.exception("ERROR IN FORWARD")
+        logger.exception(f"ERROR IN FORWARD ({threadName})")
     finally:
+        logger.info(f"{threadName}: source was {source.getpeername()}")
+        logger.info(f"{threadName}: destination was {destination.getpeername()}")
+        logger.info(f"closing forward ({threadName})")
         source.shutdown(socket.SHUT_RD)
         destination.shutdown(socket.SHUT_WR)
 
@@ -85,6 +90,10 @@ def combinedForward(source, destination, done=LockedVar()):
     t2.start()
     t1.join()
     t2.join()
+    logger.info(f"combinedForward: closing socket: {source.getpeername()}")
+    source.close()
+    logger.info(f"combinedForward: closing socket: {destination.getpeername()}")
+    destination.close()
     done.set(True)
 
 def selectFrom(myList):
