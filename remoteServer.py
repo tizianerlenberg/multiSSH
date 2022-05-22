@@ -39,6 +39,7 @@ def requestHandler(sock, addr, hosts, clients):
         logger.info(f"received request for host: {request}")
         hostSock = hosts[request][0]
         logger.info(f"requesting connection from host: {request}")
+        # See if host is closed
         try:
             hostSock.sendall(b"request")
             response = hostSock.recv(1024).decode()
