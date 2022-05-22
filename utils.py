@@ -3,18 +3,23 @@
 import threading
 import queue
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.CRITICAL)
+logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter('[%(name)s] %(message)s')
 
-#file_handler = logging.FileHandler('sample.log')
-#file_handler.setLevel(logging.ERROR)
-#file_handler.setFormatter(formatter)
+if __name__ != '__main__':
+    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}_imported_{__name__}.log")
+else:
+    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}.log")
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.INFO)
 
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
+stream_handler.setLevel(logging.DEBUG)
 
 #logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
@@ -60,25 +65,22 @@ class LockedDict():
     def pop(self, key):
         pass
 
-def forward(source, destination, errorQueue=None):
+def forward(source, destination):
     try:
         string = ' '
         while string:
             string = source.recv(1024)
             if string:
                 destination.sendall(string)
-    except Exception as e:
-        if errorQueue:
-            errorQueue.put([threading.current_thread().name, e])
-        else:
-            print(f"Error in {threading.current_thread().name}: {e}")
+    except:
+        logger.exception("ERROR IN FORWARD")
     finally:
         source.shutdown(socket.SHUT_RD)
         destination.shutdown(socket.SHUT_WR)
 
-def combinedForward(source, destination, done=LockedVar(), errorQueue=None):
-    t1= threading.Thread(target=forward, args=(source, destination, errorQueue,))
-    t2= threading.Thread(target=forward, args=(destination, source, errorQueue,))
+def combinedForward(source, destination, done=LockedVar()):
+    t1= threading.Thread(target=forward, args=(source, destination,))
+    t2= threading.Thread(target=forward, args=(destination, source,))
     t1.start()
     t2.start()
     t1.join()
@@ -94,33 +96,13 @@ def selectFrom(myList):
     myChoice = int(input("Please choose a number: "))
     return  myList[myChoice-1]
 
-def listener(sock, connectionQueue, stop=None, done=LockedVar(), errorQueue=None):
+def listener(sock, connectionQueue, stop=None, done=LockedVar()):
     try:
         while True:
             conn= sock.accept()
             msg= conn[0].recv(1024).decode()
             connectionQueue.put([conn, msg])
-    except Exception as e:
-        if errorQueue:
-            errorQueue.put([threading.current_thread().name, e])
-        else:
-            print(f"Error in {threading.current_thread().name}: {e}")
+    except:
+        logger.exception("ERROR IN LISTENER")
     finally:
         done.set(True)
-
-def errorListner(errorQueue):
-    while True:
-        newError=errorQueue.get()
-        if newError == "END":
-            break
-        print(f"[ERROR] {newError[0]}: {newError[1]}")
-
-
-import traceback
-
-try:
-    raise Exception("hallo")
-except:
-    logger.exception("my text")
-
-print("hi")
