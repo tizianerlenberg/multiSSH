@@ -11,12 +11,14 @@ logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter('[%(name)s] %(message)s')
 
+"""
 if __name__ != '__main__':
     file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}_imported_{__name__}.log")
 else:
     file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}.log")
 file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.INFO)
+"""
 
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
@@ -66,6 +68,14 @@ class LockedDict():
     def pop(self, key):
         pass
 
+def getSockName(sock):
+    try:
+        peer=sock.getpeername()
+    except:
+        return f"{sock.getsockname()}"
+    else:
+        return f"[{sock.getsockname()} connected to {peer}]"
+
 def forward(source, destination):
     threadName=threading.current_thread().name
     try:
@@ -75,10 +85,10 @@ def forward(source, destination):
             if string:
                 destination.sendall(string)
     except:
-        logger.exception(f"ERROR IN FORWARD ({threadName})")
-    finally:
+        logger.exception(f"Error in ({threadName})")
         logger.info(f"{threadName}: source was {source.getpeername()}")
         logger.info(f"{threadName}: destination was {destination.getpeername()}")
+    finally:
         logger.info(f"closing forward ({threadName})")
         source.shutdown(socket.SHUT_RD)
         destination.shutdown(socket.SHUT_WR)
@@ -90,9 +100,9 @@ def combinedForward(source, destination, done=LockedVar()):
     t2.start()
     t1.join()
     t2.join()
-    logger.info(f"combinedForward: closing socket: {source.getpeername()}")
+    logger.info(f"combinedForward: closing socket: {getSockName(sock)}")
     source.close()
-    logger.info(f"combinedForward: closing socket: {destination.getpeername()}")
+    logger.info(f"combinedForward: closing socket: {getSockName(destination)}")
     destination.close()
     done.set(True)
 
