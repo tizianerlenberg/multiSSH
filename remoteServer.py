@@ -6,18 +6,23 @@ import time
 import queue
 import utils
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter('[%(name)s] %(message)s')
 
-#file_handler = logging.FileHandler('sample.log')
-#file_handler.setLevel(logging.ERROR)
-#file_handler.setFormatter(formatter)
+if __name__ != '__main__':
+    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}_imported_{__name__}.log")
+else:
+    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}.log")
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.INFO)
 
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
+stream_handler.setLevel(logging.DEBUG)
 
 #logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
@@ -64,7 +69,7 @@ def server(sock):
                     availableHosts[msg[7:]] = conn
                 elif msg.startswith("query"):
                     requestHandler(conn[0], conn[1], availableHosts, connectedClients)
-            logger.info(f"nothing to do")
+            logger.debug(f"nothing to do")
             time.sleep(1)
     except:
         logger.exception(f"CRITICAL ERROR IN SERVER")
