@@ -86,6 +86,8 @@ def server(sock):
                     logger.warning(f"Host {key}, {availableHosts[key][1]} is down, removing from available hosts")
                     availableHosts.pop(key)
             time.sleep(1)
+    except KeyboardInterrupt:
+        raise
     except:
         logger.critical(f"error")
         logger.exception("")
@@ -113,6 +115,7 @@ def server(sock):
 def startOfProgram():
     addr = ("127.0.0.1", 2233)
     #addr = ("0.0.0.0", 2233)
+    noWait=False
 
     while True:
         try:
@@ -123,13 +126,18 @@ def startOfProgram():
             sock.listen()
             logger.info(f"starting server")
             server(sock)
+        except KeyboardInterrupt:
+            logger.info("Received Keyboard Interrupt")
+            noWait=True
+            break
         except:
             logger.critical(f"error in main")
             logger.exception("")
         finally:
             logger.info(f"shutdown")
             sock.close()
-            time.sleep(1)
+            if not noWait:
+                time.sleep(1)
 
 def main():
     startOfProgram()
