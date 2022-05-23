@@ -4,79 +4,69 @@ import threading
 import socket
 import time
 import atexit
+import logging
 
-#SERVER= ("127.0.0.1", 2233)
-SERVER = ("192.52.45.151", 2233)
-LOCAL_SSH = ("127.0.0.1", 22)
-REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-ERROR = "start"
-#ERROR_QUEUE = []
+# own libraries
+import utils
+import logHandler
 
-def exit_handler():
-    REMOTE_SOCK.close()
-    LOCAL_SOCK.close()
+logger = logging.getLogger(__name__)
+# don't change log level here! change it in logHandler.py instead
+logger.setLevel(logging.DEBUG)
+
+logger.addHandler(logHandler.stream_handler)
+logger.addHandler(logHandler.file_handler)
+
+# ------------------------------------------------------------------------------
+
+def server(remoteSock, localAddr):
+    localSshSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    try:
+        while True:
+            logger.info(f"sending offer to server")
+            remoteSock.sendall(("offer: " + socket.gethostname()).encode())
+            logger.info(f"waiting for request from server")
+            serverResponse = remoteSock.recv(1024).decode()
+            if serverResponse == "request":
+                logger.info(f"received request from server")
+                break
+            else:
+                logger.error(f"expected request from server, got: {serverResponse}")
+
+        logger.info(f"connecting to local ssh server")
+        localSshSock.connect(localAddr)
+        logger.info(f"successfully connected to local ssh server")
+
+        logger.info(f"sending go to remote server")
+        remoteSock.sendall(b"go")
+        logger.info(f"connecting remote socket {utils.getSockName(remoteSock)} to local socket {utils.getSockName(localSshSock)}")
+        utils.combinedForward(remoteSock, localSshSock)
+    finally:
+        logger.info(f"closing local socket")
+        localSshSock.close()
 
 def startOfProgram():
-    global REMOTE_SOCK
-    global LOCAL_SOCK
-    global ERROR
-
-    atexit.register(exit_handler)
+    #addr = ("127.0.0.1", 2233)
+    addr = ("192.52.45.151", 2233)
+    localAddr = ("127.0.0.1", 22)
 
     while True:
-        if ERROR != "":
-            REMOTE_SOCK.close()
-            LOCAL_SOCK.close()
-            ERROR = ""
-            try:
-                server()
-            except Exception as e:
-                ERROR = e
-                print("Error in Thread MAIN: ", e)
-        print("Active Threads: ", threading.active_count())
-        time.sleep(1)
-
-def server():
-    global SERVER
-    global LOCAL_SSH
-    global REMOTE_SOCK
-    global LOCAL_SOCK
-
-    REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    REMOTE_SOCK.connect(SERVER)
-
-    while True:
-        REMOTE_SOCK.sendall(("offer: " + socket.gethostname()).encode())
-        serverResponse = REMOTE_SOCK.recv(1024).decode()
-        if serverResponse == "request":
-            break
-
-    LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    LOCAL_SOCK.connect(LOCAL_SSH)
-
-    REMOTE_SOCK.sendall(b"go")
-    print("Sent my go")
-    threading.Thread(target=forward, args=(REMOTE_SOCK, LOCAL_SOCK,)).start()
-    threading.Thread(target=forward, args=(LOCAL_SOCK, REMOTE_SOCK,)).start()
-
-
-def forward(source, destination):
-    global ERROR
-    myError = "LIGHT ERROR"
-    try:
-        string = ' '
-        while string:
-            string = source.recv(1024)
-            if string:
-                destination.sendall(string)
-    except Exception as e:
-        myError = e
-    finally:
-        print(f"Error in Thread {threading.get_ident()}: {myError}")
-        ERROR = myError
-        source.shutdown(socket.SHUT_RD)
-        destination.shutdown(socket.SHUT_WR)
+        try:
+            remoteServer= socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            logger.info(f"start")
+            logger.info(f"connecting to remote server")
+            remoteServer.connect(addr)
+            logger.info(f"connected to remote server")
+            logger.info(f"starting own server")
+            server(remoteServer, localAddr)
+        except:
+            logger.exception(f"CRITICAL ERROR IN MAIN")
+        finally:
+            logger.info("closing remote socket")
+            remoteServer.close()
+            logger.info(f"shutdown")
+            time.sleep(1)
 
 def main():
     startOfProgram()

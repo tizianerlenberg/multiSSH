@@ -4,8 +4,10 @@ import threading
 import socket
 import time
 import queue
-import utils
 import logging
+
+# own libraries
+import utils
 import logHandler
 
 logger = logging.getLogger(__name__)
@@ -15,7 +17,7 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(logHandler.stream_handler)
 logger.addHandler(logHandler.file_handler)
 
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 def requestHandler(sock, addr, hosts, clients):
     logger.info("startet requestHandler")
@@ -27,7 +29,7 @@ def requestHandler(sock, addr, hosts, clients):
         logger.info(f"received request for host: {request}")
         hostSock = hosts[request][0]
         logger.info(f"requesting connection from host: {request}")
-        # See if host is closed
+        # TODO: See if host is closed
         try:
             hostSock.sendall(b"request")
             response = hostSock.recv(1024).decode()
@@ -35,7 +37,7 @@ def requestHandler(sock, addr, hosts, clients):
             logger.exception("ERROR IN REQUEST_HANDLER: HOST UNREACHABLE")
             logger.info(f"closing unreachable host socket")
             hostSock.close()
-            logger.info(f"closing unreachable client socket")
+            logger.info(f"closing client socket because requested host is not available")
             sock.close()
         else:
             if response == "go":
@@ -91,7 +93,9 @@ def server(sock):
             host[0].close()
 
 def startOfProgram():
+    #addr = ("127.0.0.1", 2233)
     addr = ("0.0.0.0", 2233)
+
     while True:
         try:
             logger.info(f"start")

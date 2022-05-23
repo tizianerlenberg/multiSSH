@@ -4,6 +4,8 @@ import threading
 import socket
 import queue
 import logging
+
+#own libraries
 import logHandler
 
 logger = logging.getLogger(__name__)
@@ -13,7 +15,7 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(logHandler.stream_handler)
 logger.addHandler(logHandler.file_handler)
 
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 class Locked(Exception):
     pass
@@ -75,7 +77,7 @@ def forward(source, destination):
         logger.info(f"{threadName}: source was {source.getpeername()}")
         logger.info(f"{threadName}: destination was {destination.getpeername()}")
     finally:
-        logger.info(f"closing forward ({threadName})")
+        logger.info(f"received disconnect, closing forward ({threadName})")
         source.shutdown(socket.SHUT_RD)
         destination.shutdown(socket.SHUT_WR)
 
@@ -86,7 +88,7 @@ def combinedForward(source, destination, done=LockedVar()):
     t2.start()
     t1.join()
     t2.join()
-    logger.info(f"combinedForward: closing socket: {getSockName(sock)}")
+    logger.info(f"combinedForward: closing socket: {getSockName(source)}")
     source.close()
     logger.info(f"combinedForward: closing socket: {getSockName(destination)}")
     destination.close()

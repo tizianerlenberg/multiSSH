@@ -2,96 +2,78 @@
 
 import threading
 import socket
-import json
 import time
-import atexit
+import logging
 
-#SERVER = ("127.0.0.1", 2233)
-SERVER = ("192.52.45.151", 2233)
-#LOCAL_SSH = ("127.0.0.1", 2222)
-LOCAL_SSH = ("0.0.0.0", 2222)
-REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-ERROR = "start"
-#ERROR_QUEUE = []
+# own libraries
+import utils
+import logHandler
 
-def exit_handler():
-    REMOTE_SOCK.close()
-    LOCAL_SOCK.close()
+logger = logging.getLogger(__name__)
+# don't change log level here! change it in logHandler.py instead
+logger.setLevel(logging.DEBUG)
+
+logger.addHandler(logHandler.stream_handler)
+logger.addHandler(logHandler.file_handler)
+
+# ------------------------------------------------------------------------------
+
+def server(remoteSock, localAddr):
+    localSshSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    logger.info(f"sending query to server")
+    remoteSock.sendall(b"query")
+    logger.info(f"waiting for host list from server")
+    availableHosts = remoteSock.recv(1024).decode()
+    availableHosts = availableHosts.split("\n")
+    myChoice = utils.selectFrom(availableHosts)
+    logger.info(f"got user input")
+
+    logger.info(f"sending request to server")
+    remoteSock.sendall(("request: " + myChoice).encode())
+
+    logger.info(f"waiting for go from remote server")
+    ack = remoteSock.recv(1024).decode()
+    if ack == "go":
+        logger.info(f"received go from server")
+        try:
+            logger.info(f"binding to local socket")
+            localSshSock.bind(localAddr)
+            localSshSock.listen(1)
+            logger.info(f"waiting for connections to local socket")
+            conn = localSshSock.accept()[0]
+            logger.info(f"received connection to local socket")
+            logger.info(f"starting forward")
+            utils.combinedForward(conn, remoteSock)
+        except:
+            logger.exception("Exception while trying to start forward")
+        finally:
+            logger.info("closing local socket")
+            localSshSock.close()
+
+    else:
+        logger.error("did not receive go from server, shutting down")
 
 def startOfProgram():
-    global REMOTE_SOCK
-    global LOCAL_SOCK
-    global ERROR
+    #addr = ("127.0.0.1", 2233)
+    addr = ("192.52.45.151", 2233)
+    #localAddr = ("0.0.0.0", 2222)
+    localAddr = ("127.0.0.1", 2222)
 
-    atexit.register(exit_handler)
-
-    while True:
-        if ERROR != "":
-            REMOTE_SOCK.close()
-            LOCAL_SOCK.close()
-            ERROR = ""
-            try:
-                server()
-            except Exception as e:
-                ERROR = e
-                print("Error in Thread MAIN: ", e)
-        print("Active Threads: ", threading.active_count())
-        time.sleep(1)
-
-def selectFrom(myList):
-    outList = []
-    for index, value in enumerate(myList):
-        outList.append(str(index+1) + " / " + value)
-    print("\n".join(outList))
-    print()
-    myChoice = int(input("Please choose a number: "))
-    return  myList[myChoice-1]
-
-def server():
-    global SERVER
-    global REMOTE_SOCK
-    global LOCAL_SSH
-    global LOCAL_SOCK
-
-    REMOTE_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    REMOTE_SOCK.connect(SERVER)
-    REMOTE_SOCK.sendall(b"query")
-    availableHosts = REMOTE_SOCK.recv(1024).decode()
-    availableHosts = availableHosts.split("\n")
-    myChoice = selectFrom(availableHosts)
-    print(myChoice)
-
-    REMOTE_SOCK.sendall(("request: " + myChoice).encode())
-
-    ack = REMOTE_SOCK.recv(1024).decode()
-    if ack == "go":
-        LOCAL_SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        LOCAL_SOCK.bind(LOCAL_SSH)
-        LOCAL_SOCK.listen(1)
-        sock = LOCAL_SOCK.accept()[0]
-        threading.Thread(target=forward, args=(sock, REMOTE_SOCK,)).start();
-        threading.Thread(target=forward, args=(REMOTE_SOCK, sock,)).start();
-    else:
-        print("ERROR")
-
-def forward(source, destination):
-    global ERROR
-    myError = "LIGHT ERROR"
     try:
-        string = ' '
-        while string:
-            string = source.recv(1024)
-            if string:
-                destination.sendall(string)
-    except Exception as e:
-        myError = e
+        logger.info(f"start")
+        logger.info(f"connecting to remote server")
+        sock= socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(addr)
+        logger.info(f"connected to remote server")
+        logger.info(f"starting own server")
+        server(sock, localAddr)
+    except:
+        logger.exception(f"CRITICAL ERROR IN MAIN")
     finally:
-        print(f"Error in Thread {threading.get_ident()}: {myError}")
-        ERROR = myError
-        source.shutdown(socket.SHUT_RD)
-        destination.shutdown(socket.SHUT_WR)
-        time.sleep(2)
+        logger.info("closing remote socket")
+        sock.close()
+        logger.info(f"shutdown")
 
 def main():
     startOfProgram()
