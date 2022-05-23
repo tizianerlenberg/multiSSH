@@ -27,9 +27,9 @@ def requestHandler(sock, addr, hosts, clients):
         request = sock.recv(1024).decode()
         request = request[9:]
         logger.info(f"received request for host: {request}")
+        logger.debug("searching host dictonary")
         hostSock = hosts[request][0]
         logger.info(f"requesting connection from host: {request}")
-        # TODO: See if host is closed
         try:
             hostSock.sendall(b"request")
             response = hostSock.recv(1024).decode()
@@ -71,6 +71,8 @@ def server(sock):
                 elif msg.startswith("query"):
                     threading.Thread(target=requestHandler, args=(conn[0], conn[1], availableHosts, connectedClients,)).start()
             time.sleep(1)
+            # TODO: Check if host is closed
+            # TODO: Check if Listener is down
     except:
         logger.critical(f"error")
         logger.exception("")
