@@ -50,6 +50,7 @@ def startOfProgram():
     addr = ("127.0.0.1", 2233)
     #addr = ("192.52.45.151", 2233)
     localAddr = ("127.0.0.1", 22)
+    noWait=False
 
     while True:
         try:
@@ -60,6 +61,10 @@ def startOfProgram():
             logger.info(f"connected to remote server")
             logger.debug(f"starting own server")
             server(remoteServer, localAddr)
+        except KeyboardInterrupt:
+            logger.info("Received Keyboard Interrupt")
+            noWait=True
+            break
         except:
             logger.critical(f"error")
             logger.exception("")
@@ -67,7 +72,8 @@ def startOfProgram():
             logger.debug("closing remote socket")
             remoteServer.close()
             logger.info(f"shutdown")
-            time.sleep(1)
+            if not noWait:
+                time.sleep(1)
 
 def main():
     startOfProgram()
