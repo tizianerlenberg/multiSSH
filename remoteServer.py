@@ -23,7 +23,11 @@ def requestHandler(sock, addr, hosts, clients):
     logger.debug("started requestHandler")
     try:
         logger.info(f"sending host list to client: {addr}")
-        sock.sendall(("\n".join(hosts.keys())).encode())
+        if hosts:
+            sock.sendall(("\n".join(hosts.keys())).encode())
+        else:
+            sock.sendall(b"EMPTY")
+            raise Exception("No hosts available")
         request = sock.recv(1024).decode()
         request = request[9:]
         logger.info(f"received request for host: {request}")
@@ -56,9 +60,11 @@ def server(sock):
     waitingConnections= queue.Queue()
     connectedClients= {}
     availableHosts= {}
+    listnerIsDown= utils.LockedVar(False)
+
     try:
         logger.info(f"starting listener")
-        threading.Thread(target=utils.listener, args=(sock, waitingConnections,)).start()
+        threading.Thread(target=utils.listener, args=(sock, waitingConnections, listnerIsDown,)).start()
         while True:
             try:
                 conn, msg= waitingConnections.get(block=False)
@@ -70,9 +76,16 @@ def server(sock):
                     availableHosts[msg[7:]] = conn
                 elif msg.startswith("query"):
                     threading.Thread(target=requestHandler, args=(conn[0], conn[1], availableHosts, connectedClients,)).start()
+
+            if listnerIsDown.get():
+                logger.critical("Listener is down")
+                raise Exception("Listener is down")
+
+            for key in list(availableHosts.keys()).copy():
+                if availableHosts[key][0]._closed:
+                    logger.warning(f"Host {key}, {availableHosts[key][1]} is down, removing from available hosts")
+                    availableHosts.pop(key)
             time.sleep(1)
-            # TODO: Check if host is closed
-            # TODO: Check if Listener is down
     except:
         logger.critical(f"error")
         logger.exception("")
