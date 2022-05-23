@@ -58,11 +58,14 @@ class LockedDict():
 
 def getSockName(sock):
     try:
-        peer=sock.getpeername()
+        try:
+            peer=sock.getpeername()
+        except:
+            return f"{sock.getsockname()}"
+        else:
+            return f"[{sock.getsockname()} connected to {peer}]"
     except:
-        return f"{sock.getsockname()}"
-    else:
-        return f"[{sock.getsockname()} connected to {peer}]"
+        return "socket closed"
 
 def forward(source, destination):
     threadName=threading.current_thread().name
