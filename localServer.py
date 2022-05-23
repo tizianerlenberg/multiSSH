@@ -36,19 +36,19 @@ def server(remoteSock, localAddr):
 
         logger.info(f"connecting to local ssh server")
         localSshSock.connect(localAddr)
-        logger.info(f"successfully connected to local ssh server")
+        logger.debug(f"successfully connected to local ssh server")
 
         logger.info(f"sending go to remote server")
         remoteSock.sendall(b"go")
         logger.info(f"connecting remote socket {utils.getSockName(remoteSock)} to local socket {utils.getSockName(localSshSock)}")
         utils.combinedForward(remoteSock, localSshSock)
     finally:
-        logger.info(f"closing local socket")
+        logger.debug(f"closing local socket")
         localSshSock.close()
 
 def startOfProgram():
-    #addr = ("127.0.0.1", 2233)
-    addr = ("192.52.45.151", 2233)
+    addr = ("127.0.0.1", 2233)
+    #addr = ("192.52.45.151", 2233)
     localAddr = ("127.0.0.1", 22)
 
     while True:
@@ -58,12 +58,13 @@ def startOfProgram():
             logger.info(f"connecting to remote server")
             remoteServer.connect(addr)
             logger.info(f"connected to remote server")
-            logger.info(f"starting own server")
+            logger.debug(f"starting own server")
             server(remoteServer, localAddr)
         except:
-            logger.exception(f"CRITICAL ERROR IN MAIN")
+            logger.critical(f"error")
+            logger.exception("")
         finally:
-            logger.info("closing remote socket")
+            logger.debug("closing remote socket")
             remoteServer.close()
             logger.info(f"shutdown")
             time.sleep(1)

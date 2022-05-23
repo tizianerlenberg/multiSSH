@@ -27,17 +27,17 @@ def server(remoteSock, localAddr):
     availableHosts = remoteSock.recv(1024).decode()
     availableHosts = availableHosts.split("\n")
     myChoice = utils.selectFrom(availableHosts)
-    logger.info(f"got user input")
+    logger.debug(f"got user input")
 
     logger.info(f"sending request to server")
     remoteSock.sendall(("request: " + myChoice).encode())
 
-    logger.info(f"waiting for go from remote server")
+    logger.debug(f"waiting for go from remote server")
     ack = remoteSock.recv(1024).decode()
     if ack == "go":
         logger.info(f"received go from server")
         try:
-            logger.info(f"binding to local socket")
+            logger.debug(f"binding to local socket")
             localSshSock.bind(localAddr)
             localSshSock.listen(1)
             logger.info(f"waiting for connections to local socket")
@@ -46,19 +46,20 @@ def server(remoteSock, localAddr):
             logger.info(f"starting forward")
             utils.combinedForward(conn, remoteSock)
         except:
-            logger.exception("Exception while trying to start forward")
+            logger.error("Exception while trying to start forward")
+            logger.exception("")
         finally:
-            logger.info("closing local socket")
+            logger.debug("closing local socket")
             localSshSock.close()
 
     else:
-        logger.error("did not receive go from server, shutting down")
+        logger.warning("did not receive go from server, shutting down")
 
 def startOfProgram():
-    #addr = ("127.0.0.1", 2233)
-    addr = ("192.52.45.151", 2233)
-    #localAddr = ("0.0.0.0", 2222)
-    localAddr = ("127.0.0.1", 2222)
+    addr = ("127.0.0.1", 2233)
+    #addr = ("192.52.45.151", 2233)
+    localAddr = ("0.0.0.0", 2222)
+    #localAddr = ("127.0.0.1", 2222)
 
     try:
         logger.info(f"start")
@@ -69,9 +70,10 @@ def startOfProgram():
         logger.info(f"starting own server")
         server(sock, localAddr)
     except:
-        logger.exception(f"CRITICAL ERROR IN MAIN")
+        logger.critical(f"error in main")
+        logger.exception("")
     finally:
-        logger.info("closing remote socket")
+        logger.debug("closing remote socket")
         sock.close()
         logger.info(f"shutdown")
 

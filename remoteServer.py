@@ -20,7 +20,7 @@ logger.addHandler(logHandler.file_handler)
 # ------------------------------------------------------------------------------
 
 def requestHandler(sock, addr, hosts, clients):
-    logger.info("startet requestHandler")
+    logger.debug("started requestHandler")
     try:
         logger.info(f"sending host list to client: {addr}")
         sock.sendall(("\n".join(hosts.keys())).encode())
@@ -34,21 +34,23 @@ def requestHandler(sock, addr, hosts, clients):
             hostSock.sendall(b"request")
             response = hostSock.recv(1024).decode()
         except:
-            logger.exception("error in request handler: host unreachable")
-            logger.info(f"closing unreachable host socket")
+            logger.warning("error in request handler: host unreachable")
+            logger.exception("")
+            logger.debug(f"closing unreachable host socket")
             hostSock.close()
-            logger.info(f"closing client socket because requested host is not available")
+            logger.debug(f"closing client socket because requested host is not available")
             sock.close()
         else:
             if response == "go":
                 logger.info(f"received ok from host: {request}")
                 logger.info(f"sending go to client: {addr}")
                 sock.sendall(b"go")
-                logger.info(f"connecting client: {addr} with host: {request}")
-                utils.combinedForward(sock, hostSock)
                 clients[addr]=sock
+                logger.info(f"connecting client: {addr} with host {request}: {utils.getSockName(hostSock)}")
+                utils.combinedForward(sock, hostSock)
     except:
-        logger.exception("ERROR IN REQUEST_HANDLER")
+        logger.warning("error in request handler")
+        logger.exception("")
 
 def server(sock):
     waitingConnections= queue.Queue()
@@ -70,15 +72,15 @@ def server(sock):
                     threading.Thread(target=requestHandler, args=(conn[0], conn[1], availableHosts, connectedClients,)).start()
             time.sleep(1)
     except:
-        logger.critical(f"Error")
-        logger.exception()
+        logger.critical(f"error")
+        logger.exception("")
     finally:
         logger.info(f"cleaning up sockets")
-        logger.info(f"cleaning up connected clients")
+        logger.debug(f"cleaning up connected clients")
         for key, host in connectedClients.items():
-            logger.info(f"closing client connection: {key}")
+            logger.debug(f"closing client connection: {key}")
             host.close()
-        logger.info(f"cleaning up queued clients")
+        logger.debug(f"cleaning up queued clients")
         stop= False
         while(stop):
             try:
@@ -86,16 +88,16 @@ def server(sock):
             except queue.Empty:
                 stop= True
             else:
-                logger.info(f"closing client connection: {getSockName(conn[0])}")
+                logger.debug(f"closing client connection: {utils.getSockName(conn[0])}")
                 conn[0].close()
-        logger.info(f"cleaning up connected hosts")
+        logger.debug(f"cleaning up connected hosts")
         for key, host in availableHosts.items():
-            logger.info(f"closing host {key}, connection: {getSockName(host[0])}")
+            logger.debug(f"closing host {key}, connection: {utils.getSockName(host[0])}")
             host[0].close()
 
 def startOfProgram():
-    #addr = ("127.0.0.1", 2233)
-    addr = ("0.0.0.0", 2233)
+    addr = ("127.0.0.1", 2233)
+    #addr = ("0.0.0.0", 2233)
 
     while True:
         try:
@@ -107,7 +109,8 @@ def startOfProgram():
             logger.info(f"starting server")
             server(sock)
         except:
-            logger.exception(f"CRITICAL ERROR IN MAIN")
+            logger.critical(f"error in main")
+            logger.exception("")
         finally:
             logger.info(f"shutdown")
             sock.close()

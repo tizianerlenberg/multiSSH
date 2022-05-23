@@ -68,7 +68,6 @@ def getSockName(sock):
         return "socket closed"
 
 def forward(source, destination):
-    threadName=threading.current_thread().name
     try:
         string = ' '
         while string:
@@ -76,22 +75,23 @@ def forward(source, destination):
             if string:
                 destination.sendall(string)
     except:
-        logger.exception(f"Error")
-        logger.info(f"source was {getSockName(source)}")
-        logger.info(f"destination was {getSockName(destination)}")
+        logger.warning(f"exception in forward")
+        logger.exception("")
+        logger.debug(f"source was {getSockName(source)}")
+        logger.debug(f"destination was {getSockName(destination)}")
     finally:
-        logger.info(f"received disconnect, closing forward ({threadName})")
+        logger.info(f"received disconnect, closing forward")
         try:
-            logger.info(f"trying shutdown on source: {getSockName(source)}")
+            logger.debug(f"trying to shutdown source: {getSockName(source)}")
             source.shutdown(socket.SHUT_RD)
         except:
-            logger.info(f"shutdown failed on source: {getSockName(source)}, closing socket ")
+            logger.debug(f"shutdown failed on source: {getSockName(source)}, closing socket ")
             source.close()
         try:
-            logger.info(f"trying shutdown on destination: {getSockName(destination)}")
+            logger.debug(f"trying to shutdown destination: {getSockName(destination)}")
             destination.shutdown(socket.SHUT_WR)
         except:
-            logger.info(f"shutdown failed on destination: {getSockName(destination)}, closing socket ")
+            logger.debug(f"shutdown failed on destination: {getSockName(destination)}, closing socket ")
             destination.close()
 
 def combinedForward(source, destination, done=LockedVar()):
@@ -101,9 +101,9 @@ def combinedForward(source, destination, done=LockedVar()):
     t2.start()
     t1.join()
     t2.join()
-    logger.info(f"combinedForward: closing socket: {getSockName(source)}")
+    logger.debug(f"closing socket: {getSockName(source)}")
     source.close()
-    logger.info(f"combinedForward: closing socket: {getSockName(destination)}")
+    logger.debug(f"closing socket: {getSockName(destination)}")
     destination.close()
     done.set(True)
 
@@ -123,6 +123,6 @@ def listener(sock, connectionQueue, stop=None, done=LockedVar()):
             msg= conn[0].recv(1024).decode()
             connectionQueue.put([conn, msg])
     except:
-        logger.exception("Error")
+        logger.exception("error")
     finally:
         done.set(True)
