@@ -116,7 +116,7 @@ def selectFrom(myList):
     myChoice = int(input("Please choose a number: "))
     return  myList[myChoice-1]
 
-def listener(sock, connectionQueue, stop=None, done=LockedVar()):
+def listener(sock, connectionQueue, done=LockedVar()):
     try:
         while True:
             conn= sock.accept()

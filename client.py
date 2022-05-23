@@ -25,6 +25,8 @@ def server(remoteSock, localAddr):
     remoteSock.sendall(b"query")
     logger.info(f"waiting for host list from server")
     availableHosts = remoteSock.recv(1024).decode()
+    if availableHosts == "EMPTY":
+        raise Exception("No hosts available")
     availableHosts = availableHosts.split("\n")
     myChoice = utils.selectFrom(availableHosts)
     logger.debug(f"got user input")
