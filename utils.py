@@ -11,20 +11,18 @@ logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter('[%(name)s] %(message)s')
 
-"""
 if __name__ != '__main__':
-    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}_imported_{__name__}.log")
+    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}_imported_{__name__}.log", mode="w")
 else:
-    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}.log")
+    file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}.log", mode="w")
 file_handler.setFormatter(formatter)
-file_handler.setLevel(logging.INFO)
-"""
+file_handler.setLevel(logging.DEBUG)
 
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
 stream_handler.setLevel(logging.DEBUG)
 
-#logger.addHandler(file_handler)
+logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
 #-------------------------------------------------------------------------------
