@@ -32,7 +32,7 @@ class CustomColorFormatter(logging.Formatter):
         formatter = CustomTimeFormatter(log_fmt)
         return formatter.format(record)
 
-fmt = f"[ AT '%(asctime)s' IN '%(name)s, %(threadName)s, %(funcName)s()' ] %(message)s"
+fmt = f'[ AT "%(asctime)s" IN "%(name)s, %(threadName)s, %(funcName)s()" ] %(message)s'
 
 streamFormatter = CustomColorFormatter(fmt)
 fileFormatter = CustomTimeFormatter(fmt)
