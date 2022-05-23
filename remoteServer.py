@@ -34,7 +34,7 @@ def requestHandler(sock, addr, hosts, clients):
             hostSock.sendall(b"request")
             response = hostSock.recv(1024).decode()
         except:
-            logger.exception("ERROR IN REQUEST_HANDLER: HOST UNREACHABLE")
+            logger.exception("error in request handler: host unreachable")
             logger.info(f"closing unreachable host socket")
             hostSock.close()
             logger.info(f"closing client socket because requested host is not available")
@@ -70,7 +70,8 @@ def server(sock):
                     threading.Thread(target=requestHandler, args=(conn[0], conn[1], availableHosts, connectedClients,)).start()
             time.sleep(1)
     except:
-        logger.exception(f"CRITICAL ERROR IN SERVER")
+        logger.critical(f"Error")
+        logger.exception()
     finally:
         logger.info(f"cleaning up sockets")
         logger.info(f"cleaning up connected clients")
@@ -85,11 +86,11 @@ def server(sock):
             except queue.Empty:
                 stop= True
             else:
-                logger.info(f"closing client connection: {conn[1]}")
+                logger.info(f"closing client connection: {getSockName(conn[0])}")
                 conn[0].close()
         logger.info(f"cleaning up connected hosts")
         for key, host in availableHosts.items():
-            logger.info(f"closing host connection: {key}")
+            logger.info(f"closing host {key}, connection: {getSockName(host[0])}")
             host[0].close()
 
 def startOfProgram():

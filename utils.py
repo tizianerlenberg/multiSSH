@@ -73,13 +73,23 @@ def forward(source, destination):
             if string:
                 destination.sendall(string)
     except:
-        logger.exception(f"Error in ({threadName})")
-        logger.info(f"{threadName}: source was {source.getpeername()}")
-        logger.info(f"{threadName}: destination was {destination.getpeername()}")
+        logger.exception(f"Error")
+        logger.info(f"source was {getSockName(source)}")
+        logger.info(f"destination was {getSockName(destination)}")
     finally:
         logger.info(f"received disconnect, closing forward ({threadName})")
-        source.shutdown(socket.SHUT_RD)
-        destination.shutdown(socket.SHUT_WR)
+        try:
+            logger.info(f"trying shutdown on source: {getSockName(source)}")
+            source.shutdown(socket.SHUT_RD)
+        except:
+            logger.info(f"shutdown failed on source: {getSockName(source)}, closing socket ")
+            source.close()
+        try:
+            logger.info(f"trying shutdown on destination: {getSockName(destination)}")
+            destination.shutdown(socket.SHUT_WR)
+        except:
+            logger.info(f"shutdown failed on destination: {getSockName(destination)}, closing socket ")
+            destination.close()
 
 def combinedForward(source, destination, done=LockedVar()):
     t1= threading.Thread(target=forward, args=(source, destination,))
@@ -110,6 +120,6 @@ def listener(sock, connectionQueue, stop=None, done=LockedVar()):
             msg= conn[0].recv(1024).decode()
             connectionQueue.put([conn, msg])
     except:
-        logger.exception("ERROR IN LISTENER")
+        logger.exception("Error")
     finally:
         done.set(True)
