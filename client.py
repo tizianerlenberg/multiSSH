@@ -65,10 +65,10 @@ def server(remoteSock, localAddr):
         raise
 
 def startOfProgram():
-    addr = ("127.0.0.1", 2233)
-    #addr = ("192.52.45.151", 2233)
-    localAddr = ("0.0.0.0", 2222)
-    #localAddr = ("127.0.0.1", 2222)
+    #addr = ("127.0.0.1", 2233)
+    addr = ("192.52.45.151", 2233)
+    #localAddr = ("0.0.0.0", 2222)
+    localAddr = ("127.0.0.1", 2222)
 
     try:
         logger.info(f"start")

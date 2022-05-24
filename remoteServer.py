@@ -10,6 +10,9 @@ import logging
 import utils
 import logHandler
 
+# TODO: implement
+#logger = logHandler.getCustumlogger(__name__, stream=logging.DEBUG, file=logging.DEBUG)
+
 logger = logging.getLogger(__name__)
 # don't change log level here! change it in logHandler.py instead
 logger.setLevel(logging.DEBUG)

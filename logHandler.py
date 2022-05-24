@@ -3,6 +3,7 @@
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 
 class CustomTimeFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
@@ -37,7 +38,7 @@ fmt = f'[ AT "%(asctime)s" IN "%(name)s, %(threadName)s, %(funcName)s()" ] %(mes
 streamFormatter = CustomColorFormatter(fmt)
 fileFormatter = CustomTimeFormatter(fmt)
 
-file_handler = logging.FileHandler(f"{sys.argv[0][2:-3]}.log", mode="w")
+file_handler = logging.FileHandler(f"{Path(sys.argv[0]).stem}.log", mode="w")
 file_handler.setFormatter(fileFormatter)
 file_handler.setLevel(logging.DEBUG)
 
