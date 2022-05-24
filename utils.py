@@ -3,18 +3,12 @@
 import threading
 import socket
 import queue
-import logging
 import platform
 
 #own libraries
 import logHandler
 
-logger = logging.getLogger(__name__)
-# don't change log level here! change it in logHandler.py instead
-logger.setLevel(logging.DEBUG)
-
-logger.addHandler(logHandler.stream_handler)
-logger.addHandler(logHandler.file_handler)
+logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
 # ------------------------------------------------------------------------------
 
