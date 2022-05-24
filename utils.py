@@ -4,6 +4,7 @@ import threading
 import socket
 import queue
 import logging
+import platform
 
 #own libraries
 import logHandler
@@ -56,6 +57,19 @@ class LockedDict():
     def pop(self, key):
         pass
 
+if platform.system() == "Windows":
+    import msvcrt
+    def getch():
+        return msvcrt.getch()
+    def getche():
+        return msvcrt.getche()
+else:
+    import getch
+    def getch():
+        return getch.getch()
+    def getche():
+        return getch.getche()
+
 def getSockName(sock):
     try:
         try:
@@ -65,7 +79,7 @@ def getSockName(sock):
         else:
             return f"[{sock.getsockname()} connected to {peer}]"
     except:
-        return "socket closed"
+        return "[some socket (closed)]"
 
 def forward(source, destination):
     try:
