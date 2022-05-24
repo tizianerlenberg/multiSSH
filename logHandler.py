@@ -5,6 +5,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+DEBUG = 10
+INFO = 20
+WARN = 30
+WARNING = 30
+ERROR = 40
+CRITICAL = 50
+
 class CustomTimeFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         return datetime.fromtimestamp(record.created).strftime("%H:%M:%S.%f")[:-3]
@@ -45,3 +52,23 @@ file_handler.setLevel(logging.DEBUG)
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(streamFormatter)
 stream_handler.setLevel(logging.DEBUG)
+
+def getSimpleLogger(name, streamLogLevel=False, fileLogLevel=False):
+    fmt = f'[ AT "%(asctime)s" IN "%(name)s, %(threadName)s, %(funcName)s()" ] %(message)s'
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    if streamLogLevel:
+        handler = logging.StreamHandler()
+        handler.setFormatter(CustomColorFormatter(fmt))
+        handler.setLevel(streamLogLevel)
+        logger.addHandler(handler)
+
+    if fileLogLevel:
+        handler = logging.FileHandler(f"{Path(sys.argv[0]).stem}.log", mode="w")
+        handler.setFormatter(CustomTimeFormatter(fmt))
+        handler.setLevel(fileLogLevel)
+        logger.addHandler(handler)
+
+    return logger
