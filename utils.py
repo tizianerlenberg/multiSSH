@@ -58,11 +58,13 @@ if platform.system() == "Windows":
     def getche():
         return msvcrt.getche()
 else:
-    import getch
+    #import getch
     def getch():
-        return getch.getch()
+        pass
+        #return getch.getch()
     def getche():
-        return getch.getche()
+        pass
+        #return getch.getche()
 
 def getSockName(sock):
     try:
