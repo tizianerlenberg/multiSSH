@@ -10,6 +10,8 @@ import logHandler
 
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
+socket.setdefaulttimeout(300)
+
 # ------------------------------------------------------------------------------
 
 class Locked(Exception):
@@ -129,9 +131,12 @@ def selectFrom(myList):
 def listener(sock, connectionQueue, done=LockedVar()):
     try:
         while True:
-            conn= sock.accept()
-            msg= conn[0].recv(1024).decode()
-            connectionQueue.put([conn, msg])
+            try:
+                conn= sock.accept()
+                msg= conn[0].recv(1024).decode()
+                connectionQueue.put([conn, msg])
+            except TimeoutError:
+                logger.info("regular listener timeout, restarting listener")
     except:
         logger.exception("error")
     finally:

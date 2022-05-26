@@ -11,6 +11,8 @@ import logHandler
 
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
+socket.setdefaulttimeout(300)
+
 # ------------------------------------------------------------------------------
 
 def requestHandler(sock, addr, hosts, clients):
@@ -79,7 +81,13 @@ def server(sock):
                 if availableHosts[key][0]._closed:
                     logger.warning(f"Host {key}, {availableHosts[key][1]} is down, removing from available hosts")
                     availableHosts.pop(key)
+
+            if sock._closed:
+                logger.critical("Socket has closed unexpectedly")
+                raise Exception("Socket has closed unexpectedly")
+
             time.sleep(1)
+
     except KeyboardInterrupt:
         raise
     except:
@@ -113,7 +121,8 @@ def startOfProgram():
 
     while True:
         try:
-            logger.info(f"start")
+            socket.setdefaulttimeout(300)
+            logger.info(f"starting")
             logger.info(f"binding sockets")
             sock= socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.bind(addr)
@@ -132,6 +141,7 @@ def startOfProgram():
             sock.close()
             if not noWait:
                 time.sleep(1)
+            logger.info("shutdown successfull")
 
 def main():
     startOfProgram()

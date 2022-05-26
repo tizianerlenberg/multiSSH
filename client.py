@@ -10,6 +10,8 @@ import logHandler
 
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
+socket.setdefaulttimeout(300)
+
 # ------------------------------------------------------------------------------
 
 def server(remoteSock, localAddr):
@@ -65,6 +67,7 @@ def startOfProgram():
     localAddr = ("127.0.0.1", 2222)
 
     try:
+        socket.setdefaulttimeout(300)
         logger.info(f"start")
         logger.info(f"connecting to remote server")
         sock= socket.socket(socket.AF_INET, socket.SOCK_STREAM)
