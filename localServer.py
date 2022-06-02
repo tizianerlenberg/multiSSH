@@ -8,6 +8,7 @@ import atexit
 # own libraries
 import utils
 import logHandler
+import config
 
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
@@ -43,9 +44,8 @@ def server(remoteSock, localAddr):
         localSshSock.close()
 
 def startOfProgram():
-    addr = ("127.0.0.1", 2233)
-    #addr = ("192.52.45.151", 2233)
-    localAddr = ("127.0.0.1", 22)
+    addr = config.serverAddress
+    localAddr = config.localServerAddress
     noWait=False
 
     while True:

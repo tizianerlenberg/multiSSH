@@ -8,6 +8,7 @@ import queue
 # own libraries
 import utils
 import logHandler
+import config
 
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
@@ -115,8 +116,7 @@ def server(sock):
             host[0].close()
 
 def startOfProgram():
-    addr = ("127.0.0.1", 2233)
-    #addr = ("0.0.0.0", 2233)
+    addr = config.serverAddress
     noWait=False
 
     while True:
