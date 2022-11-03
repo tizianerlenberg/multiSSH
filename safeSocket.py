@@ -16,20 +16,31 @@ class Type(enum.Enum):
     DEFAULT = "DEFAULT"
 
 class SafeSocket():
-    def __init__(self, sock=socket.socket(socket.AF_INET, socket.SOCK_STREAM, type=Type.DEFAULT)):
-        self._sock = sock
+    def __init__(self, sock=socket.socket(socket.AF_INET, socket.SOCK_STREAM), type=Type.DEFAULT):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.settimeout(10)
         self._addr = None
         self._closed = True
         self._timeout = 600
         self._listenQueue = None
-        self._sendQueue = queue.Queue()
-        self._recvQueue = queue.Queue()
-        self._childs = queue.Queue()
+        self._sendQueue = None
+        self._recvQueue = None
+        self._childs = None
 
         self._listener_thread = None
         self._sender_thread = None
         self._recver_thread = None
+
+        if type == Type.SERVER:
+            pass
+        elif type == Type.CLIENT:
+            pass
+        elif type == Type.SERVER_CONNECTED:
+            self._sock = sock
+        elif type == Type.CLIENT_CONNECTED:
+            self._sock = sock
+        else:
+            pass
     def _sender(self):
         try:
             while True:
