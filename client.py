@@ -37,14 +37,11 @@ def server(remoteSock, localAddr):
         if ack == "go":
             logger.info(f"received go from server")
             try:
-                logger.debug(f"binding to local socket")
-                localSshSock.bind(localAddr)
-                localSshSock.listen(1)
-                logger.info(f"waiting for connections to local socket")
-                conn = localSshSock.accept()[0]
-                logger.info(f"received connection to local socket")
-                logger.info(f"starting forward")
-                utils.combinedForward(conn, remoteSock)
+                logger.debug(f"sending message to server")
+                remoteSock.sendall(b"connection established")
+                logger.debug(f"starting up shell")
+                utils.simpleShellClient(remoteSock)
+
             except KeyboardInterrupt:
                 raise
             except:

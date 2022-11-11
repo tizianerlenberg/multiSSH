@@ -4,6 +4,7 @@ import threading
 import socket
 import time
 import atexit
+import subprocess
 
 # own libraries
 import utils
@@ -31,14 +32,24 @@ def server(remoteSock, localAddr):
             else:
                 logger.error(f"expected request from server, got: {serverResponse}")
 
+        """
         logger.info(f"connecting to local ssh server")
         localSshSock.connect(localAddr)
         logger.debug(f"successfully connected to local ssh server")
+        """
 
         logger.info(f"sending go to remote server")
         remoteSock.sendall(b"go")
+
+        print(f"received: {remoteSock.recv(1024).decode()}")
+
+        logger.debug(f"starting up shell server")
+        utils.simpleShellServer(remoteSock)
+
+        """
         logger.info(f"connecting remote socket {utils.getSockName(remoteSock)} to local socket {utils.getSockName(localSshSock)}")
         utils.combinedForward(remoteSock, localSshSock)
+        """
     finally:
         logger.debug(f"closing local socket")
         localSshSock.close()
