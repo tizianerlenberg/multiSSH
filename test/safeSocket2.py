@@ -9,12 +9,45 @@ import logHandler
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG, fileLogLevel=logHandler.DEBUG)
 
 class MsgType():
-    ACK = bytes.fromhex(' 00 ')
-    ALV = bytes.fromhex(' 01 ')
-    BYT = bytes.fromhex(' 02 ')
-    M01 = bytes.fromhex(' 03 ')
-    M05 = bytes.fromhex(' 04 ')
-    M10 = bytes.fromhex(' 05 ')
+    Acknowledge  = b'\x00'
+    Alive        = b'\x01'
+    Byte         = b'\x02'
+    Message_01   = b'\x03'
+    Message_05   = b'\x04'
+    Message_10   = b'\x05'
+
+def encodeString(msg):
+    msgLength = len(msg)
+    if(msgLength <= 255):
+        return MsgType.Message_01 + msgLength.to_bytes(1, 'big') + msg
+    elif(msgLength <= 1099511627775):
+        return MsgType.Message_05 + msgLength.to_bytes(5, 'big') + msg
+    elif(msgLength <= 1208925819614629174706175):
+        return MsgType.Message_10 + msgLength.to_bytes(10, 'big') + msg
+    else:
+        print('error')
+
+def recvMsg(sock):
+    msgType = sock.recv(1)
+    match msgType:
+        case MsgType.Acknowledge:
+            return 'Acknowledge'
+        case MsgType.Alive:
+            return 'Alive'
+        case MsgType.Byte:
+            return sock.recv(1)
+        case MsgType.Message_01:
+            codedLength = sock.recv(1)
+            msgLength = int.from_bytes(codedLength, 'big')
+            return sock.recv(msgLength)
+        case MsgType.Message_05:
+            codedLength = sock.recv(5)
+            msgLength = int.from_bytes(codedLength, 'big')
+            return sock.recv(msgLength)
+        case MsgType.Message_10:
+            codedLength = sock.recv(10)
+            msgLength = int.from_bytes(codedLength, 'big')
+            return sock.recv(msgLength)
 
 def getSockName(sock):
     try:
@@ -42,16 +75,11 @@ class SafeSocket():
     def connect(self, host):
         self.sock.connect(host)
     def sendall(self, msg):
-        msgLength = str(len(msg))
-        self.sock.sendall(b'nmsg' + (msgLength.rjust(20, '0')).encode() + msg)
+        self.sock.sendall(encodeString(msg))
     def recv(self, bufsize):
-        msgType = self.sock.recv(4)
-        if(msgType == b"nmsg"):
-            msgLength = int((self.sock.recv(20)).decode())
-            msg = self.sock.recv(msgLength)
-            return msg
-        else:
-            print("unknown type: " + msgType.decode())
+        return self.sock.recv(bufsize)
+    def recvall(self):
+        return recvMsg(self.sock)
     def close(self):
         self.sock.close();
     def shutdown(self, type):
