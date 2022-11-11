@@ -4,6 +4,7 @@ import threading
 import socket
 import queue
 import platform
+import subprocess
 
 #own libraries
 import logHandler
@@ -141,3 +142,25 @@ def listener(sock, connectionQueue, done=LockedVar()):
         logger.exception("error")
     finally:
         done.set(True)
+
+def simpleShellClient(sock):
+    while(True):
+        userInput = input(">>> ")
+        if userInput == "exit":
+            print("disconnecting")
+            sock.sendall(b"")
+            break
+        sock.sendall(userInput.encode())
+        print(sock.recv(2048).decode())
+
+def simpleShellServer(sock):
+    while(True):
+        answer=sock.recv(1024)
+        if(answer==b""):
+            print("[CLIENT DISCONNECTED]")
+            break
+        result = subprocess.run(answer.decode(), capture_output=True, shell=True)
+        if(result.stdout == b""):
+            sock.sendall(b"NULL")
+        else:
+            sock.sendall(result.stdout)
