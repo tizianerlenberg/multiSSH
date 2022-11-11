@@ -10,7 +10,7 @@ while(True):
     print("[CLIENT CONNECTED]")
 
     while(True):
-        answer=conn.recv(1024)
+        answer=conn.recvall()
         if(answer==b""):
             print("[CLIENT DISCONNECTED]")
             break
@@ -19,4 +19,3 @@ while(True):
             conn.sendall(b"MYNULL")
         else:
             conn.sendall(result.stdout)
-
