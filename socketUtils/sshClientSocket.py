@@ -46,7 +46,7 @@ class SshClientSocket():
         self.host_key_obj = paramiko.Ed25519Key(data=decodebytes(self.host_key.encode()))
         logger.debug(f"SshClientSocket initialized")
 
-    def start_client(self):
+    def start(self):
         self.client = paramiko.client.SSHClient()
 
         self.client.get_host_keys().add(self.hostname, 'ssh-ed25519', self.host_key_obj)
@@ -64,11 +64,22 @@ class SshClientSocket():
         self.chan.get_pty(term, width, height, width_pixels, height_pixels)
         self.chan.invoke_shell()
         
-        return self.chan
+        logger.debug("SshClientSocket started")
+        return 0
 
     def close(self):
-        self.chan.close()
-        self.tran.close()
+        try:
+            logger.debug(f"Closing Channel")
+            self.chan.close()
+        except:
+            logger.info(f"Error closing Channel")
+            logger.exception("")
+        try:
+            logger.info(f"Closing Transport")
+            self.tran.close()
+        except:
+            logger.error(f"Error closing Transport")
+            logger.exception("")
 
 def main():
     sock = SshClientSocket()

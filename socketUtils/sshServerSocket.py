@@ -36,6 +36,9 @@ class SshServer(paramiko.ServerInterface):
     def check_channel_request(self, kind, chanid):
         if kind == "session":
             return paramiko.OPEN_SUCCEEDED
+        if kind == "direct-tcpip":
+            return paramiko.OPEN_SUCCEEDED
+        logger.error(f"\"{kind}\" session is not supported")
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
     def check_auth_password(self, username, password):
@@ -44,7 +47,7 @@ class SshServer(paramiko.ServerInterface):
         return paramiko.AUTH_FAILED
 
     def check_auth_publickey(self, username, key):
-        print("Auth attempt with key: " + u(hexlify(key.get_fingerprint())))
+        logger.debug(f"Auth attempt with key: {u(hexlify(key.get_fingerprint()))}")
         if (username == self.client_username) and (key == self.client_key):
             return paramiko.AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED
@@ -68,6 +71,13 @@ class SshServer(paramiko.ServerInterface):
         self, channel, term, width, height, pixelwidth, pixelheight, modes
     ):
         return True
+    
+    def check_channel_direct_tcpip_request(
+        self, chanid, origin, destination
+    ):
+        logger.info(f"chanid: {chanid}, origin: {origin}, destination: {destination}")
+        self.event.set()
+        return paramiko.OPEN_SUCCEEDED
 
 class SshServerSocket():
     def __init__(self, sock, hostname='tunnel', username='tunnel', host_key=example_private_server_key, client_key=example_public_client_key, password=None):
@@ -90,11 +100,11 @@ class SshServerSocket():
         self.client_key_obj = paramiko.Ed25519Key(data=decodebytes(self.client_key.encode()))
         logger.debug(f"SshClientSocket initialized")
 
-    def start_server(self):
+    def start(self):
         try:
             self.tran = paramiko.Transport(self.sock)
             self.tran.add_server_key(self.host_key_obj)
-            server = SshServer(client_key=self.client_key_obj)
+            server = SshServer(client_key=self.client_key_obj, client_pass=self.password)
             try:
                 self.tran.start_server(server=server)
             except paramiko.SSHException:
@@ -113,8 +123,8 @@ class SshServerSocket():
                 logger.error(f"Client never asked for a shell")
                 return 1
 
-            logger.debug("SshServer started, returning opened channel")
-            return self.chan
+            logger.debug("SshServerSocket started")
+            return 0
 
         except:
             logger.exception("")
@@ -125,8 +135,16 @@ class SshServerSocket():
             return 1
 
     def close(self):
-        self.chan.close()
-        self.tran.close()
+        try:
+            logger.debug(f"Closing Channel")
+            self.chan.close()
+        except:
+            logger.info(f"Error closing Channel")
+        try:
+            logger.debug(f"Closing Transport")
+            self.tran.close()
+        except:
+            logger.info(f"Error closing Transport")
 
 def main():
     sock = SshServerSocket()
