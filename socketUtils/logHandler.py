@@ -54,7 +54,7 @@ stream_handler.setFormatter(streamFormatter)
 stream_handler.setLevel(logging.DEBUG)
 
 def getSimpleLogger(name, streamLogLevel=False, fileLogLevel=False):
-    fmt = f'[ AT "%(asctime)s" IN "%(name)s, %(threadName)s, %(funcName)s()" ] %(message)s'
+    fmt = f'[ AT "%(asctime)s" IN "%(name)s line %(lineno)d, %(threadName)s, %(funcName)s()" ] %(message)s'
 
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)

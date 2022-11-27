@@ -8,8 +8,10 @@ print("[CONNECTED TO SERVER]")
 
 try:
     sshSock = sshClientSocket.SshClientSocket(s)
-    conn = sshSock.start_client()
+    sshSock.start()
+    conn = sshSock.chan
     print(conn.recv(1024).decode())
+    #conn.send(input(">>> "))
 finally:
-    conn.close()
+    sshSock.close()
     s.close()
