@@ -6,8 +6,8 @@ import logHandler
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG)
 
 class Server():
-    def __init__(self, hostname, serve=None):
-        self.hostname = hostname
+    def __init__(self, address, serve=None):
+        self.address = address
         self.serve=serve
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.hosts = []
@@ -26,7 +26,6 @@ class Server():
         except:
             logger.warn(f"Could not close socket for client {host[1]}")
         self.hosts.remove(host)
-        return
     def listener(self):
         try:
             while(True):
@@ -34,7 +33,7 @@ class Server():
                 host = self.sock.accept()
                 logger.info(f"Client {host[1]} connected")
                 self.hosts.append(host)
-                threading.Thread(target=self.serveWrapper, args=(host,)).start()
+                threading.Thread(target=self.serveWrapper, daemon=True, args=(host,)).start()
         finally:
             logger.info(f"Trying to close socket {host[1]}")
             try:
@@ -42,14 +41,13 @@ class Server():
                 logger.info(f"Socket for client {host[1]} closed")
             except:
                 logger.warn(f"Could not close socket for client {host[1]}")
-            return
     def start(self):
         logger.debug(f"Binding socket")
-        self.sock.bind(self.hostname)
+        self.sock.bind(self.address)
         self.sock.listen(10)
 
         logger.debug(f"Starting listener")
-        threading.Thread(target=self.listener).start()
+        threading.Thread(target=self.listener, daemon=True).start()
     def stop(self):
         for host in self.hosts:
             try:
