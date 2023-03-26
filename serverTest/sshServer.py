@@ -1,10 +1,17 @@
-import socket, threading, paramiko, io
+import socket, threading, paramiko, io, inspect
+import base64
+#from paramiko.py3compat import b, u, decodebytes
+# patch for u() missing since py3compat is obsolete
+def u(obj):
+    return obj.decode("utf8")
+
+from base64 import decodebytes
+from binascii import hexlify
 
 # own libraries
 import logHandler
 import server2
 import internalSshServer
-#import internalSshServer
 
 logger = logHandler.getSimpleLogger(__name__, streamLogLevel=logHandler.DEBUG)
 
@@ -93,15 +100,26 @@ class SshServer():
             
             logger.debug(f"Channel of Type {chanType}")
             if chanType == 'session':
-                self.sessionServe(chan)
+                if len(inspect.signature(self.sessionServe).parameters) == 1:
+                    self.sessionServe(chan)
+                elif len(inspect.signature(self.sessionServe).parameters) == 2:
+                    self.sessionServe(chan, chanInfo)
+                else:
+                    logger.error('Session Serve Function has unsopported number of arguments')
+                    logger.error(inspect.signature(self.sessionServe).parameters)
             elif chanType == 'directTcpip':
-                self.directTcpipServe(chan)
+                if len(inspect.signature(self.directTcpipServe).parameters) == 1:
+                    self.directTcpipServe(chan)
+                elif len(inspect.signature(self.directTcpipServe).parameters) == 2:
+                    self.directTcpipServe(chan, chanInfo)
+                else:
+                    logger.error('Session Serve Function has unsopported number of arguments')
             else:
                 logger.error(f"Channel type unknown")
                 raise
             
         finally:
-            logger.exception("")
+            logger.debug(f'Closing a ssh connection on client {host[1]}')
             try:
                 chan.close()
             except:
@@ -130,3 +148,7 @@ class SshServer():
             self.server.stop()
         except:
             logger.error(f'Failed to stop server')
+    def __enter__(self):
+        self.start()
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.stop()

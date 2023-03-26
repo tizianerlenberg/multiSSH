@@ -18,7 +18,7 @@ class Server():
                 self.serve(host)
         except:
             logger.warn(f"Exception in serve() method of client {host[1]}:")
-            #traceback.print_exc()
+            traceback.print_exc()
         logger.info(f"Trying to close socket for client {host[1]}")
         try:
             host[0].close
