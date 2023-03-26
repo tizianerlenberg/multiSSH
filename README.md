@@ -95,7 +95,7 @@ to solve these issues the following approach is preferred:
 the restructuring branch will implement a different approach.
 
 the remoteServer should act like a bastion server
-![see here for more info]("https://www.redhat.com/sysadmin/ssh-proxy-bastion-proxyjump")
+[see here for more info]("https://www.redhat.com/sysadmin/ssh-proxy-bastion-proxyjump")
 
 The user will connect to the remoteServer via a normal ssh-client like
 so:
