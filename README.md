@@ -1,6 +1,13 @@
 # multiSSH
 
-MultiSSH is a server-client application that aims to implement a teamviewer like experience for SSH
+MultiSSH is a server-client application that aims to implement a teamviewer like experience for SSH.
+The purpose for this approach is that you may have infrastructure running behind a firewall/NAT and therfore not accessible via SSH.
+You could open up the firwall and configure port-forwarding rules, but this can be combersome.
+
+Every piece of infrastructure you have behind the firewall can connect via a client, which will be called "localServer", to a central multiSSH server on the internet which will be called "remoteServer" (this one has a public ip and the necessary firewall configuration)
+The user than connects to the remoteServer and requests a SSH-Session on one of the localServers. The remoteServer than connects you to one of the localServers
+
+
 There is an old version which is in a working state (master branch) and a new improved version, that is not ready to be used (branch restructuring)
 The restructuring branch is going to replace the master branch eventually.
 
@@ -41,4 +48,28 @@ to solve these issues the following approach is preferred:
 
 ## restructuring branch
 
+the restructuring branch will implement a different approach.
 
+the remoteServer should act like a bastion server ![see here for more info](https://www.redhat.com/sysadmin/ssh-proxy-bastion-proxyjump)
+
+The user will connect to the remoteServer via a normal ssh-client like so:
+
+`ssh -J remoteServer username@localServer`
+
+as can be seen, this sends information to the remoteServer, which tells the remoteServer which localServer the client wants to connect to.
+The remoteServer can then initiate a forward between one of the connected localServers.
+
+In order for the user to be able to see, which localServers are available, he should be able to connect to the remoteServer like this:
+
+```
+$ ssh remoteServer
+This is a message from the remoteServer. Here are all available localServers:
+localServer1
+localServer2
+localServer3
+``` 
+
+For this to work, the remoteServer is acting like an actual openssh-Server. The paramiko library will be used to implement this. 
+
+Also the localServer should be able to offer a shell on linux and windows systems even if there is no locally running openssh-Server.
+If a openssh-Server is running on the machine, the localServer should instead use this server, since it will have alle the features of the ssh-protocoll
