@@ -5,7 +5,12 @@ import enum
 import io
 import paramiko
 import base64
-from paramiko.py3compat import b, u, decodebytes
+#from paramiko.py3compat import b, u, decodebytes
+# patch for u() missing since py3compat is obsolete
+def u(obj):
+    return obj.decode("utf8")
+
+from base64 import decodebytes
 from binascii import hexlify
 
 # own libraries
@@ -45,7 +50,7 @@ class InternalSshServer(paramiko.ServerInterface):
             return paramiko.AUTH_FAILED
         logger.debug(f"User {username} tries to authenticate with password {password}")
         for user in self.allowedUsers:
-            if (user['username'] == username) and (user['password'] == password):
+            if ((user['username'] == '') or (user['username'] == username)) and (user['password'] == password):
                 logger.debug(f"User {username} authenticated successfully")
                 return paramiko.AUTH_SUCCESSFUL
         logger.warning(f"User {username} authentication failed")
@@ -57,7 +62,7 @@ class InternalSshServer(paramiko.ServerInterface):
             return paramiko.AUTH_FAILED
         logger.debug(f"User {username} tries to authenticate with key {u(hexlify(key.get_fingerprint()))}")
         for user in self.allowedUsers:
-            if (user['username'] == username) and (user['pkey'] == key):
+            if ((user['username'] == '') or (user['username'] == username)) and (user['pkey'] == key):
                 logger.debug(f"User {username} authenticated successfully")
                 return paramiko.AUTH_SUCCESSFUL
         logger.warning(f"User {username} authentication failed")
