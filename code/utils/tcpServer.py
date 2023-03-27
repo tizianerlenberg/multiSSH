@@ -62,5 +62,3 @@ class Server():
             logger.debug(f'Closed server socket')
         except:
             logger.error(f'Failed to close server socket')
-
-

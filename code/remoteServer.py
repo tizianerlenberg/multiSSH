@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+
+import erlenberg.logHandler
+logger = erlenberg.logHandler.Logger(erlenberg.logHandler.DEBUG, pp=True).start()
+
+import utils.sshServer as sshServer
+import utils.myUtils as myUtils
+import socket
+import utils.tcpServer as tcpServer
+import json
+
+socket.setdefaulttimeout(300)
+
+########## GLOBALS ##########
+
+LOCALSERVERS = {}
+
+########## FUNCTIONS ##########
+
+# TODO
+
+########## SSH SERVER ##########
+
+def get_ssh_server():
+    global LOCALSERVERS
+    allowed_users = [{'username': '',
+                      'password': 'tunnel',
+                      'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIGjPsR6iO6YxIsSg3Izl76RbTCjDiGZKqn9XRGM8GuVe'}]
+                             
+    host=('127.0.0.1', 2233)
+
+    def ownServe(chan):
+        global LOCALSERVERS
+        chan.sendall('These localServers are available:\r\n')
+        chan.sendall('--- START JSON DUMP ---\r\n')
+        chan.sendall(json.dumps(list(LOCALSERVERS.keys()), indent=2).replace("\n", "\r\n")  + '\r\n')
+        chan.sendall('--- END JSON DUMP ---\r\n')
+
+    def ownServe2(chan, chanInfo):
+        global LOCALSERVERS
+        src=chan
+        #dest = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        #dest.connect(chanInfo['destination'])
+        #utils.combinedForward(src, dest)
+        logger.debug("destination is: " + str(chanInfo['destination']))
+        dest = LOCALSERVERS[chanInfo['destination'][0]]
+        dest.sendall(b'request')
+        if (dest.recv(1024).decode() == 'go'):
+            myUtils.combinedForward(src, dest)
+            logger.debug('NOW AFTER FORWARD')
+            while True:
+                pass
+        else:
+            raise Exception('oops, protocoll error')
+
+    server = sshServer.SshServer(
+        host,
+        sessionServe=ownServe,
+        directTcpipServe=ownServe2, 
+        allowedUsers=allowed_users, 
+        allowPass=True, 
+        allowPkey=True
+    )
+    return server
+
+########## BACKEND SERVER ##########
+
+def get_backend_server():
+    global LOCALSERVERS
+    def ownServe(sockT):
+        global LOCALSERVERS
+        sock = sockT[0]
+        if (sock.recv(1024).decode() == 'offer'):
+            sock.sendall(b'go')
+            LOCALSERVERS[sock.recv(1024).decode()] = sock
+            while True:
+                pass
+        else:
+            sock.close()
+
+    host=('127.0.0.1', 2244)
+        
+    server = tcpServer.Server(host, serve=ownServe)
+    return server
+
+########## START SERVERS ##########
+
+def main():
+    try:
+        server_backend = get_backend_server()
+        server_ssh = get_ssh_server()
+        server_backend.start()
+        server_ssh.start()
+        while True:
+            pass
+    finally:
+        try:
+            server_backend.stop()
+        except:
+            pass
+        try:
+            server_ssh.stop()
+        except:
+            pass
+
+if __name__ == '__main__':
+    main()
