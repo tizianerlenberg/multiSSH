@@ -24,9 +24,14 @@ CONNS = 0
 
 def get_ssh_server():
     global LOCALSERVERS
-    allowed_users = [{'username': '',
-                      'password': 'tunnel',
-                      'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIG6ruJUjErrnrRmTml7dbVCjVmGmhx5NYQq9cYKyO4ic'}]
+    allowed_users = [
+                        {'username': '',
+                         'password': 'tunnel',
+                         'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIG6ruJUjErrnrRmTml7dbVCjVmGmhx5NYQq9cYKyO4ic'},
+                        {'username': '',
+                         'password': 'tunnel',
+                         'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIGjPsR6iO6YxIsSg3Izl76RbTCjDiGZKqn9XRGM8GuVe'}
+                    ]
                              
     host=('127.0.0.1', 2233)
 
