@@ -9,8 +9,30 @@ import socket
 import utils.tcpServer as tcpServer
 import json
 import time
+import subprocess
 
 socket.setdefaulttimeout(300)
+
+def get_ssh_server():
+    allowed_users = [{'username': '',
+                      'password': 'tunnel',
+                      'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIG6ruJUjErrnrRmTml7dbVCjVmGmhx5NYQq9cYKyO4ic'}]
+                             
+    host=('127.0.0.1', 2299)
+
+    def ownServe(chan):
+        global LOCALSERVERS
+        chan.sendall(f'--- PYTHON CONSOLE ON LOCALSERVER {socket.gethostname().upper()} ---\r\n')
+        myUtils.simpleShellServer(chan)
+    
+    server = sshServer.SshServer(
+        host,
+        sessionServe=ownServe, 
+        allowedUsers=allowed_users, 
+        allowPass=True, 
+        allowPkey=True
+    )
+    return server
 
 def server(remoteSock, localAddr):
     localSshSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -44,8 +66,11 @@ def server(remoteSock, localAddr):
 
         logger.debug(f"starting up ssh server")
         #myUtils.simpleShellServer(remoteSock)
+        # -----------------------
+        
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(localAddr)
+        #sock.connect(("127.0.0.1", 2299))
         myUtils.combinedForward(sock, remoteSock)
 
         """
@@ -61,28 +86,34 @@ def startOfProgram():
     localAddr = ("127.0.0.1", 22)
     noWait=False
 
-    while True:
-        try:
-            socket.setdefaulttimeout(300)
-            remoteServer= socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            logger.info(f"start")
-            logger.info(f"connecting to remote server")
-            remoteServer.connect(addr)
-            logger.info(f"connected to remote server")
-            logger.debug(f"starting own server")
-            server(remoteServer, localAddr)
-        except KeyboardInterrupt:
-            logger.info("Received Keyboard Interrupt")
-            noWait=True
-            break
-        except:
-            logger.critical(f"error")
-        finally:
-            logger.debug("closing remote socket")
-            remoteServer.close()
-            logger.info(f"shutdown")
-            if not noWait:
-                time.sleep(1)
+    try:
+        #server_ssh = get_ssh_server()
+        #server_ssh.start()
+        while True:
+            try:
+                socket.setdefaulttimeout(300)
+                remoteServer= socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                logger.info(f"start")
+                logger.info(f"connecting to remote server")
+                remoteServer.connect(addr)
+                logger.info(f"connected to remote server")
+                logger.debug(f"starting own server")
+                server(remoteServer, localAddr)
+            except KeyboardInterrupt:
+                logger.info("Received Keyboard Interrupt")
+                noWait=True
+                break
+            except:
+                logger.critical(f"error")
+            finally:
+                logger.debug("closing remote socket")
+                remoteServer.close()
+                logger.info(f"shutdown")
+                if not noWait:
+                    time.sleep(1)
+    finally:
+        #server_ssh.stop()
+        pass
 
 def main():
     startOfProgram()

@@ -14,6 +14,7 @@ socket.setdefaulttimeout(300)
 ########## GLOBALS ##########
 
 LOCALSERVERS = {}
+CONNS = 0
 
 ########## FUNCTIONS ##########
 
@@ -25,7 +26,7 @@ def get_ssh_server():
     global LOCALSERVERS
     allowed_users = [{'username': '',
                       'password': 'tunnel',
-                      'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIGjPsR6iO6YxIsSg3Izl76RbTCjDiGZKqn9XRGM8GuVe'}]
+                      'pkey': 'AAAAC3NzaC1lZDI1NTE5AAAAIG6ruJUjErrnrRmTml7dbVCjVmGmhx5NYQq9cYKyO4ic'}]
                              
     host=('127.0.0.1', 2233)
 
@@ -43,14 +44,17 @@ def get_ssh_server():
         #dest.connect(chanInfo['destination'])
         #utils.combinedForward(src, dest)
         logger.debug("destination is: " + str(chanInfo['destination']))
-        dest = LOCALSERVERS[chanInfo['destination'][0]]
+        requestedDest = chanInfo['destination'][0].lower()
+        dest = LOCALSERVERS[requestedDest]
         dest.sendall(b'request')
-        if (dest.recv(1024).decode() == 'go'):
+        resp = dest.recv(2).decode()
+        if (resp == 'go'):
             myUtils.combinedForward(src, dest)
             logger.debug('NOW AFTER FORWARD')
             while True:
                 pass
         else:
+            logger.info(f"response was: {resp}")
             raise Exception('oops, protocoll error')
 
     server = sshServer.SshServer(
@@ -67,12 +71,18 @@ def get_ssh_server():
 
 def get_backend_server():
     global LOCALSERVERS
+    global CONNS
     def ownServe(sockT):
         global LOCALSERVERS
+        global CONNS
         sock = sockT[0]
         if (sock.recv(1024).decode() == 'offer'):
             sock.sendall(b'go')
-            LOCALSERVERS[sock.recv(1024).decode()] = sock
+            resp = sock.recv(1024).decode().lower()
+            print(f"hostname is: {resp}")
+            LOCALSERVERS[resp] = sock
+            #LOCALSERVERS[f"conn{CONNS}"] = sock
+            #CONNS = CONNS + 1
             while True:
                 pass
         else:
