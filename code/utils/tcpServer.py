@@ -27,20 +27,20 @@ class Server():
             logger.warn(f"Could not close socket for client {host[1]}")
         self.hosts.remove(host)
     def listener(self):
-        try:
-            while(True):
+        while(True):
+            try:
                 logger.debug(f"Waiting for connection")
                 host = self.sock.accept()
                 logger.info(f"Client {host[1]} connected")
                 self.hosts.append(host)
                 threading.Thread(target=self.serveWrapper, daemon=True, args=(host,)).start()
-        finally:
-            logger.info(f"Trying to close socket {host[1]}")
-            try:
-                conn.close()
-                logger.info(f"Socket for client {host[1]} closed")
-            except:
-                logger.warn(f"Could not close socket for client {host[1]}")
+            except TimeoutError:
+                logger.info(f"Listener Timeout")
+            finally:
+                try:
+                    conn.close()
+                except:
+                    pass
     def start(self):
         logger.debug(f"Binding socket")
         self.sock.bind(self.address)
