@@ -197,12 +197,85 @@ proxy's host key and install a service unit — but it **cannot finish enrollmen
 on its own**, because the proxy must already know the agent's public key before
 it will accept the connection. Two ways out:
 
-1. **Manual (today).** The installer prints the agent's public key; you paste it
-   into `agents_authorized_keys` with a label. Two steps, no new attack surface.
-2. **Enrollment token.** The proxy issues a short-lived token, and
-   `curl … | sh -s -- --token ABC123` self-registers. One step, but the proxy
-   needs a token endpoint, token storage and expiry — and that endpoint becomes
-   a new thing to secure.
+Manual enrollment (paste the printed public key into `agents_authorized_keys`)
+is what works today. The design below is what it should become.
 
-Option 2 is the UX you want eventually; option 1 is right until the reliability
-gaps above are closed.
+---
+
+## Planned: deployment behind a reverse proxy
+
+The intended production shape, on a single VPS also hosting other services on
+their own subdomains:
+
+```
+        :22   ─────────────────────────────►  multiSSH proxy (users)   direct, bypasses Caddy
+VPS
+        :443  ──►  Caddy  ──┬──  multissh.example.com  ──►  127.0.0.1:8080
+                            ├──  other.example.com     ──►  another service
+                            └──  …
+```
+
+The agent transport becomes a WebSocket (`wss://`), which is ordinary HTTP/1.1
+with an `Upgrade` header, so Caddy's `reverse_proxy` carries it natively and it
+looks like plain HTTPS to any firewall or DPI in between.
+
+Note that **peeking at the first bytes to demux SSH and TLS on one port does
+not work here** — Caddy owns `:443` and routes on TLS SNI, and raw SSH has no
+SNI. That trick only applies if multiSSH owns the port outright.
+
+Two properties this gains:
+
+- The agent listener binds **loopback only** and is never directly exposed.
+- Caddy terminates TLS but sees **only ciphertext**, because the SSH transport
+  runs inside the WebSocket. Terminating TLS at the reverse proxy reveals
+  nothing.
+
+The user-facing SSH listener stays on `:22` and bypasses Caddy, since an `ssh`
+client cannot speak through it. Putting the client side on `:443` too would
+need a `ProxyCommand` helper, which breaks "stock ssh client, nothing extra".
+
+## Planned: enrollment
+
+Adding a machine has to be nearly frictionless, or it does not get done.
+
+The proxy serves the installer itself, so `install.sh` is generated per request
+with **the proxy's own SSH host key fingerprint baked in**. The agent then pins
+the right key on its very first connect, and the trust-on-first-use window
+disappears entirely — anchored on the Caddy TLS certificate instead.
+
+```
+curl https://multissh.example.com/install.sh | sh
+```
+
+**Naming.** Prompt for a label, defaulting to the machine's hostname, Enter to
+accept. If that label is already registered, the proxy assigns a variant rather
+than failing — `laptop-2`, or a short random suffix like `laptop-6sk2`. Never
+silently replace an existing registration.
+
+**Credential.** A password registered with the proxy ahead of time, each with
+its own **configurable longevity** — a long-lived one for convenience, or a
+short-lived one when handing a machine to someone else. Requirements:
+
+- stored as an argon2id hash, never plaintext
+- `/enroll` rate-limited, or it is a brute-force oracle
+- create-only: enrollment may never overwrite an existing label
+
+**Enrollment window: optional, off by default.** A deliberately opened window
+is the stricter option, but it adds friction to the operation that most needs
+to stay easy. Password longevity already time-boxes the risk. Worth having as
+an opt-in for anyone who wants it.
+
+**Later: browser approval.** The appealing version is a page on the same
+domain, already authenticated on phone or desktop, where a pending enrollment
+is approved with one button. Best security *and* the least friction, but it
+needs a session/auth story of its own, so it comes after the password flow.
+
+⚠️ Implementation note: with `curl … | sh`, stdin is the script itself, so a
+plain `read` gets EOF. The prompt must read the terminal directly:
+
+```sh
+printf 'Enrollment password: '
+read -rs PASSWORD < /dev/tty
+```
+
+PowerShell's `iex (irm …)` is unaffected; `Read-Host` works normally.
