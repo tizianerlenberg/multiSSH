@@ -1,0 +1,5 @@
+# Leading slashes matter: bare "proxy"/"agent" would also match the
+# cmd/proxy and cmd/agent source directories.
+run/
+/proxy
+/agent
