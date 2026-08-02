@@ -106,11 +106,33 @@ homeserver ssh-ed25519 AAAAC3Nza...  agent_identity
 
 The host key is generated on first run if absent.
 
+Enable the WebSocket listener to run behind a reverse proxy. Bind it to
+loopback and let Caddy terminate TLS:
+
+```bash
+./proxy -user-addr :22 -agent-addr "" -agent-ws-addr 127.0.0.1:8080
+```
+
+```caddyfile
+multissh.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+**This is tested against real Caddy**, with subdomain routing and another
+service sharing the same port: registration, `exec`, an interactive PTY, 1 MB
+of throughput and a 70-second idle session all work through it.
+
 ### Agent
 
 ```bash
-./agent -proxy proxy.example.com:2223
+./agent -proxy proxy.example.com:2223               # raw TCP
+./agent -proxy wss://multissh.example.com/agent     # through a reverse proxy
 ```
+
+`-proxy-host` overrides the HTTP `Host` header independently of the address
+dialled, so a target can reach the proxy by IP when DNS is broken — a plausible
+state of affairs for a last-resort tool.
 
 On first run it generates three things: an identity key (proving itself to the
 proxy), a host key for its embedded server, and — on first connect — a pinned
@@ -189,7 +211,7 @@ cap on concurrent connections.
 |---|---|---|
 | 🟡 | Windows and macOS are **built but never run**. | Unknown. |
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
-| 🟡 | Agent-to-proxy transport is plain TCP on a custom port. | Blocked by restrictive firewalls; TLS/WebSocket on 443 would fix it. |
+| 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
 | ⚪ | No installer. Enrollment is manual: paste the agent's public key into the proxy's config. | See below. |
 
@@ -205,7 +227,7 @@ is what works today. The design below is what it should become.
 
 ---
 
-## Planned: deployment behind a reverse proxy
+## Deployment behind a reverse proxy
 
 The intended production shape, on a single VPS also hosting other services on
 their own subdomains:
@@ -218,9 +240,10 @@ VPS
                             └──  …
 ```
 
-The agent transport becomes a WebSocket (`wss://`), which is ordinary HTTP/1.1
-with an `Upgrade` header, so Caddy's `reverse_proxy` carries it natively and it
-looks like plain HTTPS to any firewall or DPI in between.
+The agent transport is a WebSocket (`wss://`), which is ordinary HTTP/1.1 with
+an `Upgrade` header, so Caddy's `reverse_proxy` carries it natively and it looks
+like plain HTTPS to any firewall or DPI in between. **Implemented and tested
+against real Caddy.**
 
 Note that **peeking at the first bytes to demux SSH and TLS on one port does
 not work here** — Caddy owns `:443` and routes on TLS SNI, and raw SSH has no
