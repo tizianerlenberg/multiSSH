@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -14,9 +15,11 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
 	"multissh/internal/sshx"
 )
@@ -44,10 +47,11 @@ type ptyProcess interface {
 
 func main() {
 	var (
-		proxyAddr = flag.String("proxy", "127.0.0.1:2223", "proxy agent-port address")
+		proxyAddr = flag.String("proxy", "127.0.0.1:2223", "proxy address: host:port, or ws://host/agent")
 		identity  = flag.String("identity", "agent_identity", "key identifying this agent to the proxy")
 		hostKey   = flag.String("host-key", "agent_host_key", "host key of the embedded ssh server")
 		authKeys  = flag.String("authorized-keys", "agent_authorized_keys", "keys allowed to log in here")
+		proxyHost = flag.String("proxy-host", "", "override the HTTP Host header for ws/wss (use when DNS is unavailable)")
 		knownKey  = flag.String("known-proxy-key", "known_proxy_key", "pinned proxy host key; trusted on first use when absent")
 	)
 	flag.Parse()
@@ -81,7 +85,7 @@ func main() {
 	backoff := minBackoff
 	for {
 		started := time.Now()
-		err := session(*proxyAddr, clientCfg, hostSigner, *authKeys)
+		err := session(*proxyAddr, *proxyHost, clientCfg, hostSigner, *authKeys)
 		log.Printf("disconnected from proxy: %v", err)
 
 		// A session that stayed up proves the proxy is reachable, so start
@@ -122,9 +126,35 @@ func tofuProxyKey(path string) (ssh.HostKeyCallback, error) {
 	}, nil
 }
 
+// dialProxy reaches the proxy over a plain socket, or over a WebSocket when
+// given a ws:// or wss:// URL. The WebSocket form is what survives restrictive
+// firewalls and lets a reverse proxy front the service on :443, since it is
+// indistinguishable from ordinary HTTPS.
+// hostOverride sets the HTTP Host header independently of the address dialled,
+// so a target can reach the proxy by IP when DNS is unavailable -- a plausible
+// state of affairs for something billed as a last resort. Note that wss:// to a
+// bare IP would also need the TLS SNI overridden, which is not implemented.
+func dialProxy(target, hostOverride string, timeout time.Duration) (net.Conn, error) {
+	if !strings.HasPrefix(target, "ws://") && !strings.HasPrefix(target, "wss://") {
+		return net.DialTimeout("tcp", target, timeout)
+	}
+
+	// This context bounds the HTTP upgrade only.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c, _, err := websocket.Dial(ctx, target, &websocket.DialOptions{Host: hostOverride})
+	if err != nil {
+		return nil, err
+	}
+	// The session's own context must outlive the dial, or it would be
+	// cancelled the moment this function returns.
+	return websocket.NetConn(context.Background(), c, websocket.MessageBinary), nil
+}
+
 // session holds one registration open until the connection dies.
-func session(addr string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, authKeys string) error {
-	raw, err := net.DialTimeout("tcp", addr, cfg.Timeout)
+func session(addr, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, authKeys string) error {
+	raw, err := dialProxy(addr, wsHost, cfg.Timeout)
 	if err != nil {
 		return err
 	}

@@ -10,15 +10,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sort"
 	"sync"
-
 	"time"
 
+	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
 	"multissh/internal/sshx"
 )
@@ -86,7 +88,9 @@ func (r *registry) labels() []string {
 func main() {
 	var (
 		userAddr  = flag.String("user-addr", "127.0.0.1:2222", "listen address for ssh clients")
-		agentAddr = flag.String("agent-addr", "127.0.0.1:2223", "listen address for agents")
+		agentAddr = flag.String("agent-addr", "127.0.0.1:2223", "raw TCP listen address for agents (empty to disable)")
+		wsAddr    = flag.String("agent-ws-addr", "", "websocket listen address for agents, e.g. 127.0.0.1:8080 (empty to disable)")
+		wsPath    = flag.String("agent-ws-path", "/agent", "websocket path")
 		hostKey   = flag.String("host-key", "proxy_host_key", "proxy host key (created if absent)")
 		usersFile = flag.String("users", "users_authorized_keys", "authorized_keys for users")
 		agentFile = flag.String("agents", "agents_authorized_keys", "'<label> <pubkey>' per line")
@@ -134,15 +138,47 @@ func main() {
 	}
 	agentCfg.AddHostKey(signer)
 
-	go serve(*agentAddr, "agent", agentCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+	agentHandler := func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleAgent(reg, c, chans, reqs)
-	})
+	}
+	if *agentAddr == "" && *wsAddr == "" {
+		log.Fatal("no agent listener configured: set -agent-addr or -agent-ws-addr")
+	}
+	if *agentAddr != "" {
+		go serve(*agentAddr, "agent", agentCfg, agentHandler)
+	}
+	if *wsAddr != "" {
+		go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler)
+	}
+
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleUser(reg, c, chans, reqs)
 	})
 }
 
-func serve(addr, kind string, cfg *ssh.ServerConfig, h func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Request)) {
+type connHandler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Request)
+
+// takeConn runs the SSH server handshake over any transport: a plain socket,
+// or a WebSocket presented as a net.Conn.
+func takeConn(nc net.Conn, kind string, cfg *ssh.ServerConfig, h connHandler) {
+	defer nc.Close()
+
+	// Bound the handshake, or a client that connects and never speaks pins a
+	// goroutine and a socket indefinitely. OpenSSH calls this LoginGraceTime.
+	nc.SetDeadline(time.Now().Add(handshakeTimeout))
+	conn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
+	if err != nil {
+		log.Printf("%s handshake from %s failed: %v", kind, nc.RemoteAddr(), err)
+		return
+	}
+	// Clear it, or an idle session would be torn down mid-use.
+	nc.SetDeadline(time.Time{})
+
+	defer conn.Close()
+	h(conn, chans, reqs)
+}
+
+func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
@@ -154,24 +190,33 @@ func serve(addr, kind string, cfg *ssh.ServerConfig, h func(*ssh.ServerConn, <-c
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go func() {
-			defer nc.Close()
+		go takeConn(nc, kind, cfg, h)
+	}
+}
 
-			// Bound the handshake, or a client that connects and never speaks
-			// pins a goroutine and a socket indefinitely. OpenSSH calls this
-			// LoginGraceTime.
-			nc.SetDeadline(time.Now().Add(handshakeTimeout))
-			conn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
-			if err != nil {
-				log.Printf("%s handshake from %s failed: %v", kind, nc.RemoteAddr(), err)
-				return
-			}
-			// Clear it, or an idle session would be torn down mid-use.
-			nc.SetDeadline(time.Time{})
+// serveWebSocket carries the agent protocol inside an ordinary HTTP upgrade,
+// so a reverse proxy such as Caddy can front it on :443 alongside other
+// subdomains, and the traffic looks like plain HTTPS on the wire. Bind this to
+// loopback and let the reverse proxy terminate TLS: SSH runs inside the
+// WebSocket, so the reverse proxy only ever relays ciphertext.
+func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			log.Printf("%s websocket upgrade from %s failed: %v", kind, r.RemoteAddr, err)
+			return
+		}
+		// Binary frames, and a context that outlives the handshake so the
+		// session is not cancelled underneath us.
+		takeConn(websocket.NetConn(context.Background(), c, websocket.MessageBinary), kind, cfg, h)
+	})
 
-			defer conn.Close()
-			h(conn, chans, reqs)
-		}()
+	// No server-wide timeouts: these connections are meant to stay open.
+	srv := &http.Server{Addr: addr, Handler: mux}
+	log.Printf("%s websocket listener on %s%s", kind, addr, path)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatalf("websocket listen %s: %v", addr, err)
 	}
 }
 
