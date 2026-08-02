@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -52,6 +53,9 @@ func main() {
 		hostKey   = flag.String("host-key", "agent_host_key", "host key of the embedded ssh server")
 		authKeys  = flag.String("authorized-keys", "agent_authorized_keys", "keys allowed to log in here")
 		proxyHost = flag.String("proxy-host", "", "override the HTTP Host header for ws/wss (use when DNS is unavailable)")
+		idCert    = flag.String("identity-cert", "agent_identity-cert.pub", "certificate proving our label to the proxy (optional)")
+		hostCert  = flag.String("host-cert", "agent_host_key-cert.pub", "signed host key for the embedded server (optional)")
+		caFile    = flag.String("ca", "", "pinned certificate authority; preferred over -known-proxy-key")
 		knownKey  = flag.String("known-proxy-key", "known_proxy_key", "pinned proxy host key; trusted on first use when absent")
 	)
 	flag.Parse()
@@ -68,14 +72,49 @@ func main() {
 	log.Printf("agent identity  %s", ssh.FingerprintSHA256(idSigner.PublicKey()))
 	log.Printf("embedded hostkey %s", ssh.FingerprintSHA256(hostSigner.PublicKey()))
 
-	hostKeyCB, err := tofuProxyKey(*knownKey)
+	// A certificate carries our label, so the proxy need not remember us.
+	// The username we present must match a principal in it.
+	authSigner, user := idSigner, "agent"
+	if sshx.Exists(*idCert) {
+		cert, err := sshx.LoadCert(*idCert)
+		if err != nil {
+			log.Fatalf("identity certificate: %v", err)
+		}
+		cs, err := ssh.NewCertSigner(cert, idSigner)
+		if err != nil {
+			log.Fatalf("identity certificate: %v", err)
+		}
+		if len(cert.ValidPrincipals) == 0 {
+			log.Fatalf("identity certificate has no principal to use as a label")
+		}
+		authSigner, user = cs, cert.ValidPrincipals[0]
+		log.Printf("identity certificate for %q, authority %s",
+			user, ssh.FingerprintSHA256(cert.SignatureKey))
+	}
+
+	// Presenting a signed host key means one @cert-authority line in the
+	// user's known_hosts covers every target, present and future.
+	if sshx.Exists(*hostCert) {
+		cert, err := sshx.LoadCert(*hostCert)
+		if err != nil {
+			log.Fatalf("host certificate: %v", err)
+		}
+		cs, err := ssh.NewCertSigner(cert, hostSigner)
+		if err != nil {
+			log.Fatalf("host certificate: %v", err)
+		}
+		hostSigner = cs
+		log.Printf("serving a signed host certificate")
+	}
+
+	hostKeyCB, err := proxyVerifier(*caFile, *knownKey)
 	if err != nil {
-		log.Fatalf("proxy host key: %v", err)
+		log.Fatalf("proxy verification: %v", err)
 	}
 
 	clientCfg := &ssh.ClientConfig{
-		User:            "agent",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(idSigner)},
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(authSigner)},
 		HostKeyCallback: hostKeyCB,
 		Timeout:         10 * time.Second,
 	}
@@ -102,6 +141,28 @@ func main() {
 			backoff *= 2
 		}
 	}
+}
+
+// proxyVerifier decides how the agent authenticates the proxy. Pinning the
+// certificate authority is preferred: the proxy can then be rebuilt on new
+// hardware with a fresh host key and every agent still accepts it, which is
+// what makes the proxy recoverable from one backed-up file. Falls back to
+// trust-on-first-use when no authority is configured.
+func proxyVerifier(caPath, knownPath string) (ssh.HostKeyCallback, error) {
+	if caPath == "" {
+		return tofuProxyKey(knownPath)
+	}
+	caPub, err := sshx.LoadPublicKey(caPath)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("trusting proxies certified by %s", ssh.FingerprintSHA256(caPub))
+	checker := &ssh.CertChecker{
+		IsHostAuthority: func(auth ssh.PublicKey, _ string) bool {
+			return sshx.SameKey(auth, caPub)
+		},
+	}
+	return checker.CheckHostKey, nil
 }
 
 // tofuProxyKey pins the proxy's host key the way an ssh client's known_hosts
@@ -152,13 +213,33 @@ func dialProxy(target, hostOverride string, timeout time.Duration) (net.Conn, er
 	return websocket.NetConn(context.Background(), c, websocket.MessageBinary), nil
 }
 
+// canonicalAddr reduces a target to host:port. Host key checking parses this
+// with net.SplitHostPort, so handing it a whole ws:// URL fails before the
+// certificate is ever examined.
+func canonicalAddr(target string) string {
+	if !strings.HasPrefix(target, "ws://") && !strings.HasPrefix(target, "wss://") {
+		return target
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return target
+	}
+	if u.Port() != "" {
+		return u.Host
+	}
+	if u.Scheme == "wss" {
+		return net.JoinHostPort(u.Host, "443")
+	}
+	return net.JoinHostPort(u.Host, "80")
+}
+
 // session holds one registration open until the connection dies.
 func session(addr, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, authKeys string) error {
 	raw, err := dialProxy(addr, wsHost, cfg.Timeout)
 	if err != nil {
 		return err
 	}
-	conn, chans, reqs, err := ssh.NewClientConn(raw, addr, cfg)
+	conn, chans, reqs, err := ssh.NewClientConn(raw, canonicalAddr(addr), cfg)
 	if err != nil {
 		raw.Close()
 		return err
