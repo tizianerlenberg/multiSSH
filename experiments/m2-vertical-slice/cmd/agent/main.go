@@ -21,6 +21,14 @@ import (
 	"multissh/internal/sshx"
 )
 
+const (
+	minBackoff = time.Second
+	maxBackoff = 60 * time.Second
+	// healthySession is how long a connection must last to count as good
+	// enough to reset the backoff.
+	healthySession = 60 * time.Second
+)
+
 // ptyProcess is a shell attached to a pseudo-terminal. The implementations
 // live in pty_unix.go and pty_windows.go; nothing else in the agent knows
 // which platform it is on.
@@ -70,14 +78,23 @@ func main() {
 
 	// Reconnect forever: the agent is the side that must survive NAT timeouts,
 	// laptop sleep, and the proxy restarting.
-	backoff := time.Second
+	backoff := minBackoff
 	for {
+		started := time.Now()
 		err := session(*proxyAddr, clientCfg, hostSigner, *authKeys)
 		log.Printf("disconnected from proxy: %v", err)
 
+		// A session that stayed up proves the proxy is reachable, so start
+		// over from a short delay. Without this the backoff only ever grows,
+		// and an agent that has reconnected a few times over its life is stuck
+		// waiting the maximum every time -- slowest exactly when it matters.
+		if time.Since(started) >= healthySession {
+			backoff = minBackoff
+		}
+
 		jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
 		time.Sleep(backoff + jitter)
-		if backoff < 60*time.Second {
+		if backoff < maxBackoff {
 			backoff *= 2
 		}
 	}

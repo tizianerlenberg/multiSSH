@@ -11,7 +11,7 @@ case is why the agent runs its **own** SSH server rather than forwarding to the
 system one: a broken `sshd` on the target has no bearing on whether you can get
 in.
 
-> **Status: working prototype, Linux only, not internet-ready.**
+> **Status: working prototype, Linux only. Reliability gaps closed; internet exposure still untested.**
 > See [Security](#security) and [Known gaps](#known-gaps) before exposing it.
 
 ---
@@ -168,11 +168,18 @@ key — it can only route bytes, and it cannot read them.
   replaced
 - session teardown signals the shell's whole process group; no orphans after
   `kill -9` of the client
+- a silent unauthenticated client is dropped after 30s, while an established
+  session survives well past that
+- a frozen agent (`SIGSTOP`) is evicted from the registry within ~30s, and a
+  connection attempt to it fails in ~10s rather than hanging
+- reconnect backoff resets after a healthy session, so recovery stays fast
 
-### Not safe to expose yet
+### Before exposing it publicly
 
-See [Known gaps](#known-gaps) — chiefly no handshake timeout, which makes the
-proxy trivially DoS-able by an unauthenticated client.
+The denial-of-service and liveness gaps are closed, but this has still only
+ever run on a LAN, against a single agent, on Linux. Treat internet exposure as
+untested. There is no rate limiting on repeated failed authentication, and no
+cap on concurrent connections.
 
 ---
 
@@ -180,10 +187,6 @@ proxy trivially DoS-able by an unauthenticated client.
 
 | | Issue | Impact |
 |---|---|---|
-| 🔴 | **No handshake timeout on either listener.** A client that connects and never speaks holds a goroutine and socket forever. | Unauthenticated DoS. OpenSSH's `LoginGraceTime` exists for this. |
-| 🔴 | **Proxy does not detect dead agents promptly.** It only notices via `conn.Wait()`, so a half-open TCP (sleeping laptop) leaves a ghost registration until the kernel gives up, which can be many minutes. | Stale target in the listing; connections to it hang. |
-| 🟠 | **`OpenChannel` toward an agent has no timeout.** | A user's `ssh -J` hangs instead of failing fast. |
-| 🟠 | **Reconnect backoff never resets after a successful session.** It only ever doubles, so a long-lived agent that has disconnected a few times ends up permanently waiting the 60s maximum. | Slower recovery exactly when it matters. |
 | 🟡 | Windows and macOS are **built but never run**. | Unknown. |
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
 | 🟡 | Agent-to-proxy transport is plain TCP on a custom port. | Blocked by restrictive firewalls; TLS/WebSocket on 443 would fix it. |
