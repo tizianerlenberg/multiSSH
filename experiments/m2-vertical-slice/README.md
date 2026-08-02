@@ -198,7 +198,7 @@ cap on concurrent connections.
 A `curl … | sh` installer can drop the binary, generate keys, pre-seed the
 proxy's host key and install a service unit — but it **cannot finish enrollment
 on its own**, because the proxy must already know the agent's public key before
-it will accept the connection. Two ways out:
+it will accept the connection.
 
 Manual enrollment (paste the printed public key into `agents_authorized_keys`)
 is what works today. The design below is what it should become.
