@@ -85,6 +85,10 @@ func LoadAuthorizedKeys(path string) (map[string]bool, error) {
 // belonging to a different key.
 func LoadAgentKeys(path string) (map[string]string, error) {
 	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		// Optional: agents presenting a certificate need no entry here.
+		return map[string]string{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

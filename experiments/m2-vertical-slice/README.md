@@ -165,17 +165,49 @@ sessions and `exec` only.
 
 ### Trust model
 
-Host keys are trust-on-first-use; authorization keys are always explicit.
+The proxy is a **certificate authority**. At enrollment it *signs* the agent's
+key, putting the label in the certificate, so it never stores a per-machine
+list. That is what makes the proxy recoverable — see below.
 
 | Hop | Server identity | Who is allowed |
 |---|---|---|
-| you → proxy | proxy host key, TOFU into your `known_hosts` | `users_authorized_keys` |
-| agent → proxy | proxy host key, TOFU into `known_proxy_key` | `agents_authorized_keys`, with the label |
-| you → target (E2E) | embedded host key, TOFU as the label | agent's `agent_authorized_keys` |
+| you → proxy | host certificate signed by the CA (bare key also offered) | `users_authorized_keys` |
+| agent → proxy | host certificate, agent pins the **CA** | identity certificate carrying the label |
+| you → target (E2E) | host certificate, one `@cert-authority` line covers all targets | agent's `agent_authorized_keys` |
 
 The target's own `authorized_keys` is the real authority. A **fully compromised
 proxy still cannot log into any target**, because it does not hold your private
-key — it can only route bytes, and it cannot read them.
+key — it can only route bytes, and it cannot read them. That holds even if the
+CA key leaks: an attacker could register bogus targets and impersonate the
+proxy, but still could not get a shell anywhere.
+
+### Recovering the proxy
+
+**Back up `proxy_ca_key` once.** Not after every enrollment — once, ever.
+
+Rebuild the proxy on new hardware, restore that one file, and every target
+reconnects on its own. A fresh host key is signed by the restored CA at
+startup, so agents accept the replacement without being touched, and your own
+`@cert-authority` line still matches. This is tested: the test deletes the
+proxy's host key, confirms no agent list ever existed, restarts, and watches
+the agent come back unaided.
+
+`users_authorized_keys` is worth keeping too, but it holds your own public
+keys, which you already have.
+
+```bash
+# enrol a machine: the proxy signs, and stores nothing
+./proxy -sign agent_identity.pub -sign-label laptop -sign-type user
+./proxy -sign agent_host_key.pub -sign-label laptop -sign-type host
+./proxy -show-ca > proxy_ca.pub
+
+# your known_hosts, once, for every present and future target
+echo "@cert-authority * $(cat proxy_ca.pub)" >> ~/.ssh/known_hosts
+```
+
+Certificates never expire by default. For a rescue tool that is deliberate: a
+machine switched off longer than its certificate lasts would otherwise lock
+itself out. Use `-sign-validity` if you want expiry.
 
 ### Verified by test
 
@@ -190,6 +222,8 @@ key — it can only route bytes, and it cannot read them.
   replaced
 - session teardown signals the shell's whole process group; no orphans after
   `kill -9` of the client
+- the proxy survives being destroyed: with only `proxy_ca_key` restored and a
+  brand new host key, the agent re-registers unaided
 - a silent unauthenticated client is dropped after 30s, while an established
   session survives well past that
 - a frozen agent (`SIGSTOP`) is evicted from the registry within ~30s, and a

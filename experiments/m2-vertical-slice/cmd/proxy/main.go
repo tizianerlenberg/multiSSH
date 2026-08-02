@@ -1,8 +1,9 @@
 // multiSSH proxy: a jump host whose targets dial in to it.
 //
 // Two listeners, always, and never any others:
-//   -user-addr   normal ssh clients (ssh proxy / ssh -J proxy user@label)
-//   -agent-addr  targets registering themselves
+//
+//	-user-addr   normal ssh clients (ssh proxy / ssh -J proxy user@label)
+//	-agent-addr  targets registering themselves
 //
 // The proxy implements exactly two things on the user side: a session that
 // prints the target list, and direct-tcpip to a registered label. Anything
@@ -16,7 +17,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,27 +95,71 @@ func main() {
 		wsAddr    = flag.String("agent-ws-addr", "", "websocket listen address for agents, e.g. 127.0.0.1:8080 (empty to disable)")
 		wsPath    = flag.String("agent-ws-path", "/agent", "websocket path")
 		hostKey   = flag.String("host-key", "proxy_host_key", "proxy host key (created if absent)")
+		caKey     = flag.String("ca-key", "proxy_ca_key", "certificate authority key (created if absent)")
 		usersFile = flag.String("users", "users_authorized_keys", "authorized_keys for users")
-		agentFile = flag.String("agents", "agents_authorized_keys", "'<label> <pubkey>' per line")
+		agentFile = flag.String("agents", "agents_authorized_keys", "optional '<label> <pubkey>' fallback list")
+
+		showCA       = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
+		signKey      = flag.String("sign", "", "issue a certificate for this public key file, then exit")
+		signLabel    = flag.String("sign-label", "", "label/principal to put in the certificate")
+		signType     = flag.String("sign-type", "user", "certificate type: user (agent identity) or host")
+		signValidity = flag.Duration("sign-validity", 0, "certificate lifetime; 0 never expires")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
+
+	ca, err := sshx.LoadOrCreateHostKey(*caKey)
+	if err != nil {
+		log.Fatalf("ca key: %v", err)
+	}
+
+	// The public half of the authority is what agents and your known_hosts
+	// pin, so make it easy to obtain.
+	if *showCA {
+		os.Stdout.Write(ssh.MarshalAuthorizedKey(ca.PublicKey()))
+		return
+	}
+
+	// Signing mode: issue a certificate and exit. This is what enrollment will
+	// call once the installer exists.
+	if *signKey != "" {
+		if err := issueCert(ca, *signKey, *signLabel, *signType, *signValidity); err != nil {
+			log.Fatalf("sign: %v", err)
+		}
+		return
+	}
 
 	signer, err := sshx.LoadOrCreateHostKey(*hostKey)
 	if err != nil {
 		log.Fatalf("host key: %v", err)
 	}
 	log.Printf("proxy host key %s", ssh.FingerprintSHA256(signer.PublicKey()))
+	log.Printf("certificate authority %s", ssh.FingerprintSHA256(ca.PublicKey()))
 
 	users, err := sshx.LoadAuthorizedKeys(*usersFile)
 	if err != nil {
 		log.Fatalf("users: %v", err)
 	}
+	// Optional now: an agent presenting a certificate needs no entry here.
 	agents, err := sshx.LoadAgentKeys(*agentFile)
 	if err != nil {
 		log.Fatalf("agents: %v", err)
 	}
-	log.Printf("loaded %d user key(s), %d agent key(s)", len(users), len(agents))
+	log.Printf("loaded %d user key(s), %d static agent key(s)", len(users), len(agents))
+
+	// Sign our own host key afresh on every start, with no principals, so it
+	// is valid whatever address agents reach us on. This is what lets the
+	// proxy be rebuilt on a new machine with a new host key: agents pin the
+	// authority, not the key, so they accept the replacement without being
+	// touched.
+	hostCert, err := sshx.SignCert(ca, signer.PublicKey(), ssh.HostCert, "multissh-proxy", nil, 0)
+	if err != nil {
+		log.Fatalf("host certificate: %v", err)
+	}
+	agentHostSigner, err := ssh.NewCertSigner(hostCert, signer)
+	if err != nil {
+		log.Fatalf("host certificate signer: %v", err)
+	}
 
 	reg := newRegistry()
 
@@ -124,19 +171,40 @@ func main() {
 			return nil, nil
 		},
 	}
+	// Offer both the certificate and the bare key. OpenSSH prefers whichever
+	// it already trusts, so a client with an @cert-authority line accepts a
+	// rebuilt proxy without edits, while one with a plain known_hosts entry
+	// keeps working unchanged.
+	userCfg.AddHostKey(agentHostSigner)
 	userCfg.AddHostKey(signer)
+
+	caPub := ca.PublicKey()
+	certChecker := &ssh.CertChecker{
+		IsUserAuthority: func(auth ssh.PublicKey) bool { return sshx.SameKey(auth, caPub) },
+	}
 
 	agentCfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			// Preferred path: a certificate we signed. CheckCert verifies the
+			// signature, the validity window, and that the username the agent
+			// claims is one of the principals we put in the certificate --
+			// so the label is still ours to assign, without storing it.
+			if cert, ok := key.(*ssh.Certificate); ok {
+				if err := certChecker.CheckCert(c.User(), cert); err != nil {
+					return nil, fmt.Errorf("certificate rejected: %w", err)
+				}
+				return &ssh.Permissions{Extensions: map[string]string{"label": c.User()}}, nil
+			}
+			// Fallback for agents enrolled before certificates existed.
 			label, ok := agents[string(key.Marshal())]
 			if !ok {
-				return nil, fmt.Errorf("unregistered agent key")
+				return nil, fmt.Errorf("no certificate and key is not in %s", *agentFile)
 			}
-			// The label comes from the proxy's config, never from the agent.
 			return &ssh.Permissions{Extensions: map[string]string{"label": label}}, nil
 		},
 	}
-	agentCfg.AddHostKey(signer)
+	// Agents verify us through the authority, so present the certificate.
+	agentCfg.AddHostKey(agentHostSigner)
 
 	agentHandler := func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleAgent(reg, c, chans, reqs)
@@ -154,6 +222,43 @@ func main() {
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleUser(reg, c, chans, reqs)
 	})
+}
+
+// issueCert signs a public key and writes "<path>-cert.pub" beside it, the
+// same naming OpenSSH uses.
+func issueCert(ca ssh.Signer, pubPath, label, kind string, validity time.Duration) error {
+	if label == "" {
+		return fmt.Errorf("-sign-label is required")
+	}
+	pub, err := sshx.LoadPublicKey(pubPath)
+	if err != nil {
+		return err
+	}
+
+	certType := uint32(ssh.UserCert)
+	if kind == "host" {
+		certType = ssh.HostCert
+	} else if kind != "user" {
+		return fmt.Errorf("-sign-type must be user or host")
+	}
+
+	cert, err := sshx.SignCert(ca, pub, certType, label, []string{label}, validity)
+	if err != nil {
+		return err
+	}
+
+	out := strings.TrimSuffix(pubPath, ".pub") + "-cert.pub"
+	if err := sshx.WriteCert(out, cert); err != nil {
+		return err
+	}
+
+	expiry := "never expires"
+	if validity > 0 {
+		expiry = "expires " + time.Unix(int64(cert.ValidBefore), 0).Format(time.RFC3339)
+	}
+	fmt.Printf("wrote %s\n  type       %s\n  principal  %s\n  authority  %s\n  %s\n",
+		out, kind, label, ssh.FingerprintSHA256(ca.PublicKey()), expiry)
+	return nil
 }
 
 type connHandler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Request)
