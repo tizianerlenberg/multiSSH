@@ -17,8 +17,21 @@ import (
 	"sort"
 	"sync"
 
+	"time"
+
 	"golang.org/x/crypto/ssh"
 	"multissh/internal/sshx"
+)
+
+const (
+	// handshakeTimeout bounds an unauthenticated connection, as OpenSSH's
+	// LoginGraceTime does.
+	handshakeTimeout = 30 * time.Second
+	// keepaliveInterval/Timeout decide how fast a vanished agent is evicted.
+	keepaliveInterval = 30 * time.Second
+	keepaliveTimeout  = 15 * time.Second
+	// tunnelOpenTimeout stops a user waiting on an unresponsive agent.
+	tunnelOpenTimeout = 10 * time.Second
 )
 
 // registry tracks which agents are currently connected.
@@ -143,11 +156,19 @@ func serve(addr, kind string, cfg *ssh.ServerConfig, h func(*ssh.ServerConn, <-c
 		}
 		go func() {
 			defer nc.Close()
+
+			// Bound the handshake, or a client that connects and never speaks
+			// pins a goroutine and a socket indefinitely. OpenSSH calls this
+			// LoginGraceTime.
+			nc.SetDeadline(time.Now().Add(handshakeTimeout))
 			conn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
 			if err != nil {
 				log.Printf("%s handshake from %s failed: %v", kind, nc.RemoteAddr(), err)
 				return
 			}
+			// Clear it, or an idle session would be torn down mid-use.
+			nc.SetDeadline(time.Time{})
+
 			defer conn.Close()
 			h(conn, chans, reqs)
 		}()
@@ -176,9 +197,56 @@ func handleAgent(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChanne
 	reg.add(label, conn)
 	log.Printf("agent %q registered from %s", label, conn.RemoteAddr())
 
+	// The agent sends its own keepalives, but nothing here would notice them
+	// stopping. Without probing from this side, a half-open connection (a
+	// sleeping laptop) stays registered until the kernel gives up on the TCP
+	// session, which can take many minutes, and the label meanwhile accepts
+	// connections that hang.
+	stop := make(chan struct{})
+	defer close(stop)
+	go probeLiveness(conn, label, stop)
+
 	conn.Wait() // blocks until the connection dies
 	reg.remove(label, conn)
 	log.Printf("agent %q disconnected", label)
+}
+
+// probeLiveness pings the agent and closes the connection when it stops
+// answering, which makes conn.Wait return and the registration go away.
+// A false reply still proves liveness: x/crypto/ssh clients refuse unknown
+// global requests by design, so only an error or a timeout counts as dead.
+func probeLiveness(conn ssh.Conn, label string, stop <-chan struct{}) {
+	t := time.NewTicker(keepaliveInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+
+		errc := make(chan error, 1)
+		go func() {
+			_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
+			errc <- err
+		}()
+
+		select {
+		case err := <-errc:
+			if err != nil {
+				log.Printf("agent %q failed keepalive: %v", label, err)
+				conn.Close()
+				return
+			}
+		case <-time.After(keepaliveTimeout):
+			log.Printf("agent %q timed out on keepalive, dropping", label)
+			conn.Close()
+			return
+		case <-stop:
+			return
+		}
+	}
 }
 
 func handleUser(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
@@ -250,6 +318,37 @@ func serveListing(reg *registry, nc ssh.NewChannel) {
 	}
 }
 
+// openTunnel asks the agent for a channel, giving up rather than blocking on
+// an agent whose connection is half-open and not yet known to be dead.
+func openTunnel(agent ssh.Conn) (ssh.Channel, <-chan *ssh.Request, error) {
+	type result struct {
+		ch   ssh.Channel
+		reqs <-chan *ssh.Request
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ch, reqs, err := agent.OpenChannel(sshx.TunnelChannelType, nil)
+		done <- result{ch, reqs, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, nil, fmt.Errorf("agent refused tunnel: %w", r.err)
+		}
+		return r.ch, r.reqs, nil
+	case <-time.After(tunnelOpenTimeout):
+		// If it lands after we gave up, discard it rather than leak a channel.
+		go func() {
+			if r := <-done; r.err == nil {
+				r.ch.Close()
+			}
+		}()
+		return nil, nil, fmt.Errorf("agent did not answer within %s", tunnelOpenTimeout)
+	}
+}
+
 // serveJump routes `ssh -J proxy user@label` to the registered agent.
 func serveJump(reg *registry, conn *ssh.ServerConn, nc ssh.NewChannel) {
 	var d sshx.DirectTCPIP
@@ -267,9 +366,9 @@ func serveJump(reg *registry, conn *ssh.ServerConn, nc ssh.NewChannel) {
 		return
 	}
 
-	tunnel, tReqs, err := agent.OpenChannel(sshx.TunnelChannelType, nil)
+	tunnel, tReqs, err := openTunnel(agent)
 	if err != nil {
-		log.Printf("  user %q -> %q: agent refused tunnel: %v", conn.User(), d.DestHost, err)
+		log.Printf("  user %q -> %q: %v", conn.User(), d.DestHost, err)
 		nc.Reject(ssh.ConnectionFailed, "target unreachable")
 		return
 	}
