@@ -110,11 +110,25 @@ func main() {
 	}
 
 	clientCfg := &ssh.ClientConfig{
-		User:            canonical,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(authSigner)},
+		User: canonical,
+		Auth: []ssh.AuthMethod{ssh.PublicKeys(authSigner)},
+		// The identification string carries the protocol version, so a proxy
+		// too new for this agent can say so before authentication rather than
+		// failing in some later, less legible way.
+		ClientVersion:   sshx.AgentVersion(),
 		HostKeyCallback: hostKeyCB,
-		Timeout:         10 * time.Second,
+		// Whatever the proxy refuses us for, it says here. Without this the
+		// message would be discarded and the operator would see only that
+		// authentication failed.
+		BannerCallback: func(msg string) error {
+			for _, line := range strings.Split(strings.TrimSpace(msg), "\n") {
+				log.Printf("proxy says: %s", strings.TrimSpace(line))
+			}
+			return nil
+		},
+		Timeout: 10 * time.Second,
 	}
+	log.Printf("protocol %s", sshx.DescribeProtocol(sshx.ProtocolVersion))
 
 	// Hold a registration open with every proxy at once rather than failing
 	// over between them. One certificate is valid at all of them, so this
@@ -242,6 +256,14 @@ func session(addr, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, 
 	}
 	client := ssh.NewClient(conn, chans, reqs)
 	defer client.Close()
+
+	// A proxy ahead of this agent still serves it -- refusing would strand the
+	// machine over a difference it may not even notice -- but the mismatch is
+	// worth saying out loud, since an upgrade sweep has to start somewhere.
+	if pv := sshx.ParseProxyVersion(conn.ServerVersion()); pv > sshx.ProtocolVersion {
+		log.Printf("[%s] proxy speaks protocol %s, this agent %s; consider updating this machine",
+			addr, sshx.DescribeProtocol(pv), sshx.DescribeProtocol(sshx.ProtocolVersion))
+	}
 	log.Printf("registered with proxy at %s", addr)
 
 	// Keep the NAT mapping alive from the inside; consumer routers can expire
@@ -259,12 +281,17 @@ func session(addr, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, 
 
 	go func() {
 		for nc := range client.HandleChannelOpen(sshx.TunnelChannelType) {
+			// The payload only describes the tunnel; nothing in version 1
+			// changes what happens next, so an unknown version is served and
+			// noted rather than refused. Refusing would turn a proxy upgrade
+			// into an outage on every machine not updated in step.
+			req := sshx.ParseTunnelRequest(nc.ExtraData())
 			ch, chReqs, err := nc.Accept()
 			if err != nil {
 				continue
 			}
 			go ssh.DiscardRequests(chReqs)
-			go serveEmbedded(ch, hostSigner, authKeys)
+			go serveEmbedded(ch, hostSigner, authKeys, int(req.Version))
 		}
 	}()
 
@@ -273,7 +300,11 @@ func session(addr, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, 
 
 // serveEmbedded runs a complete SSH server across one tunnel channel. The
 // client's handshake terminates here, so the proxy sees only ciphertext.
-func serveEmbedded(ch ssh.Channel, hostSigner ssh.Signer, authKeys string) {
+func serveEmbedded(ch ssh.Channel, hostSigner ssh.Signer, authKeys string, tunnelVersion int) {
+	if tunnelVersion > sshx.ProtocolVersion {
+		log.Printf("tunnel opened at protocol %s, above this agent's %s; serving it anyway",
+			sshx.DescribeProtocol(tunnelVersion), sshx.DescribeProtocol(sshx.ProtocolVersion))
+	}
 	allowed, err := sshx.LoadAuthorizedKeys(authKeys)
 	if err != nil {
 		log.Printf("authorized_keys: %v", err)

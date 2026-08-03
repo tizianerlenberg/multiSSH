@@ -12,9 +12,9 @@ import (
 
 // Every target has two names.
 //
-// The canonical name embeds a hash of the target's own host key, so it is
-// unique by construction and needs no bookkeeping to stay that way. More
-// importantly the name *commits to the key your client verifies*: no other
+// The canonical name embeds a hash of the target's own host key and its own
+// label, so it is unique by construction and needs no bookkeeping to stay that
+// way. More importantly the name *commits to the key your client verifies*: no other
 // machine can be given that name, because the string is derived from a key it
 // does not hold. That keeps the proxy out of the trust chain -- it cannot
 // substitute a different host key for a canonical name even if it is
@@ -45,13 +45,30 @@ func ValidFriendlyName(s string) bool { return friendlyRe.MatchString(s) }
 // friendly one.
 func IsCanonicalName(s string) bool { return strings.Contains(s, ".") }
 
-// CanonicalName derives "<base>.<hash of hostKey>".
+// nameDomain separates this hash from any other use of the same key material,
+// so a digest computed elsewhere can never be mistaken for a name.
+const nameDomain = "multissh-canonical-name-v1"
+
+// CanonicalName derives "<base>.<hash of base and hostKey>".
+//
+// The label goes into the hash as well as in front of it. Hashing the host key
+// alone would leave the label free: the same machine could be presented under
+// any number of canonical names, each verifying perfectly, and "laptop" and
+// "backup-server" could be the same box with no way to tell. Binding it costs
+// nothing and makes the whole name, not just its tail, commit to the key.
 func CanonicalName(base string, hostKey ssh.PublicKey) (string, error) {
 	if !ValidFriendlyName(base) {
 		return "", fmt.Errorf("label %q must be lowercase letters, digits and dashes, and must not contain a dot", base)
 	}
-	sum := sha256.Sum256(hostKey.Marshal())
-	return base + "." + b32.EncodeToString(sum[:])[:hashLen], nil
+	h := sha256.New()
+	h.Write([]byte(nameDomain))
+	h.Write([]byte{0})
+	// The label alphabet excludes NUL, so this separator cannot be produced
+	// from within either field.
+	h.Write([]byte(base))
+	h.Write([]byte{0})
+	h.Write(hostKey.Marshal())
+	return base + "." + b32.EncodeToString(h.Sum(nil))[:hashLen], nil
 }
 
 // VerifyCanonicalName checks that a host key matches the name claiming it.

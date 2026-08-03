@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,9 +63,20 @@ func sourceHost(addr net.Addr) string {
 // registration is one connected agent under one of its names. The fingerprint
 // is of the agent's identity key -- the thing the proxy authenticates -- so
 // re-issuing a certificate for a machine is not mistaken for a new machine.
+// It is also the handle revocation works on, which is why it is shown to the
+// user rather than kept in the log.
 type registration struct {
-	conn ssh.Conn
-	fp   string
+	conn  ssh.Conn
+	fp    string
+	proto int
+}
+
+// target is one row of the listing `ssh proxy` prints.
+type target struct {
+	Friendly  string
+	Canonical string
+	Proto     int
+	FP        string
 }
 
 // registry tracks which agents are currently connected. A target appears under
@@ -85,14 +98,14 @@ func newRegistry() *registry { return &registry{m: make(map[string]registration)
 // connection must win. A *different* key claiming a name that is already taken
 // is refused. Allowing it to evict instead would let two machines kick each
 // other off forever, leaving neither reliably reachable.
-func (r *registry) add(name string, conn ssh.Conn, fp string) error {
+func (r *registry) add(name string, conn ssh.Conn, fp string, proto int) error {
 	r.mu.Lock()
 	old, existed := r.m[name]
 	if existed && old.fp != fp {
 		r.mu.Unlock()
 		return fmt.Errorf("%q is held by a different machine (%s)", name, old.fp)
 	}
-	r.m[name] = registration{conn: conn, fp: fp}
+	r.m[name] = registration{conn: conn, fp: fp, proto: proto}
 	r.mu.Unlock()
 
 	if existed && old.conn != conn {
@@ -121,7 +134,7 @@ func (r *registry) get(name string) (ssh.Conn, bool) {
 
 // listing pairs each canonical name with the friendly name pointing at the
 // same connection, so `ssh proxy` can show both.
-func (r *registry) listing() [][2]string {
+func (r *registry) listing() []target {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -136,9 +149,28 @@ func (r *registry) listing() [][2]string {
 	}
 	sort.Strings(canonical)
 
-	out := make([][2]string, 0, len(canonical))
+	out := make([]target, 0, len(canonical))
 	for _, c := range canonical {
-		out = append(out, [2]string{friendly[r.m[c].conn], c})
+		reg := r.m[c]
+		out = append(out, target{
+			Friendly:  friendly[reg.conn],
+			Canonical: c,
+			Proto:     reg.proto,
+			FP:        reg.fp,
+		})
+	}
+	return out
+}
+
+// connections returns every distinct live agent connection with its
+// fingerprint, so a sweep (revocation, counting) does not see a machine twice
+// for holding two names.
+func (r *registry) connections() map[ssh.Conn]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[ssh.Conn]string, len(r.m))
+	for _, reg := range r.m {
+		out[reg.conn] = reg.fp
 	}
 	return out
 }
@@ -156,9 +188,16 @@ func main() {
 		ledgerPath = flag.String("labels", "friendly_labels", "advisory record of which machine owns which friendly name")
 		seenFile   = flag.String("last-seen", "last_seen", "advisory record of when each target was last connected")
 		pwFile     = flag.String("passwords", "enrol_passwords.json", "enrolment passwords, argon2id hashed")
+		revFile    = flag.String("revoked", "revoked_keys", "barred agent identity fingerprints; NOT advisory, back this up")
 		distDir    = flag.String("dist", "dist", "directory of agent builds named <os>-<arch>")
 		publicURL  = flag.String("public-url", "", "how targets reach this proxy, e.g. https://multissh.example.com; enables the installer")
 		enrolValid = flag.Duration("enrol-validity", 0, "lifetime of issued certificates; 0 never expires")
+		staleAfter = flag.Duration("stale-after", 30*24*time.Hour, "flag targets not seen for this long as stale")
+		// The default accepts everything, including agents installed before
+		// the version handshake existed. Refusing old agents strands machines
+		// nobody is going to walk over to, so it stays a decision taken
+		// deliberately here rather than one a proxy upgrade makes for you.
+		minProto = flag.Int("min-agent-protocol", sshx.LegacyProtocol, "refuse agents older than this protocol version")
 
 		showCA        = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
 		signKey       = flag.String("sign", "", "issue a certificate for this public key file, then exit")
@@ -170,9 +209,25 @@ func main() {
 		pwValidity    = flag.Duration("password-validity", 0, "lifetime of the new password; 0 never expires")
 		listPasswords = flag.Bool("list-passwords", false, "show enrolment passwords and exit")
 		delPassword   = flag.String("remove-password", "", "delete the enrolment password with this label, then exit")
+		revoke        = flag.String("revoke", "", "bar this agent identity fingerprint (SHA256:...), then exit")
+		unrevoke      = flag.String("unrevoke", "", "lift a revocation, then exit")
+		revokeNote    = flag.String("revoke-note", "", "why, recorded beside the fingerprint")
+		listRevoked   = flag.Bool("list-revoked", false, "show revoked fingerprints and exit")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
+
+	// Revocation is handled before anything else touches a key. It needs no
+	// authority at all -- a standby can revoke too, and should be able to,
+	// since it is what still works when the primary is gone -- and running it
+	// after the block below would create a certificate authority as a side
+	// effect of listing revoked keys.
+	if *listRevoked || *revoke != "" || *unrevoke != "" {
+		if err := manageRevocations(*revFile, *revoke, *unrevoke, *listRevoked, *revokeNote, *ledgerPath); err != nil {
+			log.Fatalf("revoke: %v", err)
+		}
+		return
+	}
 
 	// Verifying a certificate needs only the authority's public key; issuing
 	// one needs the private key. A standby therefore runs on the public half
@@ -255,7 +310,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("last-seen: %v", err)
 	}
-	log.Printf("loaded %d user key(s)", len(users))
+	revoked, err := openRevocations(*revFile)
+	if err != nil {
+		log.Fatalf("revoked: %v", err)
+	}
+	log.Printf("loaded %d user key(s), %d revoked agent key(s)", len(users), revoked.count())
+
+	// Silent decay is this tool's real failure mode: an agent that stopped
+	// months ago is otherwise discovered during the emergency it existed for.
+	// Say so at startup, where it is seen without being asked for.
+	if stale := seen.staleSince(time.Now().Add(-*staleAfter)); len(stale) > 0 {
+		log.Printf("WARNING: %d target(s) not seen in %s:", len(stale), *staleAfter)
+		for _, s := range stale {
+			log.Printf("    %s  last seen %s", s.Name, ago(s.When))
+		}
+	}
 
 	// Agents pin the authority rather than a key, so a proxy rebuilt on new
 	// hardware with a new host key is accepted without touching a target. The
@@ -285,8 +354,10 @@ func main() {
 	agentHostSigner := certSigner
 
 	reg := newRegistry()
+	go revoked.watch(reg)
 
 	userCfg := &ssh.ServerConfig{
+		ServerVersion: sshx.ProxyVersion(),
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if !users[string(key.Marshal())] {
 				return nil, fmt.Errorf("unauthorized user key")
@@ -306,7 +377,28 @@ func main() {
 	}
 
 	agentCfg := &ssh.ServerConfig{
+		ServerVersion: sshx.ProxyVersion(),
+		// An agent refused for its protocol version would otherwise see only
+		// "authentication failed", on a machine nobody is standing next to.
+		// This puts the reason in the agent's own log.
+		//
+		// Only the version case can be reported this way: the banner is sent
+		// before any key is offered, so revocation -- a fact about the key --
+		// is not yet knowable here. That refusal is named in the proxy's log
+		// instead, which is where whoever revoked the machine is looking.
+		BannerCallback: func(c ssh.ConnMetadata) string {
+			if v := sshx.ParseAgentVersion(c.ClientVersion()); v < *minProto {
+				return fmt.Sprintf("this proxy needs agent protocol %s or newer; you speak %s. Re-run the installer to update.\n",
+					sshx.DescribeProtocol(*minProto), sshx.DescribeProtocol(v))
+			}
+			return ""
+		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			proto := sshx.ParseAgentVersion(c.ClientVersion())
+			if proto < *minProto {
+				return nil, fmt.Errorf("agent protocol %s is below the minimum %s",
+					sshx.DescribeProtocol(proto), sshx.DescribeProtocol(*minProto))
+			}
 			// Only a certificate we signed. CheckCert verifies the signature,
 			// the validity window, and that the name the agent claims is one
 			// of the principals we put in the certificate -- so names remain
@@ -314,6 +406,15 @@ func main() {
 			cert, ok := key.(*ssh.Certificate)
 			if !ok {
 				return nil, fmt.Errorf("agents must present a certificate")
+			}
+			// Revocation is checked before the certificate, and on the key
+			// inside it rather than on the certificate: re-issuing a
+			// certificate must not undo a revocation, and re-enrolling the
+			// same machine reuses the same identity key.
+			fp := ssh.FingerprintSHA256(cert.Key)
+			if reason, yes := revoked.revoked(fp); yes {
+				log.Printf("REFUSING revoked agent %s from %s (%s)", fp, c.RemoteAddr(), reason)
+				return nil, fmt.Errorf("this identity key is revoked")
 			}
 			if err := certChecker.CheckCert(c.User(), cert); err != nil {
 				return nil, fmt.Errorf("certificate rejected: %w", err)
@@ -325,7 +426,8 @@ func main() {
 			// request, granted later only if unclaimed.
 			ext := map[string]string{
 				"canonical": c.User(),
-				"fp":        ssh.FingerprintSHA256(cert.Key),
+				"fp":        fp,
+				"proto":     strconv.Itoa(proto),
 			}
 			for _, p := range cert.ValidPrincipals {
 				if !sshx.IsCanonicalName(p) {
@@ -371,15 +473,17 @@ func main() {
 					proxies:   agentURLs(*publicURL, *wsPath),
 					limit:     newLimiter(enrolRateWindow, enrolRateBurst),
 					validity:  *enrolValid,
+					revoked:   revoked,
 				},
 			}
 		}
 	}
 
-	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler, extra)
+	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler,
+		serveHealth(reg, seen, revoked, *staleAfter), extra)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-		handleUser(reg, seen, c, chans, reqs)
+		handleUser(reg, seen, *staleAfter, c, chans, reqs)
 	})
 }
 
@@ -528,8 +632,42 @@ func agentURLs(public, path string) []string {
 	return []string{u + path}
 }
 
-func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, extra *httpExtras) {
+// serveHealth answers monitoring without authentication, so it must give away
+// nothing. Counts only: target names and fingerprints are deliberately absent,
+// because this shares a public hostname with the installer and knowing which
+// machines exist is itself worth something to an attacker. Names live in the
+// authenticated listing.
+func serveHealth(reg *registry, seen *sightings, revoked *revocations, staleAfter time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		connected := len(reg.connections())
+		known := seen.known()
+		stale := seen.staleSince(time.Now().Add(-staleAfter))
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(struct {
+			Status     string `json:"status"`
+			Connected  int    `json:"connected"`
+			Known      int    `json:"known"`
+			Stale      int    `json:"stale"`
+			StaleAfter string `json:"stale_after"`
+			Revoked    int    `json:"revoked"`
+			Protocol   int    `json:"protocol"`
+		}{
+			Status:     "ok",
+			Connected:  connected,
+			Known:      len(known),
+			Stale:      len(stale),
+			StaleAfter: staleAfter.String(),
+			Revoked:    revoked.count(),
+			Protocol:   sshx.ProtocolVersion,
+		})
+	}
+}
+
+func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, health http.HandlerFunc, extra *httpExtras) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", health)
 	if extra != nil {
 		mux.HandleFunc("/install.sh", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/x-shellscript")
@@ -566,6 +704,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 	canonical := conn.Permissions.Extensions["canonical"]
 	friendly := conn.Permissions.Extensions["friendly"]
 	fp := conn.Permissions.Extensions["fp"]
+	proto, _ := strconv.Atoi(conn.Permissions.Extensions["proto"])
 
 	// Answer keepalives; refuse everything else, including tcpip-forward.
 	go func() {
@@ -584,7 +723,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 
 	// The canonical name is derived from the agent's own host key, so a clash
 	// here means someone ground a key or replayed a certificate. Refuse.
-	if err := reg.add(canonical, conn, fp); err != nil {
+	if err := reg.add(canonical, conn, fp, proto); err != nil {
 		log.Printf("REFUSING agent from %s: %v; arriving key %s", conn.RemoteAddr(), err, fp)
 		conn.Close()
 		return
@@ -600,7 +739,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 			log.Printf("agent %q wanted the name %q, which belongs to another machine; "+
 				"it is reachable canonically only", canonical, friendly)
 		default:
-			if err := reg.add(friendly, conn, fp); err != nil {
+			if err := reg.add(friendly, conn, fp, proto); err != nil {
 				log.Printf("agent %q could not take %q: %v", canonical, friendly, err)
 			} else {
 				names = append(names, friendly)
@@ -609,7 +748,11 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 	}
 
 	seen.seen(canonical)
-	log.Printf("agent registered from %s as %s", conn.RemoteAddr(), strings.Join(names, " and "))
+	// The fingerprint is logged on the way in, not only when something goes
+	// wrong: it is the handle -revoke takes, so it has to be obtainable from a
+	// machine that is behaving normally.
+	log.Printf("agent registered from %s as %s, protocol %s, identity %s",
+		conn.RemoteAddr(), strings.Join(names, " and "), sshx.DescribeProtocol(proto), fp)
 
 	// The agent sends its own keepalives, but nothing here would notice them
 	// stopping. Without probing from this side, a half-open connection (a
@@ -666,7 +809,7 @@ func probeLiveness(conn ssh.Conn, label string, stop <-chan struct{}) {
 	}
 }
 
-func handleUser(reg *registry, seen *sightings, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+func handleUser(reg *registry, seen *sightings, staleAfter time.Duration, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 	log.Printf("user %q connected from %s", conn.User(), conn.RemoteAddr())
 
 	// Draining is mandatory or the connection deadlocks. Replying false is the
@@ -685,7 +828,7 @@ func handleUser(reg *registry, seen *sightings, conn *ssh.ServerConn, chans <-ch
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":
-			go serveListing(reg, seen, nc)
+			go serveListing(reg, seen, staleAfter, nc)
 		case "direct-tcpip":
 			go serveJump(reg, conn, nc)
 		default:
@@ -696,12 +839,13 @@ func handleUser(reg *registry, seen *sightings, conn *ssh.ServerConn, chans <-ch
 }
 
 // serveListing answers a plain `ssh proxy` with the available targets.
-func serveListing(reg *registry, seen *sightings, nc ssh.NewChannel) {
+func serveListing(reg *registry, seen *sightings, staleAfter time.Duration, nc ssh.NewChannel) {
 	ch, reqs, err := nc.Accept()
 	if err != nil {
 		return
 	}
 	defer ch.Close()
+	staleBefore := time.Now().Add(-staleAfter)
 
 	for req := range reqs {
 		switch req.Type {
@@ -719,11 +863,16 @@ func serveListing(reg *registry, seen *sightings, nc ssh.NewChannel) {
 			} else {
 				fmt.Fprintf(ch, " registered targets (%d):\r\n\r\n", len(list))
 				for _, t := range list {
-					fmt.Fprintf(ch, "   %-20s %s\r\n", t[0], t[1])
+					fmt.Fprintf(ch, "   %-20s %-24s %s\r\n", t.Friendly, t.Canonical, sshx.DescribeProtocol(t.Proto))
+					// The identity fingerprint is what -revoke takes, so it
+					// belongs somewhere reachable without shell access to the
+					// proxy. Its own line, because a full fingerprint plus two
+					// names does not fit an 80-column terminal.
+					fmt.Fprintf(ch, "     %s\r\n", t.FP)
 				}
-				pick := list[0][0]
+				pick := list[0].Friendly
 				if pick == "" {
-					pick = list[0][1]
+					pick = list[0].Canonical
 				}
 				fmt.Fprintf(ch, "\r\n connect with:  ssh -J <thisproxy> user@%s\r\n", pick)
 			}
@@ -733,19 +882,25 @@ func serveListing(reg *registry, seen *sightings, nc ssh.NewChannel) {
 			// absence should be visible without being asked for.
 			online := map[string]bool{}
 			for _, t := range list {
-				online[t[1]] = true
+				online[t.Canonical] = true
 			}
 			var missing []string
 			for _, k := range seen.known() {
-				if !online[k.Name] {
-					missing = append(missing, fmt.Sprintf("   %-24s last seen %s", k.Name, ago(k.When)))
+				if online[k.Name] {
+					continue
 				}
+				mark := " "
+				if k.When.Before(staleBefore) {
+					mark = "!"
+				}
+				missing = append(missing, fmt.Sprintf(" %s %-24s last seen %s", mark, k.Name, ago(k.When)))
 			}
 			if len(missing) > 0 {
 				fmt.Fprintf(ch, "\r\n not connected (%d):\r\n\r\n", len(missing))
 				for _, m := range missing {
 					fmt.Fprintf(ch, "%s\r\n", m)
 				}
+				fmt.Fprintf(ch, "\r\n ! not seen in %s\r\n", staleAfter)
 			}
 			fmt.Fprintf(ch, "\r\n")
 			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
@@ -769,7 +924,7 @@ func openTunnel(agent ssh.Conn) (ssh.Channel, <-chan *ssh.Request, error) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		ch, reqs, err := agent.OpenChannel(sshx.TunnelChannelType, nil)
+		ch, reqs, err := agent.OpenChannel(sshx.TunnelChannelType, sshx.MarshalTunnelRequest())
 		done <- result{ch, reqs, err}
 	}()
 

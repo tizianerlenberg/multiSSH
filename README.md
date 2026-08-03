@@ -11,7 +11,7 @@ case is why the agent runs its **own** SSH server rather than forwarding to the
 system one: a broken `sshd` on the target has no bearing on whether you can get
 in.
 
-> **Status: working prototype, Linux only. Reliability gaps closed; internet exposure still untested.**
+> **Status: working prototype, exercised only on Linux. Internet exposure still untested.**
 > See [Security](#security) and [Known gaps](#known-gaps) before exposing it.
 >
 > The Python implementation this replaces is at the `v0-python` tag.
@@ -140,14 +140,32 @@ $ ssh proxy
 
  registered targets (2):
 
-   homeserver
-   laptop
+   homeserver           homeserver.4kfq2wtnbxue  v1
+     SHA256:0kA1pS9vHhLmXqR7dTgWc2ZuYbN4eJf6oPiK3sVrQ8w
+   laptop               laptop.niwru7dfuvu5abcd  v1
+     SHA256:2LnQxYd8vTgMhR6pW3kZjB5cFsN1eUaHo9KiV7rXmY0
 
  connect with:  ssh -J proxy user@laptop
+
+ not connected (1):
+
+ ! oldbox.7hs3kqp2mfxa       last seen 94d ago
+
+ ! not seen in 720h0m0s
 
 $ ssh -J proxy tizian@laptop
 tizian@target:~$
 ```
+
+The second line under each target is its **identity fingerprint**, which is
+what [revocation](#revoking-a-machine) takes. `v1` is the agent's protocol
+version, so an upgrade sweep can be planned by looking rather than guessing.
+
+**The username is ignored by both hops.** The proxy does not use it (the target
+is chosen by hostname), and the agent's embedded server does not switch users —
+it runs the shell as whoever the agent runs as. So `ssh -J proxy root@laptop`
+on a user-scope install silently gives you a *non-root* shell. Write whatever
+you like; only your key matters.
 
 `scp`/`sftp` do **not** work yet — the embedded server serves interactive
 sessions and `exec` only.
@@ -186,12 +204,17 @@ laptop.niwru7dfuvu5     canonical: derived from the target's own host key
 laptop                  friendly: convenience, granted only when unclaimed
 ```
 
-The canonical name embeds a hash of the target's host key, so it is unique by
-construction and needs no bookkeeping. More usefully, **the name commits to the
-key your client verifies**: no other machine can be given that name, because
-the string is derived from a key it does not hold. On the one connection where
-trust-on-first-use is exposed, you can check the fingerprint against the name
-you typed.
+The canonical name embeds a hash of the target's host key **and of its own
+label**, so it is unique by construction and needs no bookkeeping. More
+usefully, **the name commits to the key your client verifies**: no other machine
+can be given that name, because the string is derived from a key it does not
+hold. On the one connection where trust-on-first-use is exposed, you can check
+the fingerprint against the name you typed.
+
+The label goes into the hash as well as in front of it. Hashing the host key
+alone would leave the label free, so one machine could be presented under any
+number of canonical names — each verifying perfectly — and `laptop` and
+`backup-server` could be the same box with no way to tell.
 
 Friendly names may not contain a dot; canonical names always do. That is the
 whole of the namespace separation, so the two can never be confused.
@@ -210,11 +233,19 @@ Rebuild the proxy on new hardware, restore that one file, and every target
 reconnects on its own. A fresh host key is signed by the restored CA at
 startup, so agents accept the replacement without being touched, and your own
 `@cert-authority` line still matches. This is tested: the test deletes the
-proxy's host key, confirms no agent list ever existed, restarts, and watches
-the agent come back unaided.
+proxy's host key and every advisory record, restarts with only the CA key, and
+watches the agent come back unaided *and be reachable*, not merely listed.
 
-`users_authorized_keys` is worth keeping too, but it holds your own public
-keys, which you already have.
+What each file costs you if it is lost:
+
+| File | Losing it costs |
+|---|---|
+| `proxy_ca_key` | **everything** — every machine must be re-enrolled by hand |
+| `revoked_keys` | **silently un-revokes every entry**; back this up too |
+| `users_authorized_keys` | nothing you do not already have — your own public keys |
+| `friendly_labels` | a convenient name, until the machine reconnects and reclaims it |
+| `last_seen` | history, so decay is harder to notice for a while |
+| `enrol_passwords.json` | the ability to enrol new machines until you make another |
 
 ```bash
 # enrol a machine: the proxy signs its identity and derives its canonical
@@ -232,7 +263,42 @@ Certificates never expire by default. For a rescue tool that is deliberate: a
 machine switched off longer than its certificate lasts would otherwise lock
 itself out. Use `-sign-validity` if you want expiry.
 
+### Revoking a machine
+
+Because certificates do not expire, revocation is the only lever that removes a
+machine's access, and the trade above is only honest if it works.
+
+```bash
+./proxy -revoke SHA256:2LnQxYd8… -revoke-note "stolen laptop"
+./proxy -list-revoked
+./proxy -unrevoke SHA256:2LnQxYd8…
+```
+
+The handle is the SHA256 fingerprint of the agent's **identity key**, shown by
+`ssh proxy` and logged on every registration. Not the certificate serial:
+fingerprints survive re-issuing a certificate, whereas serials would need a
+name-to-serial map — exactly the growing state the certificate design removed.
+
+A running proxy re-reads `revoked_keys` every 30 seconds and **drops matching
+connections that are already established**, so revoking does not wait for the
+machine to reconnect, and does not mean restarting the proxy and killing every
+other session.
+
+⚠️ **`revoked_keys` is the one file that is not advisory.** `friendly_labels`
+and `last_seen` cost you a convenient name or some history; losing *this* one
+silently un-revokes every entry. Back it up with `proxy_ca_key`. The file says
+so in its own header.
+
+⚠️ Revocation bars a **key**, not a machine. Anyone still holding a valid
+enrolment password can enrol the same machine afresh under a new key. If the
+hardware is genuinely out of your hands, `-remove-password` too.
+
 ### Verified by test
+
+`go test ./...` runs everything below. The end-to-end tests build the real
+proxy and agent binaries and run them over loopback, including a real PTY, so
+they check the shipped programs rather than a rehearsal of them. `-short` skips
+those and leaves the unit tests.
 
 - `ssh -R` cannot make the proxy open a listening port
 - `exec`, `subsystem`, X11 and agent forwarding are refused on the proxy
@@ -255,13 +321,24 @@ itself out. Use `-sign-validity` if you want expiry.
 - the installer works over real TLS through real Caddy, end to end
 - failed ssh handshakes are counted per source address and refused past a
   threshold, as `/enroll` attempts already were
+- a revoked agent cannot register, and un-revoking lets it back in
+- an agent below the configured protocol floor is refused, and is *told why* in
+  its own log
+- `/healthz` reports without naming a single target
+- two regressions are frozen against their original shapes: rate-limit keys
+  must strip the source port, and `expected_hash` in the installer must exit
+  zero when the platform is not the last entry in the list
+
+The last two are there because both bugs were invisible in exactly the
+configuration they were tested in — one build served, one request made — and
+only appeared in the shape a real deployment takes.
 
 ### Before exposing it publicly
 
-The denial-of-service and liveness gaps are closed, but this has still only
-ever run on a LAN, against a single agent, on Linux. Treat internet exposure as
-untested. There is no rate limiting on repeated failed authentication, and no
-cap on concurrent connections.
+This has still only ever run on a LAN, against a single agent, on Linux. Treat
+internet exposure as untested. Concretely, what is *not* there: no cap on
+concurrent connections, and no per-user access control — any key in
+`users_authorized_keys` reaches every registered target.
 
 ---
 
@@ -274,7 +351,10 @@ cap on concurrent connections.
 | 🟡 | Windows registers a scheduled task, not a real service. | No restart-on-crash beyond the agent's own reconnect loop. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
-| ⚪ | No installer. Enrollment is manual: run the sign command and copy three files to the target. | See below. |
+| 🟡 | No cap on concurrent connections. | A user key is enough to exhaust memory on the proxy. |
+| 🟡 | Everyone with a user key reaches every target. No ACLs. | Fine for one operator; wrong the moment a second key is added for someone else. |
+| 🟡 | Proxy configuration is entirely flags, which makes `ExecStart` unwieldy. | A config file would be kinder. |
+| ⚪ | A machine that enrolled but never once connected is invisible to the proxy — enrolment writes nothing there. | The installer reports success on the target instead. |
 
 ## Installing a target
 
@@ -326,17 +406,49 @@ terminal rather than hanging on a prompt.
 
 Passwords are argon2id-hashed with a lifetime chosen when created, `/enroll` is
 rate limited, and enrolment writes nothing to the proxy — so none of this adds
-anything to back up.
+anything to back up. A revoked identity key is refused at `/enroll` too, rather
+than being handed a certificate that would then fail forever at connect time.
 
-### On a one-line installer
+---
 
-A `curl … | sh` installer can drop the binary, generate keys, pre-seed the
-proxy's host key and install a service unit — but it **cannot finish enrollment
-on its own**, because the proxy must already know the agent's public key before
-it will accept the connection.
+## Noticing decay
 
-Manual enrollment (run the sign command, copy the certificate and CA key to the
-target) is what works today. The design below is what it should become.
+The realistic failure mode is not a breach. It is an agent that quietly stopped
+months ago, discovered during the emergency it was meant to cover.
+
+- `ssh proxy` lists machines it has seen before but that are **not connected
+  now**, oldest first, and marks with `!` anything past `-stale-after`
+  (30 days by default).
+- The same warning is logged at proxy startup.
+- `/healthz` on the agent listener answers monitoring:
+
+```json
+{"status":"ok","connected":3,"known":5,"stale":1,"stale_after":"720h0m0s","revoked":0,"protocol":1}
+```
+
+It is **unauthenticated and deliberately anonymous** — counts only, no names and
+no fingerprints. It shares a public hostname with the installer, and which
+machines exist is itself worth something to an attacker. Names live in the
+authenticated listing.
+
+## Protocol versioning
+
+The agent runs on machines nobody touches; that is the entire point. So a
+protocol change has to be something both ends can *see*, rather than something
+that surfaces as an inexplicable failure months later.
+
+- The version rides in the SSH identification string, exchanged before
+  anything else. `-min-agent-protocol` refuses agents below a floor, and the
+  proxy sends a **banner** saying so, which the agent prints to its own log —
+  rather than leaving an unattributed authentication failure.
+- The floor defaults to accepting everything, including agents installed before
+  any of this existed. Refusing an old agent strands a machine, so that stays a
+  decision taken deliberately rather than one a proxy upgrade makes for you.
+- The tunnel channel carries a versioned payload with a reserved `Extra` field.
+  New fields go *inside* it, because `ssh.Unmarshal` rejects a payload that does
+  not match its struct exactly — so adding a field directly would break every
+  agent already in the field. There is a test that fails if that ever stops
+  being true.
 
 ---
 
@@ -403,48 +515,17 @@ The user-facing SSH listener stays on `:22` and bypasses Caddy, since an `ssh`
 client cannot speak through it. Putting the client side on `:443` too would
 need a `ProxyCommand` helper, which breaks "stock ssh client, nothing extra".
 
-## Planned: enrollment
+---
 
-Adding a machine has to be nearly frictionless, or it does not get done.
+## Development
 
-The proxy serves the installer itself, so `install.sh` is generated per request
-with **the proxy's own SSH host key fingerprint baked in**. The agent then pins
-the right key on its very first connect, and the trust-on-first-use window
-disappears entirely — anchored on the Caddy TLS certificate instead.
-
-```
-curl https://multissh.example.com/install.sh | sh
+```bash
+go test ./...            # unit tests plus end-to-end, ~20s
+go test -short ./...     # unit tests only
+sh deploy/build.sh dist  # every platform
 ```
 
-**Naming.** Prompt for a label, defaulting to the machine's hostname, Enter to
-accept. If that label is already registered, the proxy assigns a variant rather
-than failing — `laptop-2`, or a short random suffix like `laptop-6sk2`. Never
-silently replace an existing registration.
-
-**Credential.** A password registered with the proxy ahead of time, each with
-its own **configurable longevity** — a long-lived one for convenience, or a
-short-lived one when handing a machine to someone else. Requirements:
-
-- stored as an argon2id hash, never plaintext
-- `/enroll` rate-limited, or it is a brute-force oracle
-- create-only: enrollment may never overwrite an existing label
-
-**Enrollment window: optional, off by default.** A deliberately opened window
-is the stricter option, but it adds friction to the operation that most needs
-to stay easy. Password longevity already time-boxes the risk. Worth having as
-an opt-in for anyone who wants it.
-
-**Later: browser approval.** The appealing version is a page on the same
-domain, already authenticated on phone or desktop, where a pending enrollment
-is approved with one button. Best security *and* the least friction, but it
-needs a session/auth story of its own, so it comes after the password flow.
-
-⚠️ Implementation note: with `curl … | sh`, stdin is the script itself, so a
-plain `read` gets EOF. The prompt must read the terminal directly:
-
-```sh
-printf 'Enrollment password: '
-read -rs PASSWORD < /dev/tty
-```
-
-PowerShell's `iex (irm …)` is unaffected; `Read-Host` works normally.
+CI runs `gofmt`, `go vet`, `go test -race`, a cross-compile of all five
+platforms, `sh -n` and `shellcheck` over the installer, and a PowerShell parse
+check of `install.ps1` — the last of these because the Windows path has never
+been run on real hardware, so a parse is the only guard it has.

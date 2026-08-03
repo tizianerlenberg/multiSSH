@@ -2,8 +2,10 @@
 #   systemctl enable --now multissh-proxy
 #
 # Runs from its own directory because that is where it keeps the authority key,
-# its host key and the advisory ledgers. Back up proxy_ca_key from there; it is
-# the one file that matters.
+# its host key, the advisory ledgers and the revocation list. Back up
+# proxy_ca_key and revoked_keys from there: the first is what the whole system
+# is recoverable from, and the second is the only one whose loss undoes work
+# silently -- losing it un-revokes every barred machine.
 [Unit]
 Description=multiSSH proxy
 After=network-online.target

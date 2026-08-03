@@ -175,6 +175,7 @@ type enroller struct {
 	proxies   []string
 	limit     *limiter
 	validity  time.Duration
+	revoked   *revocations
 }
 
 func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +218,20 @@ func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
 	hostPub, err := parseAuthorizedKey(req.HostKey)
 	if err != nil {
 		http.Error(w, "bad host key", http.StatusBadRequest)
+		return
+	}
+
+	// Signing a fresh certificate for a revoked key would leave the machine
+	// still barred at connect time, but confusingly so: the installer would
+	// report success and the agent would then fail forever. Refuse here, where
+	// there is somewhere to put the reason.
+	//
+	// This does not stop a machine still in someone else's hands from enrolling
+	// under a *new* identity key, which no key-based revocation can. Removing
+	// the enrolment password is the lever for that, and -revoke says so.
+	if note, yes := e.revoked.revoked(ssh.FingerprintSHA256(identPub)); yes {
+		logf("enrol refused from %s: identity key is revoked (%s)", who, note)
+		http.Error(w, "this identity key is revoked", http.StatusForbidden)
 		return
 	}
 
