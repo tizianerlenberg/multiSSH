@@ -20,6 +20,9 @@ import (
 //go:embed scripts/install.sh
 var installShTemplate string
 
+//go:embed scripts/install.ps1
+var installPs1Template string
+
 // The proxy serves the installer and the agent binaries itself rather than
 // pointing at a release host. It has to be reachable for the agent to work at
 // all, so serving from here adds no failure mode -- and it can bake its own
@@ -115,6 +118,15 @@ func (d *distributor) serveBinary(w http.ResponseWriter, r *http.Request) {
 // installScript renders the installer for this proxy: its address, its
 // authority, and the checksums of the builds it is currently serving.
 func installScript(d *distributor, caPub ssh.PublicKey, baseURL string, proxies []string) string {
+	return renderScript(installShTemplate, d, caPub, baseURL, proxies)
+}
+
+// installPowerShell is the same for Windows.
+func installPowerShell(d *distributor, caPub ssh.PublicKey, baseURL string, proxies []string) string {
+	return renderScript(installPs1Template, d, caPub, baseURL, proxies)
+}
+
+func renderScript(tmpl string, d *distributor, caPub ssh.PublicKey, baseURL string, proxies []string) string {
 	hashes, version := d.snapshot()
 
 	pairs := make([]string, 0, len(hashes))
@@ -130,5 +142,5 @@ func installScript(d *distributor, caPub ssh.PublicKey, baseURL string, proxies 
 		"__VERSION__", version,
 		"__HASHES__", strings.Join(pairs, " "),
 	)
-	return r.Replace(installShTemplate)
+	return r.Replace(tmpl)
 }

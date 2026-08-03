@@ -38,7 +38,25 @@ const (
 	keepaliveTimeout  = 15 * time.Second
 	// tunnelOpenTimeout stops a user waiting on an unresponsive agent.
 	tunnelOpenTimeout = 10 * time.Second
+
+	// authFailWindow/Burst slow down key guessing against the ssh listeners.
+	// The /enroll endpoint has its own limiter; this covers the other door.
+	authFailWindow = 5 * time.Minute
+	authFailBurst  = 10
 )
+
+// authFailures counts recent failed handshakes per source address, so a host
+// that keeps guessing is turned away before the expensive part.
+var authFailures = newLimiter(authFailWindow, authFailBurst)
+
+// sourceHost strips the port: a new connection gets a new one, so counting
+// with it would treat every attempt as a different peer and limit nothing.
+func sourceHost(addr net.Addr) string {
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
+}
 
 // registration is one connected agent under one of its names. The fingerprint
 // is of the agent's identity key -- the thing the proxy authenticates -- so
@@ -136,6 +154,7 @@ func main() {
 		hostCert   = flag.String("host-cert", "proxy_host_key-cert.pub", "host certificate issued by the primary; required on a standby")
 		usersFile  = flag.String("users", "users_authorized_keys", "authorized_keys for users")
 		ledgerPath = flag.String("labels", "friendly_labels", "advisory record of which machine owns which friendly name")
+		seenFile   = flag.String("last-seen", "last_seen", "advisory record of when each target was last connected")
 		pwFile     = flag.String("passwords", "enrol_passwords.json", "enrolment passwords, argon2id hashed")
 		distDir    = flag.String("dist", "dist", "directory of agent builds named <os>-<arch>")
 		publicURL  = flag.String("public-url", "", "how targets reach this proxy, e.g. https://multissh.example.com; enables the installer")
@@ -232,6 +251,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("labels: %v", err)
 	}
+	seen, err := openSightings(*seenFile)
+	if err != nil {
+		log.Fatalf("last-seen: %v", err)
+	}
 	log.Printf("loaded %d user key(s)", len(users))
 
 	// Agents pin the authority rather than a key, so a proxy rebuilt on new
@@ -317,7 +340,7 @@ func main() {
 	agentCfg.AddHostKey(agentHostSigner)
 
 	agentHandler := func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-		handleAgent(reg, book, c, chans, reqs)
+		handleAgent(reg, book, seen, c, chans, reqs)
 	}
 	// The installer is only offered when the proxy knows the address targets
 	// should use, since it has to bake that into the script it generates.
@@ -356,7 +379,7 @@ func main() {
 	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler, extra)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-		handleUser(reg, c, chans, reqs)
+		handleUser(reg, seen, c, chans, reqs)
 	})
 }
 
@@ -444,11 +467,18 @@ type connHandler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Reques
 func takeConn(nc net.Conn, kind string, cfg *ssh.ServerConfig, h connHandler) {
 	defer nc.Close()
 
+	peer := sourceHost(nc.RemoteAddr())
+	if authFailures.count(peer) >= authFailBurst {
+		log.Printf("%s refusing %s: too many recent auth failures", kind, peer)
+		return
+	}
+
 	// Bound the handshake, or a client that connects and never speaks pins a
 	// goroutine and a socket indefinitely. OpenSSH calls this LoginGraceTime.
 	nc.SetDeadline(time.Now().Add(handshakeTimeout))
 	conn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
 	if err != nil {
+		authFailures.allow(peer)
 		log.Printf("%s handshake from %s failed: %v", kind, nc.RemoteAddr(), err)
 		return
 	}
@@ -505,6 +535,10 @@ func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandle
 			w.Header().Set("Content-Type", "text/x-shellscript")
 			io.WriteString(w, installScript(extra.dist, extra.caPub, extra.baseURL, extra.proxies))
 		})
+		mux.HandleFunc("/install.ps1", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			io.WriteString(w, installPowerShell(extra.dist, extra.caPub, extra.baseURL, extra.proxies))
+		})
 		mux.HandleFunc("/dist/", extra.dist.serveBinary)
 		mux.HandleFunc("/enroll", extra.enrol.handle)
 	}
@@ -528,7 +562,7 @@ func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandle
 }
 
 // handleAgent keeps the agent's connection parked in the registry until it dies.
-func handleAgent(reg *registry, book *ledger, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 	canonical := conn.Permissions.Extensions["canonical"]
 	friendly := conn.Permissions.Extensions["friendly"]
 	fp := conn.Permissions.Extensions["fp"]
@@ -574,6 +608,7 @@ func handleAgent(reg *registry, book *ledger, conn *ssh.ServerConn, chans <-chan
 		}
 	}
 
+	seen.seen(canonical)
 	log.Printf("agent registered from %s as %s", conn.RemoteAddr(), strings.Join(names, " and "))
 
 	// The agent sends its own keepalives, but nothing here would notice them
@@ -586,6 +621,7 @@ func handleAgent(reg *registry, book *ledger, conn *ssh.ServerConn, chans <-chan
 	go probeLiveness(conn, canonical, stop)
 
 	conn.Wait() // blocks until the connection dies
+	seen.seen(canonical)
 	for _, n := range names {
 		reg.remove(n, conn)
 	}
@@ -630,7 +666,7 @@ func probeLiveness(conn ssh.Conn, label string, stop <-chan struct{}) {
 	}
 }
 
-func handleUser(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+func handleUser(reg *registry, seen *sightings, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 	log.Printf("user %q connected from %s", conn.User(), conn.RemoteAddr())
 
 	// Draining is mandatory or the connection deadlocks. Replying false is the
@@ -649,7 +685,7 @@ func handleUser(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":
-			go serveListing(reg, nc)
+			go serveListing(reg, seen, nc)
 		case "direct-tcpip":
 			go serveJump(reg, conn, nc)
 		default:
@@ -660,7 +696,7 @@ func handleUser(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel
 }
 
 // serveListing answers a plain `ssh proxy` with the available targets.
-func serveListing(reg *registry, nc ssh.NewChannel) {
+func serveListing(reg *registry, seen *sightings, nc ssh.NewChannel) {
 	ch, reqs, err := nc.Accept()
 	if err != nil {
 		return
@@ -690,6 +726,26 @@ func serveListing(reg *registry, nc ssh.NewChannel) {
 					pick = list[0][1]
 				}
 				fmt.Fprintf(ch, "\r\n connect with:  ssh -J <thisproxy> user@%s\r\n", pick)
+			}
+
+			// Machines that have registered before but are not here now. A
+			// rescue tool is most likely to fail by quietly decaying, so an
+			// absence should be visible without being asked for.
+			online := map[string]bool{}
+			for _, t := range list {
+				online[t[1]] = true
+			}
+			var missing []string
+			for _, k := range seen.known() {
+				if !online[k.Name] {
+					missing = append(missing, fmt.Sprintf("   %-24s last seen %s", k.Name, ago(k.When)))
+				}
+			}
+			if len(missing) > 0 {
+				fmt.Fprintf(ch, "\r\n not connected (%d):\r\n\r\n", len(missing))
+				for _, m := range missing {
+					fmt.Fprintf(ch, "%s\r\n", m)
+				}
 			}
 			fmt.Fprintf(ch, "\r\n")
 			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))

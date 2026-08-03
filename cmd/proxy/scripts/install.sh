@@ -17,6 +17,7 @@ VERSION='__VERSION__'
 HASHES='__HASHES__'
 
 MODE=install
+REENROLL=
 ASSUME_YES=${MULTISSH_YES:-}
 
 for arg in "$@"; do
@@ -24,6 +25,7 @@ for arg in "$@"; do
         --uninstall) MODE=uninstall ;;
         --update)    MODE=update ;;
         -y|--yes)    ASSUME_YES=1 ;;
+        --reenroll)  REENROLL=1 ;;
         -h|--help)
             cat <<EOF
 multiSSH agent installer
@@ -33,6 +35,7 @@ multiSSH agent installer
   sh install.sh --uninstall  stop and remove everything
 
   -y, --yes                  accept defaults, do not prompt
+      --reenroll             force a fresh enrolment over an existing install
 
 Piped from curl, pass options after '--':
   curl -fsSL $BASE_URL/install.sh | sudo sh -s -- --uninstall
@@ -158,6 +161,15 @@ if [ "$MODE" = uninstall ]; then
     rm -rf "$STATE"
     echo "removed."
     exit 0
+fi
+
+# Re-running the installer on a machine that already has one should update it,
+# not enrol it a second time under a new identity. Enrolling again would leave
+# the old certificate valid and the old name occupied.
+if [ "$MODE" = install ] && [ -f "$MANIFEST" ] && [ -z "$REENROLL" ]; then
+    echo "already installed here (${M_CANONICAL:-unknown}); updating instead."
+    echo "pass --reenroll to discard that identity and enrol afresh."
+    MODE=update
 fi
 
 # ---------------------------------------------------------------- download

@@ -1,0 +1,37 @@
+# multiSSH proxy. Copy to /etc/systemd/system/, adjust the two hostnames, then
+#   systemctl enable --now multissh-proxy
+#
+# Runs from its own directory because that is where it keeps the authority key,
+# its host key and the advisory ledgers. Back up proxy_ca_key from there; it is
+# the one file that matters.
+[Unit]
+Description=multiSSH proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=multissh
+Group=multissh
+WorkingDirectory=/var/lib/multissh
+ExecStart=/usr/local/bin/multissh-proxy \
+    -user-addr :2022 \
+    -agent-addr 127.0.0.1:8080 \
+    -public-url https://multissh.example.com \
+    -dist /var/lib/multissh/dist
+Restart=always
+RestartSec=5
+
+# Each agent is one file descriptor, so the usual 1024 would cap this at
+# roughly a thousand targets.
+LimitNOFILE=65535
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/multissh
+
+[Install]
+WantedBy=multi-user.target

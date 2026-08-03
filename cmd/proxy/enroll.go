@@ -115,6 +115,21 @@ func newLimiter(window time.Duration, burst int) *limiter {
 	return &limiter{seen: make(map[string][]time.Time), window: window, burst: burst}
 }
 
+// count reports recent events without recording one, so a check can be made
+// before deciding to act.
+func (l *limiter) count(key string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := time.Now().Add(-l.window)
+	n := 0
+	for _, t := range l.seen[key] {
+		if t.After(cutoff) {
+			n++
+		}
+	}
+	return n
+}
+
 func (l *limiter) allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
