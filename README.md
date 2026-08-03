@@ -118,6 +118,9 @@ of throughput and a 70-second idle session all work through it.
 
 ```bash
 ./agent -proxy wss://multissh.example.com/agent
+
+# or several, comma separated: the agent registers with all of them at once
+./agent -proxy wss://multissh.example.com/agent,wss://backup.example.net/agent
 ```
 
 `-proxy-host` overrides the HTTP `Host` header independently of the address
@@ -280,6 +283,36 @@ Manual enrollment (run the sign command, copy the certificate and CA key to the
 target) is what works today. The design below is what it should become.
 
 ---
+
+## Standby proxies
+
+Verifying a certificate needs only the authority's public key; issuing one
+needs the private key. A standby therefore runs on the public half alone: it
+authenticates every agent and can enrol nothing, so the private key stays on
+one machine while access survives losing it.
+
+```bash
+# once, on the primary: certify the standby's host key
+./proxy -sign-proxy-host standby_host_key.pub
+
+# on the standby: no private authority material at all
+./proxy -ca proxy_ca.pub -host-key standby_host_key -host-cert standby_host_key-cert.pub
+```
+
+Agents hold **one** certificate, valid at every proxy, and connect to all of
+them at once rather than failing over — which costs a connection each and
+removes any failover delay.
+
+Your `known_hosts` needs no changes either: target entries are keyed by the
+target's name, not the proxy, so the same pin works through either route.
+
+Losing the primary costs you *enrolment*, not access. Every target stays
+reachable through a standby while you rebuild, and adding new machines is the
+thing that can wait.
+
+⚠️ Put standbys on a different provider **and a different domain**. Two
+subdomains of one zone share a registrar and a DNS provider, either of which
+can take out both at once.
 
 ## Deployment behind a reverse proxy
 

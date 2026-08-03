@@ -106,15 +106,42 @@ func main() {
 		Timeout:         10 * time.Second,
 	}
 
-	// Reconnect forever: the agent is the side that must survive NAT timeouts,
-	// laptop sleep, and the proxy restarting.
+	// Hold a registration open with every proxy at once rather than failing
+	// over between them. One certificate is valid at all of them, so this
+	// costs one connection each and removes any failover delay: whichever
+	// proxy the user reaches, this machine is already there.
+	var proxies []string
+	for _, p := range strings.Split(*proxyAddr, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			proxies = append(proxies, p)
+		}
+	}
+	if len(proxies) == 0 {
+		log.Fatal("-proxy is required, e.g. wss://multissh.example.com/agent")
+	}
+
+	var wg sync.WaitGroup
+	for _, p := range proxies {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			maintain(target, *proxyHost, clientCfg, hostSigner, *authKeys)
+		}(p)
+	}
+	wg.Wait()
+}
+
+// maintain keeps one proxy registration alive forever. The agent is the side
+// that must survive NAT timeouts, laptop sleep and the proxy restarting, so
+// this never gives up.
+func maintain(target, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, authKeys string) {
 	backoff := minBackoff
 	for {
 		started := time.Now()
-		err := session(*proxyAddr, *proxyHost, clientCfg, hostSigner, *authKeys)
-		log.Printf("disconnected from proxy: %v", err)
+		err := session(target, wsHost, cfg, hostSigner, authKeys)
+		log.Printf("[%s] disconnected: %v", target, err)
 
-		// A session that stayed up proves the proxy is reachable, so start
+		// A session that stayed up proves this proxy is reachable, so start
 		// over from a short delay. Without this the backoff only ever grows,
 		// and an agent that has reconnected a few times over its life is stuck
 		// waiting the maximum every time -- slowest exactly when it matters.

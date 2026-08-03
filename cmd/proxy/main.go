@@ -127,7 +127,9 @@ func main() {
 		wsAddr     = flag.String("agent-addr", "127.0.0.1:8080", "websocket listen address for agents; front it with a reverse proxy")
 		wsPath     = flag.String("agent-ws-path", "/agent", "websocket path")
 		hostKey    = flag.String("host-key", "proxy_host_key", "proxy host key (created if absent)")
-		caKey      = flag.String("ca-key", "proxy_ca_key", "certificate authority key (created if absent)")
+		caKey      = flag.String("ca-key", "proxy_ca_key", "certificate authority PRIVATE key; this proxy can then enrol machines")
+		caPubFile  = flag.String("ca", "", "certificate authority PUBLIC key; runs this proxy as a verify-only standby")
+		hostCert   = flag.String("host-cert", "proxy_host_key-cert.pub", "host certificate issued by the primary; required on a standby")
 		usersFile  = flag.String("users", "users_authorized_keys", "authorized_keys for users")
 		ledgerPath = flag.String("labels", "friendly_labels", "advisory record of which machine owns which friendly name")
 
@@ -136,20 +138,42 @@ func main() {
 		signHostKey  = flag.String("sign-host-key", "", "the agent's host public key; the canonical name is derived from it")
 		signLabel    = flag.String("sign-label", "", "desired friendly name")
 		signValidity = flag.Duration("sign-validity", 0, "certificate lifetime; 0 never expires")
+		signProxy    = flag.String("sign-proxy-host", "", "issue a host certificate for a standby proxy's host key, then exit")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
 
-	ca, err := sshx.LoadOrCreateHostKey(*caKey)
-	if err != nil {
-		log.Fatalf("ca key: %v", err)
+	// Verifying a certificate needs only the authority's public key; issuing
+	// one needs the private key. A standby therefore runs on the public half
+	// alone: it can authenticate every agent, and can enrol nothing. That
+	// keeps the private key on one machine while access survives losing it.
+	var (
+		ca    ssh.Signer
+		caPub ssh.PublicKey
+		err   error
+	)
+	if *caPubFile != "" {
+		caPub, err = sshx.LoadPublicKey(*caPubFile)
+		if err != nil {
+			log.Fatalf("ca: %v", err)
+		}
+	} else {
+		ca, err = sshx.LoadOrCreateHostKey(*caKey)
+		if err != nil {
+			log.Fatalf("ca key: %v", err)
+		}
+		caPub = ca.PublicKey()
 	}
 
 	// The public half of the authority is what agents and your known_hosts
 	// pin, so make it easy to obtain.
 	if *showCA {
-		os.Stdout.Write(ssh.MarshalAuthorizedKey(ca.PublicKey()))
+		os.Stdout.Write(ssh.MarshalAuthorizedKey(caPub))
 		return
+	}
+
+	if ca == nil && (*signKey != "" || *signProxy != "") {
+		log.Fatal("this is a standby (-ca): issuing certificates needs the private key")
 	}
 
 	// Signing mode: issue a certificate and exit. This is what enrollment will
@@ -161,12 +185,25 @@ func main() {
 		return
 	}
 
+	// A standby cannot sign its own host key, so the primary does it once.
+	if *signProxy != "" {
+		if err := issueProxyHostCert(ca, *signProxy); err != nil {
+			log.Fatalf("sign-proxy-host: %v", err)
+		}
+		return
+	}
+
 	signer, err := sshx.LoadOrCreateHostKey(*hostKey)
 	if err != nil {
 		log.Fatalf("host key: %v", err)
 	}
+	role := "primary"
+	if ca == nil {
+		role = "standby (verify only)"
+	}
+	log.Printf("running as %s", role)
 	log.Printf("proxy host key %s", ssh.FingerprintSHA256(signer.PublicKey()))
-	log.Printf("certificate authority %s", ssh.FingerprintSHA256(ca.PublicKey()))
+	log.Printf("certificate authority %s", ssh.FingerprintSHA256(caPub))
 
 	users, err := sshx.LoadAuthorizedKeys(*usersFile)
 	if err != nil {
@@ -178,19 +215,32 @@ func main() {
 	}
 	log.Printf("loaded %d user key(s)", len(users))
 
-	// Sign our own host key afresh on every start, with no principals, so it
-	// is valid whatever address agents reach us on. This is what lets the
-	// proxy be rebuilt on a new machine with a new host key: agents pin the
-	// authority, not the key, so they accept the replacement without being
-	// touched.
-	hostCert, err := sshx.SignCert(ca, signer.PublicKey(), ssh.HostCert, "multissh-proxy", nil, 0)
-	if err != nil {
-		log.Fatalf("host certificate: %v", err)
+	// Agents pin the authority rather than a key, so a proxy rebuilt on new
+	// hardware with a new host key is accepted without touching a target. The
+	// primary signs its own host key afresh at every start, with no
+	// principals, so it is valid at whatever address agents reach it on; a
+	// standby presents the certificate the primary issued it once.
+	var certSigner ssh.Signer
+	if ca != nil {
+		cert, err := sshx.SignCert(ca, signer.PublicKey(), ssh.HostCert, "multissh-proxy", nil, 0)
+		if err != nil {
+			log.Fatalf("host certificate: %v", err)
+		}
+		certSigner, err = ssh.NewCertSigner(cert, signer)
+		if err != nil {
+			log.Fatalf("host certificate: %v", err)
+		}
+	} else {
+		cert, err := sshx.LoadCert(*hostCert)
+		if err != nil {
+			log.Fatalf("host certificate: %v (a standby needs one issued by the primary)", err)
+		}
+		certSigner, err = ssh.NewCertSigner(cert, signer)
+		if err != nil {
+			log.Fatalf("host certificate: %v", err)
+		}
 	}
-	agentHostSigner, err := ssh.NewCertSigner(hostCert, signer)
-	if err != nil {
-		log.Fatalf("host certificate signer: %v", err)
-	}
+	agentHostSigner := certSigner
 
 	reg := newRegistry()
 
@@ -209,7 +259,6 @@ func main() {
 	userCfg.AddHostKey(agentHostSigner)
 	userCfg.AddHostKey(signer)
 
-	caPub := ca.PublicKey()
 	certChecker := &ssh.CertChecker{
 		IsUserAuthority: func(auth ssh.PublicKey) bool { return sshx.SameKey(auth, caPub) },
 	}
@@ -260,6 +309,28 @@ func main() {
 
 // issueCert signs a public key and writes "<path>-cert.pub" beside it, the
 // same naming OpenSSH uses.
+// issueProxyHostCert certifies a standby proxy's host key. No principals, so
+// it is valid at whatever address agents reach that standby on, matching what
+// the primary signs for itself. A standby needs this once and never holds
+// private authority material.
+func issueProxyHostCert(ca ssh.Signer, pubPath string) error {
+	pub, err := sshx.LoadPublicKey(pubPath)
+	if err != nil {
+		return err
+	}
+	cert, err := sshx.SignCert(ca, pub, ssh.HostCert, "multissh-proxy-standby", nil, 0)
+	if err != nil {
+		return err
+	}
+	out := strings.TrimSuffix(pubPath, ".pub") + "-cert.pub"
+	if err := sshx.WriteCert(out, cert); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s\n  a standby presenting this is trusted by every agent\n  authority  %s\n",
+		out, ssh.FingerprintSHA256(ca.PublicKey()))
+	return nil
+}
+
 // issueCert enrols one machine. It signs the agent's identity key so the proxy
 // can authenticate it later without remembering anything, and derives the
 // canonical name from the agent's *host* key so that name commits to the key
