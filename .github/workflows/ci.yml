@@ -52,7 +52,7 @@ jobs:
       - name: sh -n
         run: |
           sh -n cmd/proxy/scripts/install.sh
-          sh -n deploy/build.sh
+          for f in deploy/*.sh; do sh -n "$f"; done
 
       # Severity is capped at 'warning' deliberately: 'info' and 'style' are
       # dominated by intentional word splitting in this script, and a check
@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck --shell=sh --severity=warning \
-            cmd/proxy/scripts/install.sh deploy/build.sh
+            cmd/proxy/scripts/install.sh deploy/*.sh
 
       # The PowerShell installer has never been run on real hardware, so a
       # parse check is the only guard it has.

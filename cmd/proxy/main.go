@@ -20,10 +20,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -69,6 +71,7 @@ type registration struct {
 	conn  ssh.Conn
 	fp    string
 	proto int
+	build string
 }
 
 // target is one row of the listing `ssh proxy` prints.
@@ -77,6 +80,7 @@ type target struct {
 	Canonical string
 	Proto     int
 	FP        string
+	Build     string
 }
 
 // registry tracks which agents are currently connected. A target appears under
@@ -98,14 +102,14 @@ func newRegistry() *registry { return &registry{m: make(map[string]registration)
 // connection must win. A *different* key claiming a name that is already taken
 // is refused. Allowing it to evict instead would let two machines kick each
 // other off forever, leaving neither reliably reachable.
-func (r *registry) add(name string, conn ssh.Conn, fp string, proto int) error {
+func (r *registry) add(name string, conn ssh.Conn, fp string, proto int, build string) error {
 	r.mu.Lock()
 	old, existed := r.m[name]
 	if existed && old.fp != fp {
 		r.mu.Unlock()
 		return fmt.Errorf("%q is held by a different machine (%s)", name, old.fp)
 	}
-	r.m[name] = registration{conn: conn, fp: fp, proto: proto}
+	r.m[name] = registration{conn: conn, fp: fp, proto: proto, build: build}
 	r.mu.Unlock()
 
 	if existed && old.conn != conn {
@@ -157,6 +161,7 @@ func (r *registry) listing() []target {
 			Canonical: c,
 			Proto:     reg.proto,
 			FP:        reg.fp,
+			Build:     reg.build,
 		})
 	}
 	return out
@@ -356,6 +361,24 @@ func main() {
 	reg := newRegistry()
 	go revoked.watch(reg)
 
+	// Built whether or not the installer is served: the listing uses it to say
+	// which targets are running a binary this proxy still hands out, and that
+	// is worth knowing even on a standby that enrols nobody.
+	dist := newDistributor(*distDir)
+
+	// Publishing a new agent build should not cost every agent its connection.
+	// SIGHUP re-reads the directory in place, so `systemctl reload` after
+	// shipping binaries is enough.
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		for range hup {
+			dist.scan()
+			hashes, version := dist.snapshot()
+			log.Printf("reloaded %d agent build(s), version %s", len(hashes), version)
+		}
+	}()
+
 	userCfg := &ssh.ServerConfig{
 		ServerVersion: sshx.ProxyVersion(),
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -428,6 +451,7 @@ func main() {
 				"canonical": c.User(),
 				"fp":        fp,
 				"proto":     strconv.Itoa(proto),
+				"build":     sshx.ParseAgentBuild(c.ClientVersion()),
 			}
 			for _, p := range cert.ValidPrincipals {
 				if !sshx.IsCanonicalName(p) {
@@ -458,7 +482,6 @@ func main() {
 			if len(pws) == 0 {
 				log.Printf("no enrolment passwords yet; create one with -add-password")
 			}
-			dist := newDistributor(*distDir)
 			hashes, version := dist.snapshot()
 			log.Printf("installer at %s/install.sh, %d build(s), version %s", *publicURL, len(hashes), version)
 			extra = &httpExtras{
@@ -480,10 +503,10 @@ func main() {
 	}
 
 	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler,
-		serveHealth(reg, seen, revoked, *staleAfter), extra)
+		serveHealth(reg, seen, revoked, dist, *staleAfter), extra)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-		handleUser(reg, seen, *staleAfter, c, chans, reqs)
+		handleUser(reg, seen, dist, *staleAfter, c, chans, reqs)
 	})
 }
 
@@ -637,11 +660,20 @@ func agentURLs(public, path string) []string {
 // because this shares a public hostname with the installer and knowing which
 // machines exist is itself worth something to an attacker. Names live in the
 // authenticated listing.
-func serveHealth(reg *registry, seen *sightings, revoked *revocations, staleAfter time.Duration) http.HandlerFunc {
+func serveHealth(reg *registry, seen *sightings, revoked *revocations, dist *distributor, staleAfter time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		connected := len(reg.connections())
+		list := reg.listing()
 		known := seen.known()
 		stale := seen.staleSince(time.Now().Add(-staleAfter))
+
+		outdated := 0
+		if current, know := dist.builds(), dist.serving(); know {
+			for _, t := range list {
+				if t.Build != "" && !current[t.Build] {
+					outdated++
+				}
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
@@ -651,14 +683,16 @@ func serveHealth(reg *registry, seen *sightings, revoked *revocations, staleAfte
 			Known      int    `json:"known"`
 			Stale      int    `json:"stale"`
 			StaleAfter string `json:"stale_after"`
+			Outdated   int    `json:"outdated"`
 			Revoked    int    `json:"revoked"`
 			Protocol   int    `json:"protocol"`
 		}{
 			Status:     "ok",
-			Connected:  connected,
+			Connected:  len(list),
 			Known:      len(known),
 			Stale:      len(stale),
 			StaleAfter: staleAfter.String(),
+			Outdated:   outdated,
 			Revoked:    revoked.count(),
 			Protocol:   sshx.ProtocolVersion,
 		})
@@ -705,6 +739,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 	friendly := conn.Permissions.Extensions["friendly"]
 	fp := conn.Permissions.Extensions["fp"]
 	proto, _ := strconv.Atoi(conn.Permissions.Extensions["proto"])
+	build := conn.Permissions.Extensions["build"]
 
 	// Answer keepalives; refuse everything else, including tcpip-forward.
 	go func() {
@@ -723,7 +758,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 
 	// The canonical name is derived from the agent's own host key, so a clash
 	// here means someone ground a key or replayed a certificate. Refuse.
-	if err := reg.add(canonical, conn, fp, proto); err != nil {
+	if err := reg.add(canonical, conn, fp, proto, build); err != nil {
 		log.Printf("REFUSING agent from %s: %v; arriving key %s", conn.RemoteAddr(), err, fp)
 		conn.Close()
 		return
@@ -739,7 +774,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 			log.Printf("agent %q wanted the name %q, which belongs to another machine; "+
 				"it is reachable canonically only", canonical, friendly)
 		default:
-			if err := reg.add(friendly, conn, fp, proto); err != nil {
+			if err := reg.add(friendly, conn, fp, proto, build); err != nil {
 				log.Printf("agent %q could not take %q: %v", canonical, friendly, err)
 			} else {
 				names = append(names, friendly)
@@ -751,8 +786,9 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 	// The fingerprint is logged on the way in, not only when something goes
 	// wrong: it is the handle -revoke takes, so it has to be obtainable from a
 	// machine that is behaving normally.
-	log.Printf("agent registered from %s as %s, protocol %s, identity %s",
-		conn.RemoteAddr(), strings.Join(names, " and "), sshx.DescribeProtocol(proto), fp)
+	log.Printf("agent registered from %s as %s, protocol %s, build %s, identity %s",
+		conn.RemoteAddr(), strings.Join(names, " and "), sshx.DescribeProtocol(proto),
+		describeBuild(build), fp)
 
 	// The agent sends its own keepalives, but nothing here would notice them
 	// stopping. Without probing from this side, a half-open connection (a
@@ -809,7 +845,7 @@ func probeLiveness(conn ssh.Conn, label string, stop <-chan struct{}) {
 	}
 }
 
-func handleUser(reg *registry, seen *sightings, staleAfter time.Duration, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+func handleUser(reg *registry, seen *sightings, dist *distributor, staleAfter time.Duration, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 	log.Printf("user %q connected from %s", conn.User(), conn.RemoteAddr())
 
 	// Draining is mandatory or the connection deadlocks. Replying false is the
@@ -828,7 +864,7 @@ func handleUser(reg *registry, seen *sightings, staleAfter time.Duration, conn *
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":
-			go serveListing(reg, seen, staleAfter, nc)
+			go serveListing(reg, seen, dist, staleAfter, nc)
 		case "direct-tcpip":
 			go serveJump(reg, conn, nc)
 		default:
@@ -839,13 +875,15 @@ func handleUser(reg *registry, seen *sightings, staleAfter time.Duration, conn *
 }
 
 // serveListing answers a plain `ssh proxy` with the available targets.
-func serveListing(reg *registry, seen *sightings, staleAfter time.Duration, nc ssh.NewChannel) {
+func serveListing(reg *registry, seen *sightings, dist *distributor, staleAfter time.Duration, nc ssh.NewChannel) {
 	ch, reqs, err := nc.Accept()
 	if err != nil {
 		return
 	}
 	defer ch.Close()
 	staleBefore := time.Now().Add(-staleAfter)
+	current := dist.builds()
+	knowBuilds := dist.serving()
 
 	for req := range reqs {
 		switch req.Type {
@@ -863,7 +901,8 @@ func serveListing(reg *registry, seen *sightings, staleAfter time.Duration, nc s
 			} else {
 				fmt.Fprintf(ch, " registered targets (%d):\r\n\r\n", len(list))
 				for _, t := range list {
-					fmt.Fprintf(ch, "   %-20s %-24s %s\r\n", t.Friendly, t.Canonical, sshx.DescribeProtocol(t.Proto))
+					fmt.Fprintf(ch, "   %-20s %-24s %-5s %s\r\n", t.Friendly, t.Canonical,
+						sshx.DescribeProtocol(t.Proto), buildState(t.Build, current, knowBuilds))
 					// The identity fingerprint is what -revoke takes, so it
 					// belongs somewhere reachable without shell access to the
 					// proxy. Its own line, because a full fingerprint plus two
@@ -911,6 +950,32 @@ func serveListing(reg *registry, seen *sightings, staleAfter time.Duration, nc s
 				req.Reply(false, nil)
 			}
 		}
+	}
+}
+
+// describeBuild renders a build ID for a log line.
+func describeBuild(build string) string {
+	if build == "" {
+		return "unknown"
+	}
+	return build
+}
+
+// buildState says whether a target is running a binary this proxy still serves,
+// which is the question an upgrade sweep asks.
+//
+// Silence when the proxy serves no builds: with nothing to compare against
+// every agent would be labelled outdated, which is worse than saying nothing.
+// Silence too when the agent sent no build ID, since that means it predates
+// build reporting rather than that it is behind.
+func buildState(build string, current map[string]bool, know bool) string {
+	switch {
+	case !know || build == "":
+		return ""
+	case current[build]:
+		return "current"
+	default:
+		return "OUTDATED"
 	}
 }
 

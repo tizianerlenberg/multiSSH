@@ -1,7 +1,11 @@
 package sshx
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -39,8 +43,24 @@ const (
 	proxyVersionPrefix = "SSH-2.0-multissh_proxy_"
 )
 
+// BuildIDLen is how much of a binary's SHA256 identifies it. Twelve hex
+// characters is far more than enough to tell apart the handful of builds a
+// proxy serves, and short enough to sit in a listing.
+const BuildIDLen = 12
+
 // AgentVersion is the identification string the agent announces itself with.
-func AgentVersion() string { return agentVersionPrefix + strconv.Itoa(ProtocolVersion) }
+//
+// The build ID rides here too, so the proxy learns which binary a machine is
+// actually running without an extra round trip and without the agent having to
+// be told at install time what it is. An empty build is omitted, which is what
+// an agent that could not read its own executable sends.
+func AgentVersion(build string) string {
+	v := agentVersionPrefix + strconv.Itoa(ProtocolVersion)
+	if build != "" {
+		v += "_" + build
+	}
+	return v
+}
 
 // ProxyVersion is the identification string the proxy announces itself with.
 func ProxyVersion() string { return proxyVersionPrefix + strconv.Itoa(ProtocolVersion) }
@@ -49,23 +69,61 @@ func ProxyVersion() string { return proxyVersionPrefix + strconv.Itoa(ProtocolVe
 // identification string, returning LegacyProtocol for anything that does not
 // carry one. It never reports an error: an unrecognised peer is old, not
 // broken, and the caller decides whether that is acceptable.
-func ParseAgentVersion(id []byte) int { return parseVersion(string(id), agentVersionPrefix) }
+func ParseAgentVersion(id []byte) int {
+	proto, _ := parseVersion(string(id), agentVersionPrefix)
+	return proto
+}
+
+// ParseAgentBuild extracts the build ID, empty when the agent did not send one.
+func ParseAgentBuild(id []byte) string {
+	_, build := parseVersion(string(id), agentVersionPrefix)
+	return build
+}
 
 // ParseProxyVersion is the same for the proxy's identification string.
-func ParseProxyVersion(id []byte) int { return parseVersion(string(id), proxyVersionPrefix) }
+func ParseProxyVersion(id []byte) int {
+	proto, _ := parseVersion(string(id), proxyVersionPrefix)
+	return proto
+}
 
-func parseVersion(id, prefix string) int {
+func parseVersion(id, prefix string) (int, string) {
 	rest, ok := strings.CutPrefix(id, prefix)
 	if !ok {
-		return LegacyProtocol
+		return LegacyProtocol, ""
 	}
 	// A comment may follow the version, separated by a space.
 	rest, _, _ = strings.Cut(rest, " ")
-	n, err := strconv.Atoi(rest)
+	// "<protocol>_<build>", with the build optional.
+	num, build, _ := strings.Cut(rest, "_")
+	n, err := strconv.Atoi(num)
 	if err != nil || n < 0 {
-		return LegacyProtocol
+		return LegacyProtocol, ""
 	}
-	return n
+	return n, build
+}
+
+// BuildIDOf reduces a full hex SHA256 to the short form used on the wire.
+func BuildIDOf(hexSHA string) string {
+	if len(hexSHA) < BuildIDLen {
+		return hexSHA
+	}
+	return hexSHA[:BuildIDLen]
+}
+
+// BuildIDOfFile hashes a file and returns its short build ID. Used by the agent
+// on its own executable, so a machine reports the binary it is really running
+// rather than what someone recorded at install time.
+func BuildIDOfFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return "", err
+	}
+	return BuildIDOf(hex.EncodeToString(sum.Sum(nil))), nil
 }
 
 // TunnelRequest is the payload the proxy sends when opening a tunnel channel

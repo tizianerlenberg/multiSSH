@@ -15,6 +15,7 @@
 param(
     [switch]$Uninstall,
     [switch]$Update,
+    [switch]$Rollback,
     [switch]$Reenroll,
     [switch]$Yes,
     [string]$Name,
@@ -77,12 +78,37 @@ if ($Uninstall) {
         $c = Read-Host 'remove, including the keys? [y/N]'
         if ($c -notmatch '^[yY]') { Write-Host 'cancelled'; exit 0 }
     }
-    Stop-Agent
+    # Ordered so that an uninstall driven over the agent's own tunnel finishes:
+    # ending the task kills this script with it, so everything that can be done
+    # while the agent still runs is done first. Windows refuses to delete a
+    # running .exe but allows it to be renamed, so the binary is moved aside
+    # and only then deleted.
     schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
     Remove-Item -Recurse -Force $m.state -ErrorAction SilentlyContinue
-    Remove-Item -Force $m.binary -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
+    if (Test-Path $m.binary) {
+        Move-Item -Force $m.binary "$($m.binary).removing" -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Force "$($m.binary).prev", "$($m.binary).new" -ErrorAction SilentlyContinue
     Write-Host 'removed.'
+    Stop-Agent
+    Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
+    exit 0
+}
+
+# ------------------------------------------------------------- rollback
+
+if ($Rollback) {
+    $m = Get-Manifest
+    if (-not $m) { Die "nothing installed here (no $Manifest)" }
+    if (-not (Test-Path "$Binary.prev")) { Die "no previous binary saved at $Binary.prev" }
+    Copy-Item -Force "$Binary.prev" "$Binary.rollback"
+    Move-Item -Force "$Binary.rollback" $Binary
+    # The recorded version no longer describes what is on disk, so clear it or
+    # the next -Update would decide there was nothing to do.
+    $m.version = 'rolled-back'
+    $m | ConvertTo-Json | Set-Content $Manifest
+    Restart-Agent $m.args
+    Write-Host 'rolled back to the previous binary; run -Update to go forward again'
     exit 0
 }
 
@@ -96,23 +122,54 @@ function Expected-Hash {
     return $null
 }
 
+# Replaces the agent without stopping it first, matching install.sh.
+#
+# Windows will not let a running .exe be overwritten, but it will let one be
+# renamed. So the outgoing binary is renamed aside and the new one takes its
+# place; the running process is undisturbed and only the restart at the end
+# interrupts anything. An update driven over the agent's own tunnel therefore
+# cannot leave the machine with no agent at all.
 function Download-Binary {
     $want = Expected-Hash
     if (-not $want) { Die 'the proxy has no agent build for windows-amd64' }
-    $tmp = [IO.Path]::GetTempFileName()
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    $new = "$Binary.new"
     Write-Host "downloading agent $Version for windows-amd64"
-    Invoke-WebRequest -Uri "$BaseUrl/dist/windows-amd64" -OutFile $tmp -UseBasicParsing
-    $got = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+    Invoke-WebRequest -Uri "$BaseUrl/dist/windows-amd64" -OutFile $new -UseBasicParsing
+    $got = (Get-FileHash $new -Algorithm SHA256).Hash.ToLower()
     if ($got -ne $want.ToLower()) {
-        Remove-Item $tmp -Force
+        Remove-Item $new -Force
         Die "checksum mismatch: expected $want, got $got"
     }
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Stop-Agent
-    Move-Item -Force $tmp $Binary
+    if (Test-Path $Binary) {
+        Remove-Item -Force "$Binary.prev" -ErrorAction SilentlyContinue
+        Move-Item -Force $Binary "$Binary.prev"
+    }
+    Move-Item -Force $new $Binary
+}
+
+function Restart-Agent($argline) {
+    schtasks /End /TN $TaskName 2>$null | Out-Null
+    Start-Agent $argline
 }
 
 # ------------------------------------------------------------- update
+
+# This copy has the proxy's version frozen into it from install time and the
+# manifest holds that same value, so comparing them here would always report
+# "already current". Fetch what the proxy is serving now and hand over to it.
+if ($Update -and -not $env:MULTISSH_NO_REFETCH) {
+    try {
+        $fresh = Join-Path $StateDir 'install.fetched.ps1'
+        Invoke-WebRequest -Uri "$BaseUrl/install.ps1" -OutFile $fresh -UseBasicParsing
+        $env:MULTISSH_NO_REFETCH = '1'
+        & $fresh -Update
+        Remove-Item -Force $fresh -ErrorAction SilentlyContinue
+        exit $LASTEXITCODE
+    } catch {
+        Write-Host "could not reach $BaseUrl; continuing with this copy"
+    }
+}
 
 $existing = Get-Manifest
 if ($existing -and -not $Reenroll -and -not $Uninstall) {
@@ -125,7 +182,7 @@ if ($existing -and -not $Reenroll -and -not $Uninstall) {
     Download-Binary
     $existing.version = $Version
     $existing | ConvertTo-Json | Set-Content $Manifest
-    Start-Agent $existing.args
+    Restart-Agent $existing.args
     Write-Host "updated to $Version; keys and certificate untouched"
     exit 0
 }
@@ -230,5 +287,6 @@ Write-Host "  ssh -J <proxy> Administrator@$($resp.friendly)"
 Write-Host ""
 Write-Host "  update or remove:"
 Write-Host "    & ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -Update"
+Write-Host "    & ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -Rollback"
 Write-Host "    & ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -Uninstall"
 Write-Host ""

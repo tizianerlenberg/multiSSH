@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -593,6 +594,85 @@ func TestProxyRefusesAgentsBelowTheProtocolFloor(t *testing.T) {
 	// the refusal rather than showing an unattributed auth failure.
 	if !strings.Contains(f.agentLog.String(), "needs agent protocol") {
 		t.Errorf("the agent was not told why it was refused:\n%s", f.agentLog.String())
+	}
+}
+
+// An upgrade sweep needs two things the proxy did not used to provide: knowing
+// which machines are behind, and being able to publish a new build without
+// disconnecting everyone to do it.
+func TestBuildReportingAndReloadWithoutDisconnecting(t *testing.T) {
+	f := setup(t)
+
+	// Serve the very binary this test's agent runs, so it starts out current.
+	distDir := filepath.Join(f.dir, "dist")
+	if err := os.MkdirAll(distDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	served := filepath.Join(distDir, "linux-amd64")
+	agentBytes, err := os.ReadFile(agentBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(served, agentBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	f.startProxy("-dist", distDir)
+	f.startAgent()
+	listing := f.waitForTarget(f.canonical)
+	if !strings.Contains(listing, "current") {
+		t.Fatalf("an agent running the served binary is not reported current:\n%s", listing)
+	}
+
+	// Publish a different build and tell the proxy to re-read it. Appending a
+	// byte is enough: the identity of a build is its hash.
+	if err := os.WriteFile(served, append(agentBytes, '\n'), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.proxyCmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		c := f.dialProxy()
+		got = f.shellListing(c)
+		c.Close()
+		if strings.Contains(got, "OUTDATED") {
+			break
+		}
+	}
+	if !strings.Contains(got, "OUTDATED") {
+		t.Fatalf("the proxy did not notice a new build after SIGHUP:\n%s", got)
+	}
+
+	// The whole point of a reload is that nobody pays for it. The agent must
+	// still be there on the same connection, not having reconnected.
+	if n := strings.Count(f.agentLog.String(), "registered with proxy"); n != 1 {
+		t.Errorf("the agent registered %d times across a reload, want 1:\n%s", n, f.agentLog.String())
+	}
+	c := f.dialProxy()
+	if _, _, err := f.jumpTo(c, f.canonical); err != nil {
+		t.Errorf("target unreachable after the proxy reloaded: %v", err)
+	}
+
+	// And the count is visible to monitoring.
+	resp, err := http.Get("http://" + f.wsAddr + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var health struct {
+		Outdated int `json:"outdated"`
+	}
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatal(err)
+	}
+	if health.Outdated != 1 {
+		t.Errorf("healthz reports %d outdated, want 1: %s", health.Outdated, body)
 	}
 }
 
