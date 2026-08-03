@@ -2,8 +2,8 @@
 //
 // Two listeners, always, and never any others:
 //
-//	-user-addr   normal ssh clients (ssh proxy / ssh -J proxy user@label)
-//	-agent-addr  targets registering themselves
+//	-user-addr   normal ssh clients (ssh proxy / ssh -J proxy user@name)
+//	-agent-addr  targets registering themselves, over a websocket
 //
 // The proxy implements exactly two things on the user side: a session that
 // prints the target list, and direct-tcpip to a registered label. Anything
@@ -39,70 +39,102 @@ const (
 	tunnelOpenTimeout = 10 * time.Second
 )
 
-// registry tracks which agents are currently connected.
+// registration is one connected agent under one of its names. The fingerprint
+// is of the agent's identity key -- the thing the proxy authenticates -- so
+// re-issuing a certificate for a machine is not mistaken for a new machine.
+type registration struct {
+	conn ssh.Conn
+	fp   string
+}
+
+// registry tracks which agents are currently connected. A target appears under
+// its canonical name always, and under its friendly name when it holds one.
 type registry struct {
 	mu sync.RWMutex
-	m  map[string]ssh.Conn
+	m  map[string]registration
 }
 
-func newRegistry() *registry { return &registry{m: make(map[string]ssh.Conn)} }
+func newRegistry() *registry { return &registry{m: make(map[string]registration)} }
 
-// add registers conn under label, evicting any earlier connection. A half-open
-// TCP session can leave a ghost behind; the newest connection always wins.
-func (r *registry) add(label string, conn ssh.Conn) {
+// add claims name for conn.
+//
+// A machine reconnecting presents the same identity key, so its stale entry is
+// replaced: a half-open TCP session leaves a ghost behind and the live
+// connection must win. A *different* key claiming a name that is already taken
+// is refused. Allowing it to evict instead would let two machines kick each
+// other off forever, leaving neither reliably reachable.
+func (r *registry) add(name string, conn ssh.Conn, fp string) error {
 	r.mu.Lock()
-	old, existed := r.m[label]
-	r.m[label] = conn
-	r.mu.Unlock()
-	if existed && old != conn {
-		log.Printf("registry: evicting stale registration for %q", label)
-		old.Close()
+	old, existed := r.m[name]
+	if existed && old.fp != fp {
+		r.mu.Unlock()
+		return fmt.Errorf("%q is held by a different machine (%s)", name, old.fp)
 	}
+	r.m[name] = registration{conn: conn, fp: fp}
+	r.mu.Unlock()
+
+	if existed && old.conn != conn {
+		log.Printf("registry: replacing stale registration for %q", name)
+		old.conn.Close()
+	}
+	return nil
 }
 
-// remove drops label only if it still points at conn. Without this identity
+// remove drops name only if it still points at conn. Without this identity
 // check, a dying connection would deregister the agent that just replaced it.
-func (r *registry) remove(label string, conn ssh.Conn) {
+func (r *registry) remove(name string, conn ssh.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cur, ok := r.m[label]; ok && cur == conn {
-		delete(r.m, label)
+	if cur, ok := r.m[name]; ok && cur.conn == conn {
+		delete(r.m, name)
 	}
 }
 
-func (r *registry) get(label string) (ssh.Conn, bool) {
+func (r *registry) get(name string) (ssh.Conn, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	c, ok := r.m[label]
-	return c, ok
+	c, ok := r.m[name]
+	return c.conn, ok
 }
 
-func (r *registry) labels() []string {
+// listing pairs each canonical name with the friendly name pointing at the
+// same connection, so `ssh proxy` can show both.
+func (r *registry) listing() [][2]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]string, 0, len(r.m))
-	for l := range r.m {
-		out = append(out, l)
+
+	friendly := make(map[ssh.Conn]string)
+	var canonical []string
+	for name, reg := range r.m {
+		if sshx.IsCanonicalName(name) {
+			canonical = append(canonical, name)
+		} else {
+			friendly[reg.conn] = name
+		}
 	}
-	sort.Strings(out)
+	sort.Strings(canonical)
+
+	out := make([][2]string, 0, len(canonical))
+	for _, c := range canonical {
+		out = append(out, [2]string{friendly[r.m[c].conn], c})
+	}
 	return out
 }
 
 func main() {
 	var (
-		userAddr  = flag.String("user-addr", "127.0.0.1:2222", "listen address for ssh clients")
-		agentAddr = flag.String("agent-addr", "127.0.0.1:2223", "raw TCP listen address for agents (empty to disable)")
-		wsAddr    = flag.String("agent-ws-addr", "", "websocket listen address for agents, e.g. 127.0.0.1:8080 (empty to disable)")
-		wsPath    = flag.String("agent-ws-path", "/agent", "websocket path")
-		hostKey   = flag.String("host-key", "proxy_host_key", "proxy host key (created if absent)")
-		caKey     = flag.String("ca-key", "proxy_ca_key", "certificate authority key (created if absent)")
-		usersFile = flag.String("users", "users_authorized_keys", "authorized_keys for users")
-		agentFile = flag.String("agents", "agents_authorized_keys", "optional '<label> <pubkey>' fallback list")
+		userAddr   = flag.String("user-addr", "127.0.0.1:2222", "listen address for ssh clients")
+		wsAddr     = flag.String("agent-addr", "127.0.0.1:8080", "websocket listen address for agents; front it with a reverse proxy")
+		wsPath     = flag.String("agent-ws-path", "/agent", "websocket path")
+		hostKey    = flag.String("host-key", "proxy_host_key", "proxy host key (created if absent)")
+		caKey      = flag.String("ca-key", "proxy_ca_key", "certificate authority key (created if absent)")
+		usersFile  = flag.String("users", "users_authorized_keys", "authorized_keys for users")
+		ledgerPath = flag.String("labels", "friendly_labels", "advisory record of which machine owns which friendly name")
 
 		showCA       = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
 		signKey      = flag.String("sign", "", "issue a certificate for this public key file, then exit")
-		signLabel    = flag.String("sign-label", "", "label/principal to put in the certificate")
-		signType     = flag.String("sign-type", "user", "certificate type: user (agent identity) or host")
+		signHostKey  = flag.String("sign-host-key", "", "the agent's host public key; the canonical name is derived from it")
+		signLabel    = flag.String("sign-label", "", "desired friendly name")
 		signValidity = flag.Duration("sign-validity", 0, "certificate lifetime; 0 never expires")
 	)
 	flag.Parse()
@@ -123,7 +155,7 @@ func main() {
 	// Signing mode: issue a certificate and exit. This is what enrollment will
 	// call once the installer exists.
 	if *signKey != "" {
-		if err := issueCert(ca, *signKey, *signLabel, *signType, *signValidity); err != nil {
+		if err := issueCert(ca, *signKey, *signHostKey, *signLabel, *ledgerPath, *signValidity); err != nil {
 			log.Fatalf("sign: %v", err)
 		}
 		return
@@ -140,12 +172,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("users: %v", err)
 	}
-	// Optional now: an agent presenting a certificate needs no entry here.
-	agents, err := sshx.LoadAgentKeys(*agentFile)
+	book, err := openLedger(*ledgerPath)
 	if err != nil {
-		log.Fatalf("agents: %v", err)
+		log.Fatalf("labels: %v", err)
 	}
-	log.Printf("loaded %d user key(s), %d static agent key(s)", len(users), len(agents))
+	log.Printf("loaded %d user key(s)", len(users))
 
 	// Sign our own host key afresh on every start, with no principals, so it
 	// is valid whatever address agents reach us on. This is what lets the
@@ -185,39 +216,42 @@ func main() {
 
 	agentCfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			// Preferred path: a certificate we signed. CheckCert verifies the
-			// signature, the validity window, and that the username the agent
-			// claims is one of the principals we put in the certificate --
-			// so the label is still ours to assign, without storing it.
-			if cert, ok := key.(*ssh.Certificate); ok {
-				if err := certChecker.CheckCert(c.User(), cert); err != nil {
-					return nil, fmt.Errorf("certificate rejected: %w", err)
-				}
-				return &ssh.Permissions{Extensions: map[string]string{"label": c.User()}}, nil
-			}
-			// Fallback for agents enrolled before certificates existed.
-			label, ok := agents[string(key.Marshal())]
+			// Only a certificate we signed. CheckCert verifies the signature,
+			// the validity window, and that the name the agent claims is one
+			// of the principals we put in the certificate -- so names remain
+			// ours to assign without our storing them anywhere.
+			cert, ok := key.(*ssh.Certificate)
 			if !ok {
-				return nil, fmt.Errorf("no certificate and key is not in %s", *agentFile)
+				return nil, fmt.Errorf("agents must present a certificate")
 			}
-			return &ssh.Permissions{Extensions: map[string]string{"label": label}}, nil
+			if err := certChecker.CheckCert(c.User(), cert); err != nil {
+				return nil, fmt.Errorf("certificate rejected: %w", err)
+			}
+			if !sshx.IsCanonicalName(c.User()) {
+				return nil, fmt.Errorf("agents must connect under their canonical name")
+			}
+			// Principals are [canonical, friendly]; the friendly one is a
+			// request, granted later only if unclaimed.
+			ext := map[string]string{
+				"canonical": c.User(),
+				"fp":        ssh.FingerprintSHA256(cert.Key),
+			}
+			for _, p := range cert.ValidPrincipals {
+				if !sshx.IsCanonicalName(p) {
+					ext["friendly"] = p
+					break
+				}
+			}
+			return &ssh.Permissions{Extensions: ext}, nil
 		},
 	}
 	// Agents verify us through the authority, so present the certificate.
 	agentCfg.AddHostKey(agentHostSigner)
 
 	agentHandler := func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-		handleAgent(reg, c, chans, reqs)
+		handleAgent(reg, book, c, chans, reqs)
 	}
-	if *agentAddr == "" && *wsAddr == "" {
-		log.Fatal("no agent listener configured: set -agent-addr or -agent-ws-addr")
-	}
-	if *agentAddr != "" {
-		go serve(*agentAddr, "agent", agentCfg, agentHandler)
-	}
-	if *wsAddr != "" {
-		go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler)
-	}
+	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleUser(reg, c, chans, reqs)
@@ -226,28 +260,46 @@ func main() {
 
 // issueCert signs a public key and writes "<path>-cert.pub" beside it, the
 // same naming OpenSSH uses.
-func issueCert(ca ssh.Signer, pubPath, label, kind string, validity time.Duration) error {
+// issueCert enrols one machine. It signs the agent's identity key so the proxy
+// can authenticate it later without remembering anything, and derives the
+// canonical name from the agent's *host* key so that name commits to the key
+// the user's client will verify.
+//
+// The host key is deliberately not signed. Were the proxy to certify target
+// host keys, a compromised proxy could mint one for a machine it controls and
+// impersonate a target to you, with no warning from your client. Leaving
+// targets on trust-on-first-use keeps the proxy out of that trust chain.
+func issueCert(ca ssh.Signer, idPath, hostPath, label string, ledgerPath string, validity time.Duration) error {
 	if label == "" {
 		return fmt.Errorf("-sign-label is required")
 	}
-	pub, err := sshx.LoadPublicKey(pubPath)
+	if hostPath == "" {
+		return fmt.Errorf("-sign-host-key is required: the canonical name is derived from it")
+	}
+
+	idPub, err := sshx.LoadPublicKey(idPath)
+	if err != nil {
+		return err
+	}
+	hostPub, err := sshx.LoadPublicKey(hostPath)
 	if err != nil {
 		return err
 	}
 
-	certType := uint32(ssh.UserCert)
-	if kind == "host" {
-		certType = ssh.HostCert
-	} else if kind != "user" {
-		return fmt.Errorf("-sign-type must be user or host")
-	}
-
-	cert, err := sshx.SignCert(ca, pub, certType, label, []string{label}, validity)
+	canonical, err := sshx.CanonicalName(label, hostPub)
 	if err != nil {
 		return err
 	}
 
-	out := strings.TrimSuffix(pubPath, ".pub") + "-cert.pub"
+	// Both names travel in the certificate; the proxy grants the friendly one
+	// at connect time only if no other machine holds it.
+	cert, err := sshx.SignCert(ca, idPub, ssh.UserCert, canonical,
+		[]string{canonical, label}, validity)
+	if err != nil {
+		return err
+	}
+
+	out := strings.TrimSuffix(idPath, ".pub") + "-cert.pub"
 	if err := sshx.WriteCert(out, cert); err != nil {
 		return err
 	}
@@ -256,8 +308,8 @@ func issueCert(ca ssh.Signer, pubPath, label, kind string, validity time.Duratio
 	if validity > 0 {
 		expiry = "expires " + time.Unix(int64(cert.ValidBefore), 0).Format(time.RFC3339)
 	}
-	fmt.Printf("wrote %s\n  type       %s\n  principal  %s\n  authority  %s\n  %s\n",
-		out, kind, label, ssh.FingerprintSHA256(ca.PublicKey()), expiry)
+	fmt.Printf("wrote %s\n  canonical  %s\n  friendly   %s (granted only if unclaimed)\n  authority  %s\n  %s\n",
+		out, canonical, label, ssh.FingerprintSHA256(ca.PublicKey()), expiry)
 	return nil
 }
 
@@ -326,8 +378,10 @@ func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandle
 }
 
 // handleAgent keeps the agent's connection parked in the registry until it dies.
-func handleAgent(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-	label := conn.Permissions.Extensions["label"]
+func handleAgent(reg *registry, book *ledger, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
+	canonical := conn.Permissions.Extensions["canonical"]
+	friendly := conn.Permissions.Extensions["friendly"]
+	fp := conn.Permissions.Extensions["fp"]
 
 	// Answer keepalives; refuse everything else, including tcpip-forward.
 	go func() {
@@ -344,21 +398,48 @@ func handleAgent(reg *registry, conn *ssh.ServerConn, chans <-chan ssh.NewChanne
 		}
 	}()
 
-	reg.add(label, conn)
-	log.Printf("agent %q registered from %s", label, conn.RemoteAddr())
+	// The canonical name is derived from the agent's own host key, so a clash
+	// here means someone ground a key or replayed a certificate. Refuse.
+	if err := reg.add(canonical, conn, fp); err != nil {
+		log.Printf("REFUSING agent from %s: %v; arriving key %s", conn.RemoteAddr(), err, fp)
+		conn.Close()
+		return
+	}
+	names := []string{canonical}
+
+	// The friendly name is convenience, and the only ambiguous surface. Serve
+	// it only when this machine owns it; otherwise the target stays reachable
+	// canonically and the clash is reported rather than silently resolved.
+	if friendly != "" {
+		switch {
+		case !book.claim(friendly, fp):
+			log.Printf("agent %q wanted the name %q, which belongs to another machine; "+
+				"it is reachable canonically only", canonical, friendly)
+		default:
+			if err := reg.add(friendly, conn, fp); err != nil {
+				log.Printf("agent %q could not take %q: %v", canonical, friendly, err)
+			} else {
+				names = append(names, friendly)
+			}
+		}
+	}
+
+	log.Printf("agent registered from %s as %s", conn.RemoteAddr(), strings.Join(names, " and "))
 
 	// The agent sends its own keepalives, but nothing here would notice them
 	// stopping. Without probing from this side, a half-open connection (a
 	// sleeping laptop) stays registered until the kernel gives up on the TCP
-	// session, which can take many minutes, and the label meanwhile accepts
+	// session, which can take many minutes, and the name meanwhile accepts
 	// connections that hang.
 	stop := make(chan struct{})
 	defer close(stop)
-	go probeLiveness(conn, label, stop)
+	go probeLiveness(conn, canonical, stop)
 
 	conn.Wait() // blocks until the connection dies
-	reg.remove(label, conn)
-	log.Printf("agent %q disconnected", label)
+	for _, n := range names {
+		reg.remove(n, conn)
+	}
+	log.Printf("agent %q disconnected", canonical)
 }
 
 // probeLiveness pings the agent and closes the connection when it stops
@@ -445,16 +526,20 @@ func serveListing(reg *registry, nc ssh.NewChannel) {
 			if req.Type != "shell" {
 				continue
 			}
-			labels := reg.labels()
+			list := reg.listing()
 			fmt.Fprintf(ch, "\r\n multiSSH proxy\r\n\r\n")
-			if len(labels) == 0 {
+			if len(list) == 0 {
 				fmt.Fprintf(ch, " no targets currently registered\r\n")
 			} else {
-				fmt.Fprintf(ch, " registered targets (%d):\r\n\r\n", len(labels))
-				for _, l := range labels {
-					fmt.Fprintf(ch, "   %s\r\n", l)
+				fmt.Fprintf(ch, " registered targets (%d):\r\n\r\n", len(list))
+				for _, t := range list {
+					fmt.Fprintf(ch, "   %-20s %s\r\n", t[0], t[1])
 				}
-				fmt.Fprintf(ch, "\r\n connect with:  ssh -J <thisproxy> user@%s\r\n", labels[0])
+				pick := list[0][0]
+				if pick == "" {
+					pick = list[0][1]
+				}
+				fmt.Fprintf(ch, "\r\n connect with:  ssh -J <thisproxy> user@%s\r\n", pick)
 			}
 			fmt.Fprintf(ch, "\r\n")
 			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))

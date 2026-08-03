@@ -89,29 +89,15 @@ go build -o agent ./cmd/agent
 
 ### Proxy
 
-Needs two files. `users_authorized_keys` is a normal `authorized_keys` listing
-who may use the proxy at all. `agents_authorized_keys` maps each target's key
-to the label it will be known by — **the proxy assigns labels, so an agent
-cannot claim one belonging to another key**:
-
-```
-# agents_authorized_keys
-laptop     ssh-ed25519 AAAAC3Nza...  agent_identity
-homeserver ssh-ed25519 AAAAC3Nza...  agent_identity
-```
+`users_authorized_keys` is a normal `authorized_keys` listing who may use the
+proxy at all. There is no list of agents: they present certificates instead.
 
 ```bash
-./proxy -user-addr :22 -agent-addr :2223
+./proxy -user-addr :2022 -agent-addr 127.0.0.1:8080
 ```
 
-The host key is generated on first run if absent.
-
-Enable the WebSocket listener to run behind a reverse proxy. Bind it to
-loopback and let Caddy terminate TLS:
-
-```bash
-./proxy -user-addr :22 -agent-addr "" -agent-ws-addr 127.0.0.1:8080
-```
+The host key and CA key are generated on first run if absent. Agents connect
+over a WebSocket, so bind that to loopback and let Caddy terminate TLS:
 
 ```caddyfile
 multissh.example.com {
@@ -126,18 +112,17 @@ of throughput and a 70-second idle session all work through it.
 ### Agent
 
 ```bash
-./agent -proxy proxy.example.com:2223               # raw TCP
-./agent -proxy wss://multissh.example.com/agent     # through a reverse proxy
+./agent -proxy wss://multissh.example.com/agent
 ```
 
 `-proxy-host` overrides the HTTP `Host` header independently of the address
 dialled, so a target can reach the proxy by IP when DNS is broken — a plausible
 state of affairs for a last-resort tool.
 
-On first run it generates three things: an identity key (proving itself to the
-proxy), a host key for its embedded server, and — on first connect — a pinned
-copy of the proxy's host key. It needs `agent_authorized_keys` containing the
-key you will log in with.
+On first run it generates an identity key and a host key. It then needs the
+certificate issued by the proxy, the proxy's CA public key, and an
+`agent_authorized_keys` holding the key you will log in with. It refuses to
+start if its certificate does not match its own host key.
 
 ### Connecting
 
@@ -165,21 +150,49 @@ sessions and `exec` only.
 
 ### Trust model
 
-The proxy is a **certificate authority**. At enrollment it *signs* the agent's
-key, putting the label in the certificate, so it never stores a per-machine
-list. That is what makes the proxy recoverable — see below.
+The proxy is a **certificate authority**, but deliberately only for its own
+business. It signs agent identities so it can authenticate them without
+remembering anything, and it signs its own host key so agents can accept a
+rebuilt proxy. It does **not** certify target host keys.
 
 | Hop | Server identity | Who is allowed |
 |---|---|---|
 | you → proxy | host certificate signed by the CA (bare key also offered) | `users_authorized_keys` |
-| agent → proxy | host certificate, agent pins the **CA** | identity certificate carrying the label |
-| you → target (E2E) | host certificate, one `@cert-authority` line covers all targets | agent's `agent_authorized_keys` |
+| agent → proxy | host certificate, agent pins the **CA** | identity certificate carrying the names |
+| **you → target (E2E)** | **trust-on-first-use, proxy not involved** | agent's `agent_authorized_keys` |
 
-The target's own `authorized_keys` is the real authority. A **fully compromised
-proxy still cannot log into any target**, because it does not hold your private
-key — it can only route bytes, and it cannot read them. That holds even if the
-CA key leaks: an attacker could register bogus targets and impersonate the
-proxy, but still could not get a shell anywhere.
+**The proxy is not in the trust chain for your connections to targets**, and
+that is on purpose. Were it to certify target host keys, a compromised proxy
+could mint one for a machine it controls, route you there, and your client
+would accept it in silence — pubkey auth would not leak your key, but you would
+be typing into someone else's shell. Leaving targets on trust-on-first-use
+means such a substitution trips the usual `HOST KEY CHANGED` warning.
+
+A compromised proxy therefore cannot read your sessions, cannot log into your
+machines, and cannot impersonate one to you. It can deny service.
+
+### Two names per target
+
+```
+laptop.niwru7dfuvu5     canonical: derived from the target's own host key
+laptop                  friendly: convenience, granted only when unclaimed
+```
+
+The canonical name embeds a hash of the target's host key, so it is unique by
+construction and needs no bookkeeping. More usefully, **the name commits to the
+key your client verifies**: no other machine can be given that name, because
+the string is derived from a key it does not hold. On the one connection where
+trust-on-first-use is exposed, you can check the fingerprint against the name
+you typed.
+
+Friendly names may not contain a dot; canonical names always do. That is the
+whole of the namespace separation, so the two can never be confused.
+
+The friendly name is the only ambiguous surface, so the proxy grants it only to
+the machine that holds it, recorded in `friendly_labels`. A second machine
+wanting the same name keeps its canonical name and the clash is logged rather
+than silently resolved. That file is **advisory**: losing it costs a convenient
+name, never access.
 
 ### Recovering the proxy
 
@@ -196,13 +209,15 @@ the agent come back unaided.
 keys, which you already have.
 
 ```bash
-# enrol a machine: the proxy signs, and stores nothing
-./proxy -sign agent_identity.pub -sign-label laptop -sign-type user
-./proxy -sign agent_host_key.pub -sign-label laptop -sign-type host
+# enrol a machine: the proxy signs its identity and derives its canonical
+# name from its host key, storing nothing
+./proxy -sign agent_identity.pub -sign-host-key agent_host_key.pub -sign-label laptop
 ./proxy -show-ca > proxy_ca.pub
 
-# your known_hosts, once, for every present and future target
-echo "@cert-authority * $(cat proxy_ca.pub)" >> ~/.ssh/known_hosts
+# your known_hosts needs the authority only for the proxy itself; targets are
+# pinned individually on first use, which is what keeps the proxy out of the
+# trust chain
+echo "@cert-authority multissh.example.com $(cat proxy_ca.pub)" >> ~/.ssh/known_hosts
 ```
 
 Certificates never expire by default. For a rescue tool that is deliberate: a
@@ -247,7 +262,7 @@ cap on concurrent connections.
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
-| ⚪ | No installer. Enrollment is manual: paste the agent's public key into the proxy's config. | See below. |
+| ⚪ | No installer. Enrollment is manual: run the sign command and copy three files to the target. | See below. |
 
 ### On a one-line installer
 
@@ -256,8 +271,8 @@ proxy's host key and install a service unit — but it **cannot finish enrollmen
 on its own**, because the proxy must already know the agent's public key before
 it will accept the connection.
 
-Manual enrollment (paste the printed public key into `agents_authorized_keys`)
-is what works today. The design below is what it should become.
+Manual enrollment (run the sign command, copy the certificate and CA key to the
+target) is what works today. The design below is what it should become.
 
 ---
 

@@ -80,40 +80,6 @@ func LoadAuthorizedKeys(path string) (map[string]bool, error) {
 	return set, sc.Err()
 }
 
-// LoadAgentKeys parses "<label> <authorized_keys line>" and maps each public
-// key to its label. The proxy assigns labels, so an agent cannot claim one
-// belonging to a different key.
-func LoadAgentKeys(path string) (map[string]string, error) {
-	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		// Optional: agents presenting a certificate need no entry here.
-		return map[string]string{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	byKey := make(map[string]string)
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		label, rest, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(strings.TrimSpace(rest)))
-		if err != nil {
-			continue
-		}
-		byKey[string(pk.Marshal())] = label
-	}
-	return byKey, sc.Err()
-}
-
 type chanAddr string
 
 func (a chanAddr) Network() string { return "ssh-tunnel" }
@@ -127,8 +93,8 @@ type ChannelConn struct {
 	Local, Remote string
 }
 
-func (c ChannelConn) LocalAddr() net.Addr             { return chanAddr(c.Local) }
-func (c ChannelConn) RemoteAddr() net.Addr            { return chanAddr(c.Remote) }
+func (c ChannelConn) LocalAddr() net.Addr              { return chanAddr(c.Local) }
+func (c ChannelConn) RemoteAddr() net.Addr             { return chanAddr(c.Remote) }
 func (c ChannelConn) SetDeadline(time.Time) error      { return nil }
 func (c ChannelConn) SetReadDeadline(time.Time) error  { return nil }
 func (c ChannelConn) SetWriteDeadline(time.Time) error { return nil }
