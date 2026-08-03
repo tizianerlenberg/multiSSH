@@ -272,6 +272,53 @@ cap on concurrent connections.
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
 | ⚪ | No installer. Enrollment is manual: run the sign command and copy three files to the target. | See below. |
 
+## Installing a target
+
+The proxy serves the installer and the agent builds itself. It has to be
+reachable for the agent to work at all, so serving from it adds no failure mode
+— and it can bake **its own authority into the script**, so the agent pins the
+right one from its first connect and there is no trust-on-first-use window for
+the agent-to-proxy hop.
+
+```bash
+# on the proxy, once
+./proxy -add-password laptops -password-validity 720h
+GOOS=linux GOARCH=amd64 go build -o dist/linux-amd64 ./cmd/agent
+./proxy ... -public-url https://multissh.example.com -dist dist -passwords enrol_passwords.json
+```
+
+```bash
+# on the target
+curl -fsSL https://multissh.example.com/install.sh | sudo sh
+```
+
+It asks two things — the machine's name, defaulting to the hostname, and the
+enrollment password — shows every path it will touch, and takes one
+confirmation. Answering `c` walks each setting. Scope follows reality: root
+installs system-wide, anyone else installs for themselves.
+
+**Private keys are generated on the target and never transmitted.** Only public
+halves are sent for signing, which is what keeps the proxy out of the trust
+chain afterwards. Installation itself is the moment you trust the proxy, since
+it serves the binary; that trust is bounded to that moment.
+
+The script and a manifest of what it installed are saved beside the agent, so
+these keep working even if the proxy is gone:
+
+```bash
+sh /var/lib/multissh-agent/manage.sh --update      # binary only; keys untouched
+sh /var/lib/multissh-agent/manage.sh --uninstall
+```
+
+Piped from curl, options go after `--`:
+`curl -fsSL … | sudo sh -s -- --uninstall`. Unattended installs read
+`MULTISSH_PASSWORD` and friends, and the script detects the absence of a
+terminal rather than hanging on a prompt.
+
+Passwords are argon2id-hashed with a lifetime chosen when created, `/enroll` is
+rate limited, and enrolment writes nothing to the proxy — so none of this adds
+anything to back up.
+
 ### On a one-line installer
 
 A `curl … | sh` installer can drop the binary, generate keys, pre-seed the
