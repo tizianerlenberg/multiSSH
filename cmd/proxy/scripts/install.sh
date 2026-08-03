@@ -180,10 +180,16 @@ fetch() { # fetch URL DEST
     else die "need curl or wget"; fi
 }
 
+# Must always exit zero. Under 'set -e' a non-zero status here aborts the whole
+# script, and a loop that ends on a non-matching entry would do exactly that --
+# which stayed hidden while only one build existed and the match came last.
 expected_hash() {
-    echo "$HASHES" | tr ' ' '\n' | while IFS=: read -r p h; do
-        [ "$p" = "$PLATFORM" ] && echo "$h"
+    for _pair in $HASHES; do
+        case "$_pair" in
+            "$PLATFORM":*) echo "${_pair#*:}"; return 0 ;;
+        esac
     done
+    return 0
 }
 
 sha256_of() {
