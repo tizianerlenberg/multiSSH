@@ -14,6 +14,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -53,6 +54,9 @@ type registry struct {
 	mu sync.RWMutex
 	m  map[string]registration
 }
+
+// stdLogf exists so enroll.go can log without a second import alias.
+func stdLogf(format string, args ...any) { log.Printf(format, args...) }
 
 func newRegistry() *registry { return &registry{m: make(map[string]registration)} }
 
@@ -132,13 +136,21 @@ func main() {
 		hostCert   = flag.String("host-cert", "proxy_host_key-cert.pub", "host certificate issued by the primary; required on a standby")
 		usersFile  = flag.String("users", "users_authorized_keys", "authorized_keys for users")
 		ledgerPath = flag.String("labels", "friendly_labels", "advisory record of which machine owns which friendly name")
+		pwFile     = flag.String("passwords", "enrol_passwords.json", "enrolment passwords, argon2id hashed")
+		distDir    = flag.String("dist", "dist", "directory of agent builds named <os>-<arch>")
+		publicURL  = flag.String("public-url", "", "how targets reach this proxy, e.g. https://multissh.example.com; enables the installer")
+		enrolValid = flag.Duration("enrol-validity", 0, "lifetime of issued certificates; 0 never expires")
 
-		showCA       = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
-		signKey      = flag.String("sign", "", "issue a certificate for this public key file, then exit")
-		signHostKey  = flag.String("sign-host-key", "", "the agent's host public key; the canonical name is derived from it")
-		signLabel    = flag.String("sign-label", "", "desired friendly name")
-		signValidity = flag.Duration("sign-validity", 0, "certificate lifetime; 0 never expires")
-		signProxy    = flag.String("sign-proxy-host", "", "issue a host certificate for a standby proxy's host key, then exit")
+		showCA        = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
+		signKey       = flag.String("sign", "", "issue a certificate for this public key file, then exit")
+		signHostKey   = flag.String("sign-host-key", "", "the agent's host public key; the canonical name is derived from it")
+		signLabel     = flag.String("sign-label", "", "desired friendly name")
+		signValidity  = flag.Duration("sign-validity", 0, "certificate lifetime; 0 never expires")
+		signProxy     = flag.String("sign-proxy-host", "", "issue a host certificate for a standby proxy's host key, then exit")
+		addPassword   = flag.String("add-password", "", "create an enrolment password with this label, then exit")
+		pwValidity    = flag.Duration("password-validity", 0, "lifetime of the new password; 0 never expires")
+		listPasswords = flag.Bool("list-passwords", false, "show enrolment passwords and exit")
+		delPassword   = flag.String("remove-password", "", "delete the enrolment password with this label, then exit")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
@@ -181,6 +193,13 @@ func main() {
 	if *signKey != "" {
 		if err := issueCert(ca, *signKey, *signHostKey, *signLabel, *ledgerPath, *signValidity); err != nil {
 			log.Fatalf("sign: %v", err)
+		}
+		return
+	}
+
+	if *listPasswords || *addPassword != "" || *delPassword != "" {
+		if err := managePasswords(*pwFile, *addPassword, *delPassword, *listPasswords, *pwValidity); err != nil {
+			log.Fatalf("passwords: %v", err)
 		}
 		return
 	}
@@ -300,7 +319,41 @@ func main() {
 	agentHandler := func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleAgent(reg, book, c, chans, reqs)
 	}
-	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler)
+	// The installer is only offered when the proxy knows the address targets
+	// should use, since it has to bake that into the script it generates.
+	var extra *httpExtras
+	if *publicURL != "" {
+		if ca == nil {
+			log.Print("standby: serving no installer, since enrolment needs the private authority key")
+		} else {
+			pws, err := loadPasswords(*pwFile)
+			if err != nil {
+				log.Fatalf("passwords: %v", err)
+			}
+			if len(pws) == 0 {
+				log.Printf("no enrolment passwords yet; create one with -add-password")
+			}
+			dist := newDistributor(*distDir)
+			hashes, version := dist.snapshot()
+			log.Printf("installer at %s/install.sh, %d build(s), version %s", *publicURL, len(hashes), version)
+			extra = &httpExtras{
+				dist:    dist,
+				baseURL: strings.TrimSuffix(*publicURL, "/"),
+				proxies: agentURLs(*publicURL, *wsPath),
+				caPub:   caPub,
+				enrol: &enroller{
+					ca:        ca,
+					passwords: pws,
+					usersFile: *usersFile,
+					proxies:   agentURLs(*publicURL, *wsPath),
+					limit:     newLimiter(enrolRateWindow, enrolRateBurst),
+					validity:  *enrolValid,
+				},
+			}
+		}
+	}
+
+	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler, extra)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleUser(reg, c, chans, reqs)
@@ -427,8 +480,34 @@ func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler) {
 // subdomains, and the traffic looks like plain HTTPS on the wire. Bind this to
 // loopback and let the reverse proxy terminate TLS: SSH runs inside the
 // WebSocket, so the reverse proxy only ever relays ciphertext.
-func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler) {
+// httpExtras are the enrolment routes, served beside the agent websocket on
+// the same listener so one reverse-proxy entry covers everything.
+type httpExtras struct {
+	dist    *distributor
+	enrol   *enroller
+	baseURL string
+	proxies []string
+	caPub   ssh.PublicKey
+}
+
+// agentURLs turns the public https:// address into the wss:// the agent dials.
+func agentURLs(public, path string) []string {
+	u := strings.TrimSuffix(public, "/")
+	u = strings.Replace(u, "https://", "wss://", 1)
+	u = strings.Replace(u, "http://", "ws://", 1)
+	return []string{u + path}
+}
+
+func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, extra *httpExtras) {
 	mux := http.NewServeMux()
+	if extra != nil {
+		mux.HandleFunc("/install.sh", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/x-shellscript")
+			io.WriteString(w, installScript(extra.dist, extra.caPub, extra.baseURL, extra.proxies))
+		})
+		mux.HandleFunc("/dist/", extra.dist.serveBinary)
+		mux.HandleFunc("/enroll", extra.enrol.handle)
+	}
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
