@@ -3,3 +3,6 @@
 run/
 /proxy
 /agent
+# deploy/build.sh drops the proxy binary here; it was committed once already.
+/multissh-proxy
+/dist/

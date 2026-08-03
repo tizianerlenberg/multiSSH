@@ -59,26 +59,40 @@ func (s *sightings) seen(name string) {
 	s.save()
 }
 
-// known returns every target ever seen, oldest sighting first, so the ones
-// worth worrying about are at the top.
-func (s *sightings) known() []struct {
+// sighting is one target and when it was last connected.
+type sighting struct {
 	Name string
 	When time.Time
-} {
+}
+
+// known returns every target ever seen, oldest sighting first, so the ones
+// worth worrying about are at the top.
+func (s *sightings) known() []sighting {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	out := make([]struct {
-		Name string
-		When time.Time
-	}, 0, len(s.m))
+	out := make([]sighting, 0, len(s.m))
 	for n, t := range s.m {
-		out = append(out, struct {
-			Name string
-			When time.Time
-		}{n, t})
+		out = append(out, sighting{n, t})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].When.Before(out[j].When) })
+	return out
+}
+
+// staleSince returns every target whose last sighting predates cutoff, oldest
+// first.
+//
+// One gap worth naming: a machine that enrolled and never once connected is
+// not here to be missed, because enrolment writes nothing to the proxy. The
+// installer reports success from the target, so that case is visible there
+// instead.
+func (s *sightings) staleSince(cutoff time.Time) []sighting {
+	var out []sighting
+	for _, k := range s.known() {
+		if k.When.Before(cutoff) {
+			out = append(out, k)
+		}
+	}
 	return out
 }
 
