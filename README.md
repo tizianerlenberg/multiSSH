@@ -252,6 +252,9 @@ itself out. Use `-sign-validity` if you want expiry.
 - a frozen agent (`SIGSTOP`) is evicted from the registry within ~30s, and a
   connection attempt to it fails in ~10s rather than hanging
 - reconnect backoff resets after a healthy session, so recovery stays fast
+- the installer works over real TLS through real Caddy, end to end
+- failed ssh handshakes are counted per source address and refused past a
+  threshold, as `/enroll` attempts already were
 
 ### Before exposing it publicly
 
@@ -268,6 +271,7 @@ cap on concurrent connections.
 |---|---|---|
 | 🟡 | Windows and macOS are **built but never run**. | Unknown. |
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
+| 🟡 | Windows registers a scheduled task, not a real service. | No restart-on-crash beyond the agent's own reconnect loop. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
 | ⚪ | No installer. Enrollment is manual: run the sign command and copy three files to the target. | See below. |
@@ -282,15 +286,20 @@ the agent-to-proxy hop.
 
 ```bash
 # on the proxy, once
+sh deploy/build.sh dist                       # every platform, plus the proxy
 ./proxy -add-password laptops -password-validity 720h
-GOOS=linux GOARCH=amd64 go build -o dist/linux-amd64 ./cmd/agent
-./proxy ... -public-url https://multissh.example.com -dist dist -passwords enrol_passwords.json
+./proxy ... -public-url https://multissh.example.com -dist dist
 ```
 
 ```bash
 # on the target
-curl -fsSL https://multissh.example.com/install.sh | sudo sh
+curl -fsSL https://multissh.example.com/install.sh | sudo sh          # linux, macos
+irm https://multissh.example.com/install.ps1 | iex                    # windows, elevated
 ```
+
+`deploy/multissh-proxy.service` is a hardened systemd unit for the proxy
+itself. Re-running the installer on an enrolled machine updates it rather than
+enrolling a second identity; `--reenroll` forces a fresh one.
 
 It asks two things — the machine's name, defaulting to the hostname, and the
 enrollment password — shows every path it will touch, and takes one

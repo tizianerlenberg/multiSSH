@@ -54,6 +54,7 @@ func main() {
 		proxyHost = flag.String("proxy-host", "", "override the HTTP Host header for ws/wss (use when DNS is unavailable)")
 		idCert    = flag.String("identity-cert", "agent_identity-cert.pub", "certificate naming this machine, issued by the proxy")
 		caFile    = flag.String("ca", "proxy_ca.pub", "the proxy's certificate authority, pinned")
+		showKeys  = flag.Bool("show-keys", false, "create the keys if absent, print their public halves, and exit")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
@@ -66,6 +67,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("host key: %v", err)
 	}
+	// Enrolment needs the public halves before there is a certificate to run
+	// with. Doing it here means the installer needs no ssh-keygen, which a
+	// minimal container or a stock Windows box may not have.
+	if *showKeys {
+		fmt.Printf("identity %s", ssh.MarshalAuthorizedKey(idSigner.PublicKey()))
+		fmt.Printf("host %s", ssh.MarshalAuthorizedKey(hostSigner.PublicKey()))
+		return
+	}
+
 	log.Printf("agent identity  %s", ssh.FingerprintSHA256(idSigner.PublicKey()))
 	log.Printf("embedded hostkey %s", ssh.FingerprintSHA256(hostSigner.PublicKey()))
 
