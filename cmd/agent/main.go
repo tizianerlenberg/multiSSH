@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -115,7 +116,7 @@ func main() {
 		// The identification string carries the protocol version, so a proxy
 		// too new for this agent can say so before authentication rather than
 		// failing in some later, less legible way.
-		ClientVersion:   sshx.AgentVersion(),
+		ClientVersion:   sshx.AgentVersion(ownBuildID()),
 		HostKeyCallback: hostKeyCB,
 		// Whatever the proxy refuses us for, it says here. Without this the
 		// message would be discarded and the operator would see only that
@@ -128,7 +129,7 @@ func main() {
 		},
 		Timeout: 10 * time.Second,
 	}
-	log.Printf("protocol %s", sshx.DescribeProtocol(sshx.ProtocolVersion))
+	log.Printf("protocol %s, build %s", sshx.DescribeProtocol(sshx.ProtocolVersion), ownBuildID())
 
 	// Hold a registration open with every proxy at once rather than failing
 	// over between them. One certificate is valid at all of them, so this
@@ -154,6 +155,25 @@ func main() {
 	}
 	wg.Wait()
 }
+
+// ownBuildID hashes this executable, so a machine reports the binary it is
+// really running rather than whatever was recorded at install time -- the two
+// drift apart the moment an update half-finishes.
+//
+// Computed once at startup and cached: after an update the file at this path
+// has been replaced, and on Linux the running process's executable is by then
+// an unlinked inode that cannot be reopened.
+var ownBuildID = sync.OnceValue(func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	id, err := sshx.BuildIDOfFile(exe)
+	if err != nil {
+		return ""
+	}
+	return id
+})
 
 // maintain keeps one proxy registration alive forever. The agent is the side
 // that must survive NAT timeouts, laptop sleep and the proxy restarting, so

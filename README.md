@@ -140,9 +140,9 @@ $ ssh proxy
 
  registered targets (2):
 
-   homeserver           homeserver.4kfq2wtnbxue  v1
+   homeserver           homeserver.4kfq2wtnbxue  v1    current
      SHA256:0kA1pS9vHhLmXqR7dTgWc2ZuYbN4eJf6oPiK3sVrQ8w
-   laptop               laptop.niwru7dfuvu5abcd  v1
+   laptop               laptop.niwru7dfuvu5abcd  v1    OUTDATED
      SHA256:2LnQxYd8vTgMhR6pW3kZjB5cFsN1eUaHo9KiV7rXmY0
 
  connect with:  ssh -J proxy user@laptop
@@ -159,7 +159,8 @@ tizian@target:~$
 
 The second line under each target is its **identity fingerprint**, which is
 what [revocation](#revoking-a-machine) takes. `v1` is the agent's protocol
-version, so an upgrade sweep can be planned by looking rather than guessing.
+version, and `current`/`OUTDATED` says whether the machine is running a binary
+this proxy still serves — see [updating agents](#updating-agents).
 
 **The username is ignored by both hops.** The proxy does not use it (the target
 is chosen by hostname), and the agent's embedded server does not switch users —
@@ -325,9 +326,13 @@ those and leaves the unit tests.
 - an agent below the configured protocol floor is refused, and is *told why* in
   its own log
 - `/healthz` reports without naming a single target
-- two regressions are frozen against their original shapes: rate-limit keys
-  must strip the source port, and `expected_hash` in the installer must exit
-  zero when the platform is not the last entry in the list
+- publishing a new agent build and reloading with `SIGHUP` does not disconnect
+  a single agent, and the listing flips to `OUTDATED`
+- four regressions are frozen against their original shapes: rate-limit keys
+  must strip the source port; `expected_hash` must exit zero when the platform
+  is not the last entry; nothing may stop the agent before its binary is
+  swapped; and the saved installer must re-fetch rather than compare against
+  its own frozen version
 
 The last two are there because both bugs were invisible in exactly the
 configuration they were tested in — one build served, one request made — and
@@ -353,7 +358,8 @@ concurrent connections, and no per-user access control — any key in
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
 | 🟡 | No cap on concurrent connections. | A user key is enough to exhaust memory on the proxy. |
 | 🟡 | Everyone with a user key reaches every target. No ACLs. | Fine for one operator; wrong the moment a second key is added for someone else. |
-| 🟡 | Proxy configuration is entirely flags, which makes `ExecStart` unwieldy. | A config file would be kinder. |
+| 🟡 | Proxy configuration is entirely flags, held in the systemd unit. | `install-proxy.sh` writes the unit once and never overwrites it, so changes are edited on the server. |
+| 🟡 | Agents are never updated automatically. | A sweep is something you run; nothing happens on its own. Deliberate — an automatic update that goes wrong takes out every machine at once. |
 | ⚪ | A machine that enrolled but never once connected is invisible to the proxy — enrolment writes nothing there. | The installer reports success on the target instead. |
 
 ## Installing a target
@@ -365,20 +371,12 @@ right one from its first connect and there is no trust-on-first-use window for
 the agent-to-proxy hop.
 
 ```bash
-# on the proxy, once
-sh deploy/build.sh dist                       # every platform, plus the proxy
-./proxy -add-password laptops -password-validity 720h
-./proxy ... -public-url https://multissh.example.com -dist dist
-```
-
-```bash
 # on the target
 curl -fsSL https://multissh.example.com/install.sh | sudo sh          # linux, macos
 irm https://multissh.example.com/install.ps1 | iex                    # windows, elevated
 ```
 
-`deploy/multissh-proxy.service` is a hardened systemd unit for the proxy
-itself. Re-running the installer on an enrolled machine updates it rather than
+Re-running the installer on an enrolled machine updates it rather than
 enrolling a second identity; `--reenroll` forces a fresh one.
 
 It asks two things — the machine's name, defaulting to the hostname, and the
@@ -391,13 +389,17 @@ halves are sent for signing, which is what keeps the proxy out of the trust
 chain afterwards. Installation itself is the moment you trust the proxy, since
 it serves the binary; that trust is bounded to that moment.
 
-The script and a manifest of what it installed are saved beside the agent, so
-these keep working even if the proxy is gone:
+The script and a manifest of what it installed are saved beside the agent:
 
 ```bash
 sh /var/lib/multissh-agent/manage.sh --update      # binary only; keys untouched
+sh /var/lib/multissh-agent/manage.sh --rollback    # back to the previous binary
 sh /var/lib/multissh-agent/manage.sh --uninstall
 ```
+
+**These are safe to run over the tunnel itself**, which matters because for a
+machine behind NAT that is the only way to reach it. See
+[Updating agents](#updating-agents) for why that took some doing.
 
 Piped from curl, options go after `--`:
 `curl -fsSL … | sudo sh -s -- --uninstall`. Unattended installs read
@@ -408,6 +410,82 @@ Passwords are argon2id-hashed with a lifetime chosen when created, `/enroll` is
 rate limited, and enrolment writes nothing to the proxy — so none of this adds
 anything to back up. A revoked identity key is refused at `/enroll` too, rather
 than being handed a certificate that would then fail forever at connect time.
+
+---
+
+## Deploying the proxy
+
+One command from your own machine, first time and every time after:
+
+```bash
+sh deploy/push.sh root@vps --public-url https://multissh.example.com   # first install
+sh deploy/push.sh root@vps                                            # every update after
+```
+
+It builds all five platforms plus the proxy, ships them over ssh, and runs
+`deploy/install-proxy.sh` on the far end, which creates the `multissh` system
+user, the state directory and a hardened unit, then reports `/healthz`.
+
+It is **safe to run against a live proxy**, and acts only on what changed:
+
+| What changed | What happens |
+|---|---|
+| nothing | nothing |
+| agent builds only | `systemctl reload` — **no agent loses its connection** |
+| the proxy binary | a restart; agents reconnect on their own in a second or two |
+
+The unit is written on first install and **never overwritten**, so flags you
+edit on the server survive every later push. `install-proxy.sh` can also be run
+by hand on the box; `push.sh` only builds, copies and calls it.
+
+## Updating agents
+
+```bash
+sh deploy/update-agents.sh multissh          # every target reported OUTDATED
+sh deploy/update-agents.sh multissh laptop   # just this one
+```
+
+Targets are updated **one at a time**, waiting for each to come back before
+touching the next, and stopping at the first failure. That ordering is the
+point: an update that goes wrong on a rescue tool takes away the very thing you
+would use to fix it, so the blast radius of a bad build has to be one machine.
+
+`ssh proxy` marks each target `current` or `OUTDATED`, and `/healthz` counts
+them. The agent hashes **its own executable** at startup and reports that, so
+what you see is the binary a machine is really running rather than what someone
+recorded at install time — the two drift apart the moment an update half
+finishes.
+
+### Why updating over the tunnel needed care
+
+The installer used to stop the agent before moving the new binary into place.
+Driven over the agent's own tunnel — which for a machine behind NAT is the only
+way to reach it — that stop killed the update script too, because systemd tears
+down the whole cgroup it was running in. The binary was never replaced, the
+unit stayed stopped, and systemd would not restart it because it had been
+stopped deliberately. **One update and the machine was gone for good.** This
+was reproduced on a real systemd install, twice; `setsid` and `nohup` do not
+help, as they escape the process-group kill but not the cgroup kill.
+
+The stop was only there because a running executable cannot be overwritten in
+place — `ETXTBSY`. But `rename(2)` has no such restriction: the running process
+keeps its own inode and the new file simply takes the name. So the binary is
+downloaded, verified, and swapped atomically, and *only then* is anything
+restarted — by which point the update is already committed. If the script is
+killed before that, the old agent is still running and the next restart picks
+up the new binary. There is no window in which the machine has neither.
+
+`--uninstall` is ordered the same way, for the same reason.
+
+The outgoing binary is kept as `.prev`, so `--rollback` works, over the tunnel,
+without the proxy.
+
+Separately: the saved `manage.sh --update` could never update anything. The
+proxy generates the installer per request with its current version baked in;
+the saved copy froze that value and compared it against the manifest, which was
+written from the same value. Always equal, so it reported `already current`
+forever. It now asks the proxy for the script it is serving now — which it had
+to reach anyway to download a binary from.
 
 ---
 
@@ -423,7 +501,7 @@ months ago, discovered during the emergency it was meant to cover.
 - `/healthz` on the agent listener answers monitoring:
 
 ```json
-{"status":"ok","connected":3,"known":5,"stale":1,"stale_after":"720h0m0s","revoked":0,"protocol":1}
+{"status":"ok","connected":3,"known":5,"stale":1,"stale_after":"720h0m0s","outdated":1,"revoked":0,"protocol":1}
 ```
 
 It is **unauthenticated and deliberately anonymous** — counts only, no names and
@@ -524,6 +602,10 @@ go test ./...            # unit tests plus end-to-end, ~20s
 go test -short ./...     # unit tests only
 sh deploy/build.sh dist  # every platform
 ```
+
+Deployment lives in `deploy/`: `push.sh` (build and ship to the proxy host),
+`install-proxy.sh` (run there, idempotent), `update-agents.sh` (roll a build
+out to targets one at a time).
 
 CI runs `gofmt`, `go vet`, `go test -race`, a cross-compile of all five
 platforms, `sh -n` and `shellcheck` over the installer, and a PowerShell parse

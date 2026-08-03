@@ -151,9 +151,9 @@ func TestSweepDropsConnectedRevokedAgents(t *testing.T) {
 
 	reg := newRegistry()
 	doomed, spared := &fakeConn{}, &fakeConn{}
-	reg.add("bad.aaaa", doomed, fpA, 1)
-	reg.add("bad", doomed, fpA, 1) // same machine, two names
-	reg.add("good.bbbb", spared, fpB, 1)
+	reg.add("bad.aaaa", doomed, fpA, 1, "")
+	reg.add("bad", doomed, fpA, 1, "") // same machine, two names
+	reg.add("good.bbbb", spared, fpB, 1, "")
 
 	r.sweep(reg)
 
@@ -172,7 +172,7 @@ func TestSweepOnEmptySetTouchesNothing(t *testing.T) {
 	}
 	reg := newRegistry()
 	conn := &fakeConn{}
-	reg.add("laptop.aaaa", conn, fpA, 1)
+	reg.add("laptop.aaaa", conn, fpA, 1, "")
 
 	r.sweep(reg)
 	if conn.isClosed() {

@@ -15,6 +15,7 @@ import (
 	_ "embed"
 
 	"golang.org/x/crypto/ssh"
+	"multissh/internal/sshx"
 )
 
 //go:embed scripts/install.sh
@@ -90,6 +91,30 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// builds is the set of short build IDs this proxy is currently serving.
+//
+// An agent reports the hash of its own executable, so membership answers
+// exactly the question an upgrade sweep asks: is this machine running one of
+// the binaries I am handing out? No per-platform bookkeeping is needed, because
+// a build that matches any served binary is by definition current.
+func (d *distributor) builds() map[string]bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make(map[string]bool, len(d.hashes))
+	for _, sum := range d.hashes {
+		out[sshx.BuildIDOf(sum)] = true
+	}
+	return out
+}
+
+// serving reports whether any build is on offer at all. With none, every agent
+// would look outdated, which is worse than saying nothing.
+func (d *distributor) serving() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.hashes) > 0
 }
 
 func (d *distributor) snapshot() (map[string]string, string) {

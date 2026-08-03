@@ -24,6 +24,7 @@ for arg in "$@"; do
     case "$arg" in
         --uninstall) MODE=uninstall ;;
         --update)    MODE=update ;;
+        --rollback)  MODE=rollback ;;
         -y|--yes)    ASSUME_YES=1 ;;
         --reenroll)  REENROLL=1 ;;
         -h|--help)
@@ -32,6 +33,7 @@ multiSSH agent installer
 
   sh install.sh              install and enrol this machine
   sh install.sh --update     replace the binary, keep keys and certificate
+  sh install.sh --rollback   go back to the previous binary
   sh install.sh --uninstall  stop and remove everything
 
   -y, --yes                  accept defaults, do not prompt
@@ -47,6 +49,13 @@ EOF
         *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
     esac
 done
+
+# Where this copy of the script is. The copy saved beside the agent lives in
+# the state directory, so it can find its own manifest even when the install
+# used paths that a freshly fetched script could never guess. Piped from curl
+# there is no path at all, and this resolves to somewhere harmless that simply
+# holds no manifest.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF_DIR=
 
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -110,6 +119,14 @@ else
     PREFIX=${MULTISSH_PREFIX:-$HOME/.local/bin}
     STATE=${MULTISSH_STATE_DIR:-$HOME/.config/multissh-agent}
 fi
+
+# A manifest next to this script beats any default. Without this, running the
+# saved copy of a non-default install looks for a manifest in the default
+# location, does not find one, and reports that nothing is installed.
+if [ -z "${MULTISSH_STATE_DIR:-}" ] && [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/manifest" ]; then
+    STATE=$SELF_DIR
+fi
+
 BIN="$PREFIX/multissh-agent"
 MANIFEST="$STATE/manifest"
 
@@ -137,6 +154,26 @@ svc_start() {
         darwin-*)     launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load "$PLIST" ;;
     esac
 }
+# svc_restart is the last thing an update does, and it may well kill this
+# script: when the update was started over the agent's own tunnel, this shell
+# is inside the unit's cgroup. That is fine here and only here, because by this
+# point the new binary is already in place and the manifest already written.
+# Nothing after this line may matter.
+svc_restart() {
+    case "$OS-$SCOPE" in
+        linux-system) systemctl restart "$(svc_name)" ;;
+        linux-user)   systemctl --user restart "$(svc_name)" ;;
+        darwin-*)     launchctl kickstart -k system/net.multissh.agent ;;
+    esac
+}
+
+# set_manifest_version rewrites just the version line, leaving the paths and
+# identity the manifest records untouched.
+set_manifest_version() {
+    _v=$1
+    sed "s|^M_VERSION=.*|M_VERSION='$_v'|" "$MANIFEST" > "$MANIFEST.tmp" &&
+        mv "$MANIFEST.tmp" "$MANIFEST"
+}
 
 # ---------------------------------------------------------------- uninstall
 
@@ -151,15 +188,25 @@ if [ "$MODE" = uninstall ]; then
         read -r c < /dev/tty || c=
         case "$c" in y|Y|yes) ;; *) echo "cancelled"; exit 0 ;; esac
     fi
-    svc_stop
+    # Everything is removed before anything is stopped, for the same reason
+    # updates swap the binary before restarting: an uninstall run over the
+    # agent's own tunnel is killed the instant the service goes down. Doing the
+    # removal first means that kill lands after the work is finished rather
+    # than halfway through it. Unlinking files that are open or running is
+    # fine on Unix -- this script included.
+    rm -f "$BIN" "$BIN.prev" "$BIN.new"
+    rm -rf "$STATE"
     case "$OS-$SCOPE" in
-        linux-system) rm -f /etc/systemd/system/multissh-agent.service; systemctl daemon-reload 2>/dev/null || true ;;
-        linux-user)   rm -f "$HOME/.config/systemd/user/multissh-agent.service"; systemctl --user daemon-reload 2>/dev/null || true ;;
+        linux-system) rm -f /etc/systemd/system/multissh-agent.service ;;
+        linux-user)   rm -f "$HOME/.config/systemd/user/multissh-agent.service" ;;
         darwin-*)     rm -f /Library/LaunchDaemons/net.multissh.agent.plist ;;
     esac
-    rm -f "$BIN"
-    rm -rf "$STATE"
     echo "removed."
+    svc_stop
+    case "$OS-$SCOPE" in
+        linux-system) systemctl daemon-reload 2>/dev/null || true ;;
+        linux-user)   systemctl --user daemon-reload 2>/dev/null || true ;;
+    esac
     exit 0
 fi
 
@@ -198,32 +245,93 @@ sha256_of() {
     else echo ""; fi
 }
 
+# download_binary replaces the agent without ever stopping it first.
+#
+# This ordering is the whole safety property. It used to stop the service, then
+# move the new binary into place -- and when an update is driven over the
+# agent's own tunnel, which is the only way to reach a machine behind NAT, that
+# stop kills the update script too: systemd tears down the whole cgroup the
+# script is running in. The binary was then never replaced, the unit stayed
+# stopped, and systemd would not restart it because it had been stopped
+# deliberately. The machine was unreachable, permanently, from one update.
+#
+# The stop was only there because a running executable cannot be overwritten in
+# place -- ETXTBSY. But rename(2) has no such restriction: the running process
+# keeps its own inode, and the new file simply takes the name. So download and
+# verify first, swap atomically, and leave restarting to the very last step,
+# by which point everything is already committed. If the script dies before
+# that, the old agent is still running and the next restart picks up the new
+# binary. There is no window in which the machine is left with neither.
+#
+# The temporary file must sit beside the target, or mv falls back to copy and
+# unlink across filesystems and ETXTBSY returns.
 download_binary() {
     WANT=$(expected_hash)
     [ -n "$WANT" ] || die "the proxy has no agent build for $PLATFORM"
-    TMP=$(mktemp)
-    echo "downloading agent $VERSION for $PLATFORM"
-    fetch "$BASE_URL/dist/$PLATFORM" "$TMP" || die "download failed"
-    GOT=$(sha256_of "$TMP")
-    if [ -n "$GOT" ] && [ "$GOT" != "$WANT" ]; then
-        rm -f "$TMP"; die "checksum mismatch: expected $WANT, got $GOT"
-    fi
     mkdir -p "$PREFIX"
-    svc_stop
-    mv "$TMP" "$BIN"
-    chmod 0755 "$BIN"
+    NEW="$BIN.new"
+    echo "downloading agent $VERSION for $PLATFORM"
+    fetch "$BASE_URL/dist/$PLATFORM" "$NEW" || { rm -f "$NEW"; die "download failed"; }
+    GOT=$(sha256_of "$NEW")
+    if [ -n "$GOT" ] && [ "$GOT" != "$WANT" ]; then
+        rm -f "$NEW"; die "checksum mismatch: expected $WANT, got $GOT"
+    fi
+    chmod 0755 "$NEW"
+    # Keep the outgoing binary so --rollback has something to go back to.
+    if [ -f "$BIN" ]; then
+        cp -p "$BIN" "$BIN.prev.tmp" && mv "$BIN.prev.tmp" "$BIN.prev"
+    fi
+    mv "$NEW" "$BIN"
 }
 
 # ---------------------------------------------------------------- update
+
+if [ "$MODE" = rollback ]; then
+    [ -f "$MANIFEST" ] || die "nothing installed here (no $MANIFEST)"
+    [ -f "$BIN.prev" ] || die "no previous binary saved at $BIN.prev"
+    cp -p "$BIN.prev" "$BIN.rollback.tmp"
+    mv "$BIN.rollback.tmp" "$BIN"
+    # The recorded version no longer describes what is on disk. Clearing it
+    # means the next --update will re-apply rather than decide there is
+    # nothing to do.
+    set_manifest_version "rolled-back"
+    svc_restart
+    echo "rolled back to the previous binary; run --update to go forward again"
+    exit 0
+fi
+
+# The saved copy of this script has the proxy's version frozen into it from
+# install time, and the manifest records that same value -- so comparing the
+# two here would always say "already current" and the agent could never be
+# updated by the very command documented for updating it. Ask the proxy for
+# the script it is serving now and hand over to that.
+#
+# The proxy has to be reachable to download a binary from in any case, so this
+# costs nothing that was not already required.
+if [ "$MODE" = update ] && [ -z "${MULTISSH_NO_REFETCH:-}" ]; then
+    [ -f "$MANIFEST" ] || die "nothing installed here (no $MANIFEST)"
+    FRESH="$STATE/install.fetched.sh"
+    if fetch "$BASE_URL/install.sh" "$FRESH"; then
+        MULTISSH_NO_REFETCH=1
+        MULTISSH_STATE_DIR=$STATE
+        MULTISSH_PREFIX=$(dirname "$BIN")
+        export MULTISSH_NO_REFETCH MULTISSH_STATE_DIR MULTISSH_PREFIX
+        sh "$FRESH" --update ${ASSUME_YES:+-y}
+        rc=$?
+        rm -f "$FRESH"
+        exit $rc
+    fi
+    rm -f "$FRESH"
+    echo "could not reach $BASE_URL; continuing with this copy" >&2
+fi
 
 if [ "$MODE" = update ]; then
     [ -f "$MANIFEST" ] || die "nothing installed here (no $MANIFEST)"
     [ "$M_CA" = "$CA_KEY" ] || die "this proxy has a different authority than the one enrolled with; refusing"
     if [ "$M_VERSION" = "$VERSION" ]; then echo "already current ($VERSION)"; exit 0; fi
     download_binary
-    sed -i.bak "s|^M_VERSION=.*|M_VERSION='$VERSION'|" "$MANIFEST" 2>/dev/null || true
-    rm -f "$MANIFEST.bak"
-    svc_start
+    set_manifest_version "$VERSION"
+    svc_restart
     echo "updated to $VERSION; keys and certificate untouched"
     exit 0
 fi
@@ -370,8 +478,13 @@ cat <<EOF
 
   ssh -J <proxy> root@$FRIENDLY
 
-  update or remove:
+  update, roll back or remove:
     sh $STATE/manage.sh --update
+    sh $STATE/manage.sh --rollback
     sh $STATE/manage.sh --uninstall
+
+  These are safe to run over the tunnel itself: the binary is swapped before
+  anything is restarted, so an interrupted update leaves the old agent running
+  rather than no agent at all.
 
 EOF
