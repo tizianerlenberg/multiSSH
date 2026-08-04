@@ -356,6 +356,26 @@ Certificates never expire by default. For a rescue tool that is deliberate: a
 machine switched off longer than its certificate lasts would otherwise lock
 itself out. Use `-sign-validity` if you want expiry.
 
+### Retiring a machine
+
+Uninstalling the agent leaves the proxy holding two things about it: the
+friendly name it claimed, and its place in the last-seen record.
+
+```bash
+multissh-proxy -forget winbox.bbbb        # canonical or friendly name
+systemctl reload multissh-proxy
+```
+
+The name is the part that matters. **Reinstalling a machine generates a new
+identity key**, the ledger still binds the name to the old one, and the machine
+comes back reachable under its canonical name only — correct by the rules, and
+baffling if you do not know the rules. Forget it first and the name is free
+again.
+
+This is housekeeping, not security: an uninstalled agent has no certificate
+left to connect with. To bar a machine you do not physically control, use
+[revocation](#revoking-a-machine).
+
 ### Revoking a machine
 
 Because certificates do not expire, revocation is the only lever that removes a

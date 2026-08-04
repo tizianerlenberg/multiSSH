@@ -107,6 +107,17 @@ function Stop-Agent {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
+# Find-AgentProcesses locates a running agent by the exact binary it was
+# started from.
+#
+# By path, not by name: both scopes run a process called multissh-agent, and
+# uninstalling one must not take down the other. Must be called before the
+# binary is renamed aside, after which nothing can be matched to it.
+function Find-AgentProcesses($binary) {
+    Get-Process -Name 'multissh-agent' -ErrorAction SilentlyContinue |
+        Where-Object { try { $_.Path -eq $binary } catch { $false } }
+}
+
 function Remove-AgentTask {
     if ($Scope -eq 'system') {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
@@ -286,6 +297,16 @@ if ($Uninstall) {
     # while the agent still runs is done first. Windows refuses to delete a
     # running .exe but allows it to be renamed, so the binary is moved aside
     # and only then deleted.
+    # Noted before anything moves, and killed at the very end.
+    #
+    # Unregistering a task does not stop an instance of it that is already
+    # running -- it only removes the definition. So the old order took the
+    # definition away and then asked Task Scheduler to stop a task it no longer
+    # knew about, which did nothing, and left the agent running with its keys
+    # deleted underneath it: gone from Get-ScheduledTask, still connected to
+    # the proxy, still listed as online, and unable to serve a session.
+    $running = @(Find-AgentProcesses $m.binary)
+
     Remove-AgentTask
     Remove-Item -Recurse -Force $m.state -ErrorAction SilentlyContinue
     if (Test-Path $m.binary) {
@@ -293,7 +314,12 @@ if ($Uninstall) {
     }
     Remove-Item -Force "$($m.binary).prev", "$($m.binary).new" -ErrorAction SilentlyContinue
     Write-Host 'removed.'
+
     Stop-Agent
+    if ($running.Count -gt 0) {
+        Write-Host "stopping $($running.Count) running agent process(es)"
+        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
     exit 0
 }
