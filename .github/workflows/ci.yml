@@ -64,8 +64,10 @@ jobs:
           shellcheck --shell=sh --severity=warning \
             cmd/proxy/scripts/install.sh deploy/*.sh
 
-      # The PowerShell installer has never been run on real hardware, so a
-      # parse check is the only guard it has.
+      # The PowerShell installer is exercised as far as a non-Windows runner
+      # allows: it parses, and the parts that do not touch Windows APIs are
+      # actually run. The rest -- scheduled tasks, icacls -- can only be
+      # covered by the structural assertions in cmd/proxy/update_test.go.
       - name: parse install.ps1
         shell: pwsh
         run: |

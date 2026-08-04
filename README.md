@@ -354,9 +354,9 @@ concurrent connections, and no per-user access control — any key in
 
 | | Issue | Impact |
 |---|---|---|
-| 🟡 | Windows and macOS are **built but never run**. | Unknown. |
+| 🟡 | Windows and macOS are **built but never run**. | Unknown. The Windows installer is parse-checked and its logic exercised under PowerShell on Linux, but no part of it has touched a real Windows machine. |
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
-| 🟡 | Windows registers a scheduled task, not a real service. | No restart-on-crash beyond the agent's own reconnect loop. |
+| 🟡 | Windows registers a scheduled task, not a real service. | Restarts three times on failure and has no execution time limit, but a proper service would be better. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
 | 🟡 | No cap on concurrent connections. | A user key is enough to exhaust memory on the proxy. |
