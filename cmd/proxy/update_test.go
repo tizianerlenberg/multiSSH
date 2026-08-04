@@ -643,3 +643,36 @@ func TestPowerShellUninstallAlsoRemovesALegacyTask(t *testing.T) {
 		t.Error("the task removal is inside the system-scope branch; a legacy task would survive an uninstall")
 	}
 }
+
+// Regression. Unregistering a scheduled task removes the definition but does
+// not stop an instance already running. Uninstall unregistered first and then
+// asked Task Scheduler to stop a task it no longer knew about, so the agent
+// kept running with its keys deleted underneath it -- absent from
+// Get-ScheduledTask, still connected to the proxy, still listed online, and
+// unable to serve a session.
+func TestPowerShellUninstallKillsTheRunningAgent(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+	body := section(t, script, `^if \(\$Uninstall\) \{`, `^\}`)
+
+	if !strings.Contains(body, "$running = @(Find-AgentProcesses $m.binary)") {
+		t.Fatal("uninstall does not locate the running agent process")
+	}
+	if !strings.Contains(body, "Stop-Process -Force") {
+		t.Error("uninstall never kills the running agent")
+	}
+	// Captured before the binary is renamed, or it can no longer be matched.
+	find := strings.Index(body, "Find-AgentProcesses")
+	move := strings.Index(body, "Move-Item -Force $m.binary")
+	kill := strings.Index(body, "Stop-Process -Force")
+	if find > move {
+		t.Error("the running process is looked up after the binary is renamed aside")
+	}
+	if kill < move {
+		t.Error("the agent is killed before the files are removed; an uninstall over the tunnel would not finish")
+	}
+
+	// Matched by path so that uninstalling one scope leaves the other running.
+	if !strings.Contains(script, "$_.Path -eq $binary") {
+		t.Error("agent processes are matched by name alone; uninstalling one scope would kill the other")
+	}
+}

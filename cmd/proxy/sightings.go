@@ -127,3 +127,30 @@ func ago(t time.Time) string {
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
 }
+
+// forget drops a target from the history, for a machine that is gone for good
+// rather than merely absent.
+func (s *sightings) forget(name string) bool {
+	s.mu.Lock()
+	_, known := s.m[name]
+	if known {
+		delete(s.m, name)
+	}
+	s.mu.Unlock()
+	if known {
+		s.save()
+	}
+	return known
+}
+
+// reload re-reads the file so an edit lands without a restart.
+func (s *sightings) reload() error {
+	fresh, err := openSightings(s.path)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m = fresh.m
+	return nil
+}

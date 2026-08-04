@@ -244,6 +244,7 @@ func main() {
 		unrevoke      = flag.String("unrevoke", "", "lift a revocation, then exit")
 		revokeNote    = flag.String("revoke-note", "", "why, recorded beside the fingerprint")
 		listRevoked   = flag.Bool("list-revoked", false, "show revoked fingerprints and exit")
+		forget        = flag.String("forget", "", "drop a target from the friendly-name ledger and the last-seen record, then exit")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
@@ -257,6 +258,44 @@ func main() {
 		if err := manageRevocations(*revFile, *revoke, *unrevoke, *listRevoked, *revokeNote, *ledgerPath); err != nil {
 			log.Fatalf("revoke: %v", err)
 		}
+		return
+	}
+
+	// Forgetting a target needs no authority either, and is the counterpart to
+	// uninstalling an agent: the machine is gone, but the proxy still holds its
+	// friendly name and its history. Leaving the name bound is the trap --
+	// reinstalling generates a new identity key, the old binding refuses it,
+	// and the machine returns reachable only under its canonical name.
+	if *forget != "" {
+		book, err := openLedger(*ledgerPath)
+		if err != nil {
+			log.Fatalf("labels: %v", err)
+		}
+		seen, err := openSightings(*seenFile)
+		if err != nil {
+			log.Fatalf("last-seen: %v", err)
+		}
+		var did []string
+		if book.forget(*forget) {
+			did = append(did, "released the friendly name")
+		}
+		if seen.forget(*forget) {
+			did = append(did, "dropped it from the last-seen record")
+		}
+		// A canonical name is what the listing shows for a disconnected
+		// target, but the ledger is keyed by friendly name, so try both ends.
+		if base, _, ok := strings.Cut(*forget, "."); ok && book.forget(base) {
+			did = append(did, fmt.Sprintf("released the friendly name %q", base))
+		}
+		if len(did) == 0 {
+			fmt.Printf("nothing known about %q\n", *forget)
+			return
+		}
+		for _, d := range did {
+			fmt.Printf("  %s\n", d)
+		}
+		fmt.Printf("\nreload the proxy for this to take effect on the running one:\n")
+		fmt.Printf("  systemctl reload multissh-proxy\n")
 		return
 	}
 
@@ -554,6 +593,13 @@ func main() {
 				log.Printf("reload: users: %v (keeping the previous %d)", err, len(*users.Load()))
 			} else {
 				log.Printf("reloaded %d user key(s)", n)
+			}
+
+			if err := book.reload(); err != nil {
+				log.Printf("reload: labels: %v (keeping the previous set)", err)
+			}
+			if err := seen.reload(); err != nil {
+				log.Printf("reload: last-seen: %v (keeping the previous set)", err)
 			}
 
 			if extra != nil {

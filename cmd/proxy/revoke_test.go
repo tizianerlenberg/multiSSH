@@ -232,3 +232,82 @@ func TestStaleSince(t *testing.T) {
 		t.Error("a cutoff older than everything still found stale targets")
 	}
 }
+
+// Uninstalling an agent leaves the proxy holding its friendly name and its
+// history. The name is the part that matters: reinstalling generates a new
+// identity key, the old binding refuses it, and the machine returns reachable
+// under its canonical name only -- correct by the rules, and baffling if you
+// do not know them.
+func TestForgetReleasesBothTheNameAndTheHistory(t *testing.T) {
+	labels := tempFile(t, "friendly_labels")
+	seenPath := tempFile(t, "last_seen")
+
+	book, err := openLedger(labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !book.claim("winbox", "SHA256:old") {
+		t.Fatal("could not claim the name to begin with")
+	}
+	s, err := openSightings(seenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.seen("winbox.bbbb")
+
+	if !book.forget("winbox") {
+		t.Error("forget did not release a held name")
+	}
+	if !s.forget("winbox.bbbb") {
+		t.Error("forget did not drop the sighting")
+	}
+	if book.forget("winbox") || s.forget("winbox.bbbb") {
+		t.Error("forgetting something already forgotten reported success")
+	}
+
+	// Reread from disk: the point is that a *later* proxy sees the change.
+	again, err := openLedger(labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.claim("winbox", "SHA256:new") {
+		t.Error("a reinstalled machine could not reclaim the released name")
+	}
+	afterSeen, err := openSightings(seenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range afterSeen.known() {
+		if k.Name == "winbox.bbbb" {
+			t.Error("the forgotten target is still in the last-seen record")
+		}
+	}
+}
+
+// A reload has to pick up an edit made by -forget while the proxy is running,
+// or the in-memory copy would write the name straight back.
+func TestLedgerAndSightingsReload(t *testing.T) {
+	labels := tempFile(t, "friendly_labels")
+	book, err := openLedger(labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	book.claim("winbox", "SHA256:old")
+
+	// Another process -- the -forget command -- rewrites the file.
+	other, err := openLedger(labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.forget("winbox")
+
+	if book.claim("winbox", "SHA256:new") {
+		t.Fatal("the running copy should still hold the old binding before reloading")
+	}
+	if err := book.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if !book.claim("winbox", "SHA256:new") {
+		t.Error("after reload the released name is still refused")
+	}
+}

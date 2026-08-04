@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -77,4 +78,51 @@ func (l *ledger) appendLine(name, fp string) error {
 	defer f.Close()
 	_, err = fmt.Fprintf(f, "%s %s\n", name, fp)
 	return err
+}
+
+// forget drops a friendly name, so a machine reinstalled from scratch can
+// claim it again.
+//
+// Without this, reinstalling is a trap: the new install generates a new
+// identity key, the ledger still binds the name to the old one, and the
+// machine comes back reachable under its canonical name only -- correct by the
+// rules, and baffling if you do not know the rules.
+func (l *ledger) forget(name string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, held := l.m[name]; !held {
+		return false
+	}
+	delete(l.m, name)
+	return l.rewrite() == nil
+}
+
+// rewrite replaces the file with the current bindings. The normal path only
+// appends, so this is the one place the whole file is rendered.
+func (l *ledger) rewrite() error {
+	var b strings.Builder
+	b.WriteString("# friendly name -> agent identity fingerprint.\n")
+	b.WriteString("# Advisory: losing this costs a convenient name, never access.\n")
+	names := make([]string, 0, len(l.m))
+	for n := range l.m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		fmt.Fprintf(&b, "%s %s\n", n, l.m[n])
+	}
+	return os.WriteFile(l.path, []byte(b.String()), 0o600)
+}
+
+// reload re-reads the file, so an edit made while the proxy runs takes effect
+// without a restart that would drop every agent.
+func (l *ledger) reload() error {
+	fresh, err := openLedger(l.path)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.m = fresh.m
+	return nil
 }
