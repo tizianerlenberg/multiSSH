@@ -621,3 +621,25 @@ func TestLandingPageOffersTheInstallCommands(t *testing.T) {
 		t.Errorf("an unknown path returned %d, not 404", rec404.Code)
 	}
 }
+
+// A machine installed before the system scope became a service is running a
+// scheduled task. An uninstaller that only knew about services would remove
+// the binary and leave the task behind, scheduled, pointing at a file that no
+// longer exists.
+func TestPowerShellUninstallAlsoRemovesALegacyTask(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+	remove := section(t, script, `^function Remove-AgentTask \{`, `^\}`)
+
+	if !strings.Contains(remove, "sc.exe delete $ServiceName") {
+		t.Error("uninstall does not remove the service")
+	}
+	// Unconditional: outside the system-scope branch, so it runs either way.
+	if !strings.Contains(remove, "Unregister-ScheduledTask") {
+		t.Error("uninstall does not remove the scheduled task")
+	}
+	idx := strings.Index(remove, "Unregister-ScheduledTask")
+	closing := strings.Index(remove, "\n    }")
+	if closing >= 0 && idx < closing {
+		t.Error("the task removal is inside the system-scope branch; a legacy task would survive an uninstall")
+	}
+}

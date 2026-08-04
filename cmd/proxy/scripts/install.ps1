@@ -99,9 +99,12 @@ $ServiceName = 'multissh-agent'
 function Stop-Agent {
     if ($Scope -eq 'system') {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-    } else {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     }
+    # Also the task, always. A machine installed before the system scope became
+    # a service is running one, and an uninstaller that only knew about
+    # services would take away the binary and leave the task behind, still
+    # scheduled, pointing at a file that no longer exists.
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
 function Remove-AgentTask {
@@ -109,10 +112,9 @@ function Remove-AgentTask {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
         # sc.exe rather than Remove-Service, which only exists in PowerShell 6+
         # and this may well be Windows PowerShell 5.1.
-        & sc.exe delete $ServiceName | Out-Null
-    } else {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        & sc.exe delete $ServiceName 2>$null | Out-Null
     }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 # Start-Agent registers the task and starts it.
@@ -252,6 +254,8 @@ if ($Scope -eq 'system') {
     }
     $InstallDir = $SystemInstallDir
     $StateDir   = $SystemStateDir
+    # Kept even though the system scope installs a service now: it is the name
+    # a pre-service install used, and uninstall still has to find it.
     $TaskName   = 'multiSSH agent'
 } else {
     $InstallDir = $UserInstallDir
