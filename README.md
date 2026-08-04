@@ -162,6 +162,47 @@ what [revocation](#revoking-a-machine) takes. `v1` is the agent's protocol
 version, and `current`/`OUTDATED` says whether the machine is running a binary
 this proxy still serves — see [updating agents](#updating-agents).
 
+### What you get on Windows
+
+The agent runs as a scheduled task under **SYSTEM**, so the machine is
+reachable before anyone logs in — which is the whole point for a rescue tool.
+The shell you get is PowerShell running as SYSTEM, and that is a genuinely
+different account from yours, not merely an elevated one:
+
+- **No user profile.** `$HOME`, `%LOCALAPPDATA%` and `HKCU` are SYSTEM's, under
+  `C:\Windows\System32\config\systemprofile`, not yours.
+- **Per-user apps are missing.** `winget` in particular is an app execution
+  alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on *your* PATH and
+  not on SYSTEM's — so it is "not recognized" in the session while working fine
+  in your own PowerShell. The same goes for scoop, pyenv, and anything else
+  installed per user.
+- **No network identity of yours.** SYSTEM authenticates to other machines as
+  the *computer* account, so mapped drives and shares behave differently.
+- More privilege locally than an administrator, less reach outward.
+
+`whoami` says `nt authority\system`. To check what you are:
+
+```powershell
+whoami
+[Security.Principal.WindowsIdentity]::GetCurrent().Name
+([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+```
+
+For `winget` specifically, the package payload is present machine-wide even
+though the alias is not, so it can be called by full path:
+
+```powershell
+$w = (Get-ChildItem 'C:\Program Files\WindowsApps' -Filter winget.exe -Recurse `
+        -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+& $w list
+```
+
+Microsoft does not support running `winget` as SYSTEM, and it may still fail on
+source registration even when found. `--scope machine` installs are the ones
+most likely to work. MSI installers and `Add-AppxProvisionedPackage` do not
+have this problem.
+
 **The username is ignored by both hops.** The proxy does not use it (the target
 is chosen by hostname), and the agent's embedded server does not switch users —
 it runs the shell as whoever the agent runs as. So `ssh -J proxy root@laptop`
