@@ -721,3 +721,38 @@ func TestPowerShellSilencesTheProgressBar(t *testing.T) {
 		t.Error("the progress preference is set after the first web request")
 	}
 }
+
+// Regression. Run from a terminal, ssh with no command allocates a
+// pseudo-terminal and puts the *local* terminal into raw mode. The sweep hung
+// on its very first step, and Ctrl-C did not stop it -- in raw mode the
+// interrupt goes to the far end as a byte rather than becoming a signal
+// locally -- so the only way out was to close the window. It ran perfectly
+// when invoked without a terminal, which is why it looked fine here and broken
+// for the person using it.
+func TestUpdateScriptNeverAllocatesATerminal(t *testing.T) {
+	body, err := os.ReadFile("../../deploy/update-agents.sh")
+	if err != nil {
+		t.Skipf("no update-agents.sh: %v", err)
+	}
+	script := string(body)
+
+	opts := section(t, script, `^SSHOPTS=`, `"$`)
+	for _, want := range []string{"-T", "-n"} {
+		if !strings.Contains(opts, want+" ") {
+			t.Errorf("SSHOPTS lacks %s, so ssh will take over the terminal when run interactively", want)
+		}
+	}
+	if !strings.Contains(opts, "BatchMode=yes") {
+		t.Error("SSHOPTS lacks BatchMode; a prompt would hang the sweep")
+	}
+	// Every ssh must go through SSHOPTS rather than rolling its own options.
+	for _, line := range strings.Split(script, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, "$SSH ") {
+			continue
+		}
+		if !strings.Contains(trimmed, "$SSHOPTS") {
+			t.Errorf("an ssh call bypasses SSHOPTS: %s", trimmed)
+		}
+	}
+}
