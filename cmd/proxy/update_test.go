@@ -886,3 +886,43 @@ func TestPowerShellRefreshesTheSavedScriptOnUpdate(t *testing.T) {
 		t.Error("manage.ps1 is refreshed after the restart is scheduled; the restart would still run the stale copy")
 	}
 }
+
+// The macOS installer had never been run. Two of its faults would have stopped
+// either install path dead, and both are the sort that produce a plist launchd
+// accepts and an agent that does not work.
+func TestMacInstallerHandlesBothDomainsAndSpaces(t *testing.T) {
+	script := installerSource(t)
+
+	// A system install is a LaunchDaemon in /Library and needs root; a user
+	// install is a LaunchAgent in the user's own Library and needs nothing.
+	// Everything darwin used the daemon path regardless of scope, so an
+	// install without sudo tried to write to /Library/LaunchDaemons.
+	for _, want := range []string{
+		"PLIST=/Library/LaunchDaemons/net.multissh.agent.plist",
+		`PLIST="$HOME/Library/LaunchAgents/net.multissh.agent.plist"`,
+		`LAUNCH_DOMAIN="gui/$(id -u)"`,
+		`launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("install.sh is missing %q", want)
+		}
+	}
+	if strings.Contains(script, "launchctl bootout system/net.multissh.agent") {
+		t.Error("the system launchd domain is still hardcoded; a user install would try to stop a daemon it does not own")
+	}
+
+	// The default macOS state directory contains a space. Splitting the
+	// argument string on whitespace turned that path into two arguments.
+	if strings.Contains(script, "for a in $ARGS") {
+		t.Error("plist arguments are still word-split; the default macOS state path contains a space")
+	}
+	if !strings.Contains(script, "agent_args() {") {
+		t.Error("there is no argument list; a single string cannot carry a path with a space")
+	}
+	if !strings.Contains(script, "xml_escape") {
+		t.Error("plist values are not XML-escaped")
+	}
+	if !strings.Contains(script, "StandardErrorPath") {
+		t.Error("the plist sends the agent's output nowhere, so a macOS failure would be silent")
+	}
+}

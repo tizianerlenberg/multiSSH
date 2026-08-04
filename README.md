@@ -491,7 +491,7 @@ concurrent connections, and no per-user access control — any key in
 | | Issue | Impact |
 |---|---|---|
 | 🔴 | The agent is **not code signed**. On Windows with Smart App Control enforced it can be blocked from starting, which shows up only as scheduled task result `0x800704C7` and an agent that never reconnects. | The installer strips the Mark of the Web and warns when Smart App Control is on. A real fix needs a code-signing certificate. |
-| 🟡 | macOS is **built but never run**. | Unknown. Windows is now genuinely in use; macOS has never been started. |
+| 🟡 | macOS is **built but never run**. | Two faults that would have stopped either install path have been fixed by inspection, and the generated plist is checked in the test suite, but nothing has started on a Mac. |
 | 🟡 | Windows: a machine-wide install is a real service; a user install is a scheduled task, because creating a service needs rights a user does not have. | The user-scope agent restarts three times on failure and stops when you log out. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Processes a session starts survive disconnect, on both platforms. | Deliberate on Unix, as under a normal sshd. On Windows a Job Object would fix it, but it killed the self-update halfway through and had to come out; the way back is to move the restart out of the session. |
