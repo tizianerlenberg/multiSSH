@@ -458,3 +458,24 @@ func TestPowerShellSupportsBothScopes(t *testing.T) {
 		t.Error("the manifest records a hardcoded scope")
 	}
 }
+
+// Two agents on one machine can both ask the proxy for a friendly name, but
+// only one can hold it; the loser is reachable under its canonical name alone.
+// That is correct behaviour and quietly baffling, so the second install steers
+// its suggested name away from the first.
+func TestPowerShellSuggestsANonCollidingName(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+
+	if !strings.Contains(script, `$default = "$default-$Scope"`) {
+		t.Error("the suggested name does not avoid the other scope's")
+	}
+	// The other scope's task, not its manifest: a system install's state
+	// directory is locked to SYSTEM and Administrators, so an unelevated shell
+	// cannot see it to know it is there.
+	if !strings.Contains(script, "Get-ScheduledTask -TaskName $otherTask") {
+		t.Error("the other scope is detected by something other than its scheduled task; a system state directory is unreadable to an unelevated user")
+	}
+	if strings.Contains(script, "Test-Path $systemManifest") {
+		t.Error("the other scope is detected by its manifest, which an unelevated shell cannot read")
+	}
+}
