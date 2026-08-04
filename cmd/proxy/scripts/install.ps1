@@ -282,10 +282,25 @@ function Download-Binary {
         Die "checksum mismatch: expected $want, got $got"
     }
     if (Test-Path $Binary) {
-        Remove-Item -Force "$Binary.prev" -ErrorAction SilentlyContinue
+        # Whatever is already at .prev may be the image of a process that is
+        # still running -- an update whose restart did not take leaves exactly
+        # that, because the outgoing binary was renamed here and then never
+        # replaced. Windows will not delete or overwrite a running image,
+        # though it will rename one. So move what is in the way out of the way
+        # instead of trying to remove it; deleting was failing, and taking the
+        # whole update with it.
+        if (Test-Path "$Binary.prev") {
+            $parked = "$Binary.prev." + (Get-Date -Format 'yyyyMMddHHmmss')
+            Move-Item -Force "$Binary.prev" $parked -ErrorAction SilentlyContinue
+        }
         Move-Item -Force $Binary "$Binary.prev"
     }
     Move-Item -Force $new $Binary
+
+    # Tidy up parked copies that nothing holds open any more. Failures are
+    # expected and ignored: one of them is probably still running.
+    Get-ChildItem -Path $InstallDir -Filter 'multissh-agent.exe.prev.*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue }
 
     # Strip the Mark of the Web. Invoke-WebRequest tags what it downloads as
     # having come from the internet, and that tag is what pushes SmartScreen
@@ -470,6 +485,8 @@ if ($Uninstall) {
         Move-Item -Force $m.binary "$($m.binary).removing" -ErrorAction SilentlyContinue
     }
     Remove-Item -Force "$($m.binary).prev", "$($m.binary).new" -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $InstallDir -Filter 'multissh-agent.exe.prev.*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue }
     Write-Host 'removed.'
 
     Stop-Agent

@@ -837,3 +837,24 @@ func TestPowerShellRestartsFromOutsideTheSession(t *testing.T) {
 		}
 	}
 }
+
+// Regression. An update whose restart did not take leaves the outgoing binary
+// at .prev *and still running*, because it was renamed there and never
+// replaced. Windows refuses to delete or overwrite a running image, so every
+// later update failed at the swap -- and the failure was inside the step that
+// is supposed to be the safe one.
+func TestPowerShellSwapSurvivesALockedPreviousBinary(t *testing.T) {
+	body := section(t, withoutComments(powershellInstaller(t)),
+		`^function Download-Binary \{`, `^\}`)
+
+	if strings.Contains(body, `Remove-Item -Force "$Binary.prev"`) {
+		t.Error("the swap still tries to delete the previous binary, which fails when it is a running image")
+	}
+	if !strings.Contains(body, `Move-Item -Force "$Binary.prev" $parked`) {
+		t.Error("a previous binary in the way is not moved aside; renaming is the only thing Windows allows on a running image")
+	}
+	// The parked copies have to be cleaned up eventually, or they accumulate.
+	if !strings.Contains(body, "multissh-agent.exe.prev.*") {
+		t.Error("parked binaries are never cleaned up")
+	}
+}
