@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -234,6 +235,19 @@ func main() {
 		return
 	}
 
+	// Enrolment passwords need no authority either, and for the same reason
+	// must be handled before one is loaded: LoadOrCreateHostKey *creates* the
+	// key when it is absent, so running this from the wrong directory used to
+	// leave behind a stray file named proxy_ca_key that was not the authority
+	// at all. For a tool whose whole backup story is "keep proxy_ca_key", a
+	// decoy of that name is worse than untidy.
+	if *listPasswords || *addPassword != "" || *delPassword != "" {
+		if err := managePasswords(*pwFile, *addPassword, *delPassword, *listPasswords, *pwValidity); err != nil {
+			log.Fatalf("passwords: %v", err)
+		}
+		return
+	}
+
 	// Verifying a certificate needs only the authority's public key; issuing
 	// one needs the private key. A standby therefore runs on the public half
 	// alone: it can authenticate every agent, and can enrol nothing. That
@@ -276,13 +290,6 @@ func main() {
 		return
 	}
 
-	if *listPasswords || *addPassword != "" || *delPassword != "" {
-		if err := managePasswords(*pwFile, *addPassword, *delPassword, *listPasswords, *pwValidity); err != nil {
-			log.Fatalf("passwords: %v", err)
-		}
-		return
-	}
-
 	// A standby cannot sign its own host key, so the primary does it once.
 	if *signProxy != "" {
 		if err := issueProxyHostCert(ca, *signProxy); err != nil {
@@ -303,8 +310,18 @@ func main() {
 	log.Printf("proxy host key %s", ssh.FingerprintSHA256(signer.PublicKey()))
 	log.Printf("certificate authority %s", ssh.FingerprintSHA256(caPub))
 
-	users, err := sshx.LoadAuthorizedKeys(*usersFile)
-	if err != nil {
+	// Held behind a pointer so SIGHUP can swap it. Authorising a person should
+	// not cost every agent its connection, which a restart would.
+	var users atomic.Pointer[map[string]bool]
+	loadUsers := func() (int, error) {
+		u, err := sshx.LoadAuthorizedKeys(*usersFile)
+		if err != nil {
+			return 0, err
+		}
+		users.Store(&u)
+		return len(u), nil
+	}
+	if _, err := loadUsers(); err != nil {
 		log.Fatalf("users: %v", err)
 	}
 	book, err := openLedger(*ledgerPath)
@@ -319,7 +336,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("revoked: %v", err)
 	}
-	log.Printf("loaded %d user key(s), %d revoked agent key(s)", len(users), revoked.count())
+	log.Printf("loaded %d user key(s), %d revoked agent key(s)", len(*users.Load()), revoked.count())
 
 	// Silent decay is this tool's real failure mode: an agent that stopped
 	// months ago is otherwise discovered during the emergency it existed for.
@@ -376,13 +393,20 @@ func main() {
 			dist.scan()
 			hashes, version := dist.snapshot()
 			log.Printf("reloaded %d agent build(s), version %s", len(hashes), version)
+			// A bad users file must not empty the set of people who can log
+			// in: keep the previous one and say so.
+			if n, err := loadUsers(); err != nil {
+				log.Printf("reload: users: %v (keeping the previous %d)", err, len(*users.Load()))
+			} else {
+				log.Printf("reloaded %d user key(s)", n)
+			}
 		}
 	}()
 
 	userCfg := &ssh.ServerConfig{
 		ServerVersion: sshx.ProxyVersion(),
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if !users[string(key.Marshal())] {
+			if !(*users.Load())[string(key.Marshal())] {
 				return nil, fmt.Errorf("unauthorized user key")
 			}
 			return nil, nil

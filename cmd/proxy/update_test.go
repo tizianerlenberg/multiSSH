@@ -163,6 +163,57 @@ func TestDeploymentScriptsParse(t *testing.T) {
 	}
 }
 
+// Regression. build.sh names its packages relative to the repository root, but
+// push.sh calls it from wherever the developer happens to be standing. It used
+// to say "Run from the repository root" and then fail with "go.mod file not
+// found" the first time deployment tooling called it.
+func TestBuildScriptResolvesItsOwnRoot(t *testing.T) {
+	path, err := filepath.Abs("../../deploy/build.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("no build.sh: %v", err)
+	}
+	if !strings.Contains(string(body), `cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"`) {
+		t.Error("build.sh does not move to the repository root; calling it from anywhere else fails on go.mod")
+	}
+	// A relative output directory must still mean what the caller meant, which
+	// requires resolving it before moving.
+	if !strings.Contains(string(body), "OUT=$(pwd)/$OUT") {
+		t.Error("build.sh does not resolve a relative output directory before changing directory")
+	}
+}
+
+// Regression. install-proxy.sh started the service and then told you to create
+// users_authorized_keys -- but the proxy treats that file as mandatory and
+// exits without it, so a first install crash-looped and the script reported a
+// proxy that would not run.
+func TestProxyInstallerCreatesTheUsersFileBeforeStarting(t *testing.T) {
+	path, err := filepath.Abs("../../deploy/install-proxy.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("no install-proxy.sh: %v", err)
+	}
+	script := string(body)
+
+	create := strings.Index(script, `> "$STATE/users_authorized_keys"`)
+	start := strings.Index(script, "systemctl start multissh-proxy")
+	if create < 0 {
+		t.Fatal("install-proxy.sh never creates users_authorized_keys; a first install will crash-loop")
+	}
+	if start < 0 {
+		t.Fatal("install-proxy.sh no longer starts the service")
+	}
+	if create > start {
+		t.Error("install-proxy.sh starts the proxy before creating users_authorized_keys")
+	}
+}
+
 // The build state shown in the listing drives every update decision, so its
 // edge cases matter more than they look.
 func TestBuildState(t *testing.T) {
