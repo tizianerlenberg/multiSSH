@@ -11,7 +11,7 @@ case is why the agent runs its **own** SSH server rather than forwarding to the
 system one: a broken `sshd` on the target has no bearing on whether you can get
 in.
 
-> **Status: working prototype, exercised only on Linux. Internet exposure still untested.**
+> **Status: working prototype, in use on Linux and Windows. Internet exposure still lightly tested.**
 > See [Security](#security) and [Known gaps](#known-gaps) before exposing it.
 >
 > The Python implementation this replaces is at the `v0-python` tag.
@@ -466,7 +466,7 @@ concurrent connections, and no per-user access control — any key in
 
 | | Issue | Impact |
 |---|---|---|
-| 🟡 | Windows and macOS are **built but never run**. | Unknown. The Windows installer is parse-checked and its logic exercised under PowerShell on Linux, but no part of it has touched a real Windows machine. |
+| 🟡 | macOS is **built but never run**. | Unknown. Windows is now genuinely in use; macOS has never been started. |
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
 | 🟡 | Windows: a machine-wide install is a real service; a user install is a scheduled task, because creating a service needs rights a user does not have. | The user-scope agent restarts three times on failure and stops when you log out. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
@@ -755,10 +755,18 @@ need a `ProxyCommand` helper, which breaks "stock ssh client, nothing extra".
 ## Development
 
 ```bash
+sh deploy/check.sh       # everything CI runs, including shellcheck and pwsh
 go test ./...            # unit tests plus end-to-end, ~20s
 go test -short ./...     # unit tests only
 sh deploy/build.sh dist  # every platform
 ```
+
+Run `deploy/check.sh` before pushing. Two of CI's checks need tools that are on
+neither a development machine nor the proxy — `shellcheck` and a PowerShell
+parse — so they are easy to push and forget; that is exactly what happened, and
+CI sat red for a day with the PowerShell check never running at all, because it
+was ordered after the step that was failing. The script runs both through a
+container, or says plainly that it skipped them.
 
 Deployment lives in `deploy/`: `push.sh` (build and ship to the proxy host),
 `install-proxy.sh` (run there, idempotent), `update-agents.sh` (roll a build

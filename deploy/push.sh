@@ -12,7 +12,7 @@
 # server holds the configuration and this will not overwrite it.
 set -eu
 
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 [ $# -ge 1 ] || { echo "usage: sh deploy/push.sh [user@]host [--public-url URL] [...]" >&2; exit 2; }
 HOST=$1; shift
 
