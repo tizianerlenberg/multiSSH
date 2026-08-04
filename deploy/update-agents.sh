@@ -17,9 +17,10 @@
 # sweep: unreachable targets are the normal state for this tool, not an
 # exception, so the run reports them at the end and carries on.
 #
-#   MULTISSH_WAIT     seconds to wait for a machine to come back   (default 180)
-#   MULTISSH_TIMEOUT  seconds to allow the update command itself   (default 120)
-#   MULTISSH_STOP     set to 1 to stop at the first failure instead of skipping
+#   MULTISSH_WAIT      seconds to wait for a machine to come back  (default 120)
+#   MULTISSH_TIMEOUT   seconds to allow the update command itself   (default 90)
+#   MULTISSH_DEADLINE  seconds for the whole sweep                  (default 1800)
+#   MULTISSH_STOP      set to 1 to stop at the first failure instead of skipping
 set -eu
 
 [ $# -ge 1 ] || { echo "usage: sh deploy/update-agents.sh <proxy> [name...] [--all] [--stop]" >&2; exit 2; }
@@ -38,8 +39,9 @@ for arg in "$@"; do
 done
 
 SSH=${MULTISSH_SSH:-ssh}
-WAIT_SECONDS=${MULTISSH_WAIT:-180}
-CMD_TIMEOUT=${MULTISSH_TIMEOUT:-120}
+WAIT_SECONDS=${MULTISSH_WAIT:-120}
+CMD_TIMEOUT=${MULTISSH_TIMEOUT:-90}
+DEADLINE=$(( $(date +%s) + ${MULTISSH_DEADLINE:-1800} ))
 
 # Every ssh here is bounded. Without this a target that accepted the connection
 # and then stopped answering -- a laptop closing its lid mid-update, which is
@@ -137,6 +139,18 @@ matches() { # matches CANONICAL
     return 1
 }
 
+# Interrupting has to say what happened. Pressing ^C used to print nothing at
+# all, leaving no way to tell which machines had already been done.
+DONE=
+FAILED=
+summary() {
+    echo
+    [ -n "$DONE" ]   && echo "updated:$DONE"
+    [ -n "$FAILED" ] && echo "did not update:$FAILED" >&2
+    return 0
+}
+trap 'echo; echo "interrupted." >&2; summary; exit 130' INT TERM
+
 echo "==> asking $PROXY what is connected"
 ALL_TARGETS=$(targets)
 if [ -z "$ALL_TARGETS" ]; then
@@ -172,11 +186,16 @@ echo "will update:"
 for entry in $TODO; do echo "    ${entry%/*}  (${entry#*/})"; done
 echo
 
-FAILED=
-DONE=
 for entry in $TODO; do
     name=${entry%/*}
     platform=${entry#*/}
+
+    if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        echo "==> $name" >&2
+        echo "    skipped: the sweep has run past its overall deadline." >&2
+        FAILED="$FAILED $name"
+        continue
+    fi
     echo "==> $name"
 
     if [ "$platform" = unknown ]; then
@@ -200,16 +219,35 @@ for entry in $TODO; do
         echo "    (command ended early -- checking whether it took anyway)"
     fi
 
-    printf '    waiting for it to come back'
-    deadline=$(( $(date +%s) + WAIT_SECONDS ))
+    # Progress with numbers on it. A row of dots for two minutes is
+    # indistinguishable from a hang, which is how a slow failure came to look
+    # like a broken script.
+    started=$(date +%s)
+    until_ts=$(( started + WAIT_SECONDS ))
     ok=
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        sleep 3
-        printf '.'
+    while :; do
+        now=$(date +%s)
+        [ "$now" -lt "$until_ts" ] || break
         state=$(targets | awk -v n="$name" '$1 == n { print $3 }')
         if [ "$state" = current ]; then ok=1; break; fi
+        elapsed=$(( now - started ))
+        if [ "$state" = OUTDATED ]; then
+            what="back, still on the old build"
+        else
+            what="waiting for it to come back"
+        fi
+        # Rewriting one line is for a terminal. Piped to a file or a log, a
+        # carriage return is just a character, so say it once and be quiet.
+        if [ -t 1 ]; then
+            printf '\r    %s (%ss of %ss)   ' "$what" "$elapsed" "$WAIT_SECONDS"
+        elif [ "$elapsed" -eq 0 ]; then
+            printf '    %s...\n' "$what"
+        fi
+        sleep 3
     done
-    echo
+    if [ -t 1 ]; then
+        printf '\r                                                              \r'
+    fi
 
     if [ -n "$ok" ]; then
         echo "    now current"
@@ -226,10 +264,8 @@ for entry in $TODO; do
     fi
 done
 
-echo
-[ -n "$DONE" ] && echo "updated:$DONE"
+summary
 if [ -n "$FAILED" ]; then
-    echo "did not update:$FAILED" >&2
     echo "(re-run to try them again; nothing was left half-applied)" >&2
     exit 1
 fi
