@@ -324,12 +324,12 @@ func TestPowerShellDefinesEveryFunctionBeforeUse(t *testing.T) {
 	script := powershellInstaller(t)
 
 	lastDef := strings.LastIndex(script, "\nfunction ")
-	firstCall := strings.Index(script, "\nAssert-Admin\n")
+	firstCall := strings.Index(script, "\n$elevated = Test-Admin\n")
 	if lastDef < 0 {
 		t.Fatal("no function definitions found")
 	}
 	if firstCall < 0 {
-		t.Fatal("could not find the first executable statement (Assert-Admin)")
+		t.Fatal("could not find the first executable statement ($elevated = Test-Admin)")
 	}
 	if lastDef > firstCall {
 		t.Error("a function is defined after the script starts executing; anything calling it earlier fails at runtime")
@@ -385,5 +385,76 @@ func TestPowerShellWritesKeyFilesAsAscii(t *testing.T) {
 		if !strings.Contains(script, "Write-KeyFile (Join-Path $StateDir '"+f+"')") {
 			t.Errorf("%s is not written through Write-KeyFile", f)
 		}
+	}
+}
+
+// Windows gained the two scopes Linux already had. The SYSTEM install is the
+// rescue path -- reachable before anyone logs in; the user install is the
+// comfortable one, with a profile, a PATH and per-user tools such as winget.
+// Both are meant to coexist on one machine, which is the constraint most of
+// these assertions are really about.
+func TestPowerShellSupportsBothScopes(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+
+	if !strings.Contains(script, "[ValidateSet('system', 'user')]") {
+		t.Fatal("install.ps1 takes no -Scope")
+	}
+
+	// Scope follows elevation, and nothing else. An earlier version also
+	// consulted which manifests existed and produced a dead end: unelevated on
+	// a machine with a system install resolved to system and then refused
+	// itself.
+	if !strings.Contains(script, "if ($elevated) { $Scope = 'system' } else { $Scope = 'user' }") {
+		t.Error("scope no longer follows elevation directly; check it cannot resolve to a scope it then refuses")
+	}
+	if !strings.Contains(script, "-Scope user to install for yourself") {
+		t.Error("a system install without elevation does not point at the user scope")
+	}
+
+	// Coexistence: separate directories and, crucially, separate task names.
+	// Scheduled tasks share one namespace across the machine, so the same name
+	// would mean the second install silently replaced the first.
+	for _, want := range []string{
+		"$UserInstallDir   = Join-Path $env:LOCALAPPDATA 'multiSSH'",
+		`$TaskName   = "multiSSH agent ($env:USERNAME)"`,
+		"$TaskName   = 'multiSSH agent'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("install.ps1 is missing %q", want)
+		}
+	}
+
+	// A user-scope task must run as the user, at logon, without demanding
+	// rights the user does not have.
+	for _, want := range []string{
+		"-AtLogOn -User $me",
+		"-LogonType Interactive -RunLevel Limited",
+		"-LogonType ServiceAccount -RunLevel Highest",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("install.ps1 is missing the task principal detail %q", want)
+		}
+	}
+
+	// icacls hands the directory to SYSTEM and Administrators, which is wrong
+	// for a user install and would fail without elevation anyway. Checked on
+	// the script with its comments intact, and by looking for an enclosing
+	// block that is still open at that point rather than merely one somewhere
+	// above.
+	full := powershellInstaller(t)
+	at := strings.Index(full, "icacls $StateDir")
+	if at < 0 {
+		t.Fatal("icacls is gone; the system state directory is no longer locked down")
+	}
+	before := full[:at]
+	guard := strings.LastIndex(before, "if ($Scope -eq 'system') {")
+	if guard < 0 || strings.Contains(before[guard:], "\n}") {
+		t.Error("icacls is not inside an `if ($Scope -eq 'system')` block")
+	}
+
+	// The manifest has to record which scope it belongs to, or update and
+	// uninstall would work on the wrong paths.
+	if !strings.Contains(script, "scope     = $Scope") {
+		t.Error("the manifest records a hardcoded scope")
 	}
 }

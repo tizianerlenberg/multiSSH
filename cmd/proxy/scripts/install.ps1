@@ -14,6 +14,10 @@
 #   irm https://proxy/install.ps1 -OutFile $env:TEMP\multissh-install.ps1
 #   powershell -ExecutionPolicy Bypass -File $env:TEMP\multissh-install.ps1
 #
+# Elevated installs run as SYSTEM from a boot trigger; unelevated ones run as
+# you from a logon trigger. -Scope system|user forces either. Both can be
+# installed side by side.
+#
 # Options need the file form, or the scriptblock form -- piping into iex gives
 # no way to pass arguments:
 #
@@ -27,7 +31,9 @@ param(
     [switch]$Reenroll,
     [switch]$Yes,
     [string]$Name,
-    [string]$Password
+    [string]$Password,
+    [ValidateSet('system', 'user')]
+    [string]$Scope
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,11 +44,21 @@ $CaKey    = '__CA__'
 $Version  = '__VERSION__'
 $Hashes   = '__HASHES__'
 
-$InstallDir = Join-Path $env:ProgramFiles 'multiSSH'
-$StateDir   = Join-Path $env:ProgramData 'multiSSH'
-$Binary     = Join-Path $InstallDir 'multissh-agent.exe'
-$Manifest   = Join-Path $StateDir 'manifest.json'
-$TaskName   = 'multiSSH agent'
+# Two scopes, as on Linux.
+#
+#   system  runs as SYSTEM from a boot trigger, so the machine is reachable
+#           before anyone logs in. Needs an elevated shell.
+#   user    runs as you from a logon trigger, with your profile, your PATH and
+#           your per-user applications -- winget among them. Needs no
+#           administrator, and is not reachable while you are logged out.
+#
+# Both can be installed at once, and usefully so: the SYSTEM one is the rescue
+# path, the user one is the comfortable one. They keep separate directories,
+# separate keys and separate scheduled tasks, so neither can disturb the other.
+$SystemInstallDir = Join-Path $env:ProgramFiles 'multiSSH'
+$SystemStateDir   = Join-Path $env:ProgramData 'multiSSH'
+$UserInstallDir   = Join-Path $env:LOCALAPPDATA 'multiSSH'
+$UserStateDir     = Join-Path $UserInstallDir 'state'
 
 # ------------------------------------------------------------- functions
 #
@@ -58,12 +74,10 @@ function Die($m) {
     exit 1
 }
 
-function Assert-Admin {
+function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
-    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Die 'run this from an elevated PowerShell (Run as Administrator)'
-    }
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Get-Manifest {
@@ -88,15 +102,28 @@ function Remove-AgentTask {
 # three-day execution time limit in place, which would have killed the agent
 # after three days with nothing to say why.
 function Start-Agent($argline) {
-    $action  = New-ScheduledTaskAction -Execute $Binary -Argument $argline
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
-        -LogonType ServiceAccount -RunLevel Highest
+    $action = New-ScheduledTaskAction -Execute $Binary -Argument $argline
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -MultipleInstances IgnoreNew `
         -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    if ($Scope -eq 'system') {
+        # At boot, as SYSTEM: reachable before anyone logs in, which is the
+        # whole reason a rescue tool wants this scope.
+        $trigger   = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+            -LogonType ServiceAccount -RunLevel Highest
+    } else {
+        # At logon, as you. Registering a task for yourself needs no
+        # administrator, and the agent then has your profile, your PATH and
+        # your per-user applications.
+        $me = "$env:USERDOMAIN\$env:USERNAME"
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $me
+        $principal = New-ScheduledTaskPrincipal -UserId $me `
+            -LogonType Interactive -RunLevel Limited
+    }
 
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
@@ -150,7 +177,39 @@ function Write-KeyFile($path, $content) {
     Set-Content -Path $path -Value $content -Encoding ascii -NoNewline
 }
 
-Assert-Admin
+# ------------------------------------------------------------- scope
+
+$elevated = Test-Admin
+
+# Scope follows elevation, exactly as install.sh follows uid: an elevated shell
+# installs for the machine, anyone else installs for themselves. -Scope forces
+# either.
+#
+# Deliberately not cleverer than that. An earlier version also consulted which
+# manifests already existed, which produced a dead end -- an unelevated run on a
+# machine that already had a system install resolved to "system" and then
+# refused itself, when what the person plainly wanted was their own.
+if (-not $Scope) {
+    if ($elevated) { $Scope = 'system' } else { $Scope = 'user' }
+}
+
+if ($Scope -eq 'system') {
+    if (-not $elevated) {
+        Die 'a system install needs an elevated PowerShell (Run as Administrator), or pass -Scope user to install for yourself'
+    }
+    $InstallDir = $SystemInstallDir
+    $StateDir   = $SystemStateDir
+    $TaskName   = 'multiSSH agent'
+} else {
+    $InstallDir = $UserInstallDir
+    $StateDir   = $UserStateDir
+    # A distinct name: scheduled tasks share one namespace across the machine,
+    # so a user install must not collide with the SYSTEM one. Both are meant to
+    # be able to exist at once.
+    $TaskName   = "multiSSH agent ($env:USERNAME)"
+}
+$Binary   = Join-Path $InstallDir 'multissh-agent.exe'
+$Manifest = Join-Path $StateDir 'manifest.json'
 
 # ------------------------------------------------------------- uninstall
 
@@ -257,7 +316,13 @@ if (-not $Name) {
 Write-Host ""
 Write-Host "  install to   $Binary"
 Write-Host "  state in     $StateDir"
-Write-Host "  service      scheduled task at boot, as SYSTEM"
+if ($Scope -eq 'system') {
+    Write-Host "  service      scheduled task at boot, as SYSTEM"
+    Write-Host "  reachable    always, including before anyone logs in"
+} else {
+    Write-Host "  service      scheduled task at logon, as $env:USERNAME"
+    Write-Host "  reachable    only while you are logged in"
+}
 Write-Host "  proxy        $Proxies"
 Write-Host "  name         $Name"
 Write-Host ""
@@ -276,8 +341,12 @@ if (-not $Password) {
 if (-not $Password) { Die 'a password is required' }
 
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-# Keys and certificate are readable only by SYSTEM and Administrators.
-icacls $StateDir /inheritance:r /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' | Out-Null
+if ($Scope -eq 'system') {
+    # Keys and certificate are readable only by SYSTEM and Administrators.
+    icacls $StateDir /inheritance:r /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' | Out-Null
+}
+# A user install lives under LOCALAPPDATA, which is already private to you --
+# and a local administrator could read it either way, exactly as on Linux.
 
 Download-Binary
 
@@ -324,7 +393,7 @@ $argline = "-proxy $Proxies -identity `"$idPath`" -host-key `"$hostPath`" " +
     version   = $Version
     binary    = $Binary
     state     = $StateDir
-    scope     = 'system'
+    scope     = $Scope
     platform  = 'windows-amd64'
     proxy     = $Proxies
     ca        = $CaKey
@@ -345,7 +414,12 @@ Write-Host "  canonical  $($resp.canonical)   always works"
 Write-Host "  friendly   $($resp.friendly)   yours unless another machine already holds it"
 Write-Host ""
 Write-Host "  ssh -J <proxy> anything@$($resp.friendly)"
-Write-Host "  (the username is ignored; the shell runs as SYSTEM)"
+if ($Scope -eq 'system') {
+    Write-Host "  (the username is ignored; the shell runs as SYSTEM, so per-user"
+    Write-Host "   tools such as winget are not on its PATH)"
+} else {
+    Write-Host "  (the username is ignored; the shell runs as $env:USERNAME)"
+}
 Write-Host ""
 Write-Host "  update, roll back or remove:"
 Write-Host "    `$m = '$StateDir\manage.ps1'"

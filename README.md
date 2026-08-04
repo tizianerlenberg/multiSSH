@@ -180,6 +180,28 @@ different account from yours, not merely an elevated one:
   the *computer* account, so mapped drives and shares behave differently.
 - More privilege locally than an administrator, less reach outward.
 
+If you would rather have a session as **yourself**, install a second agent in
+user scope. Both can run side by side — the SYSTEM one is the rescue path, the
+user one is the comfortable one, and they keep separate directories, keys and
+scheduled tasks:
+
+```powershell
+# in a NORMAL (unelevated) PowerShell
+irm https://multissh.example.com/install.ps1 -OutFile $env:TEMP\ms.ps1
+powershell -ExecutionPolicy Bypass -File $env:TEMP\ms.ps1 -Scope user
+```
+
+Give it a different name when prompted, or it will ask the proxy for one
+already held by the SYSTEM install and end up reachable only under its
+canonical name. Scope follows elevation, as it does on Linux: an elevated shell
+installs for the machine, anyone else installs for themselves. The user-scope
+agent is **not reachable while you are logged out**, which is the trade.
+
+There is no `sudo -u` on Windows to switch between them from inside a session:
+`runas` wants the password typed at a real console, and `Start-Process
+-Credential` detaches the process so its output never comes back. Two agents is
+the workable answer.
+
 `whoami` says `nt authority\system`. To check what you are:
 
 ```powershell
