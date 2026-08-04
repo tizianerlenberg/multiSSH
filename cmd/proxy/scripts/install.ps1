@@ -554,6 +554,22 @@ if ($existing -and -not $Reenroll) {
     Download-Binary
     $existing.version = $Version
     $existing | ConvertTo-Json | Set-Content $Manifest
+
+    # Refresh the saved copy of this script before anything invokes it.
+    #
+    # It was only ever written at install time, so it aged while everything
+    # else was updated -- and the restart works by calling it. A copy from
+    # before -StartOnly existed was handed that switch, rejected it, and
+    # returned 1: the task ran, did nothing, and the agent stayed on the old
+    # binary with no indication why. Uninstall and rollback ran from the same
+    # stale copy.
+    try {
+        Invoke-WebRequest -Uri "$BaseUrl/install.ps1" `
+            -OutFile (Join-Path $StateDir 'manage.ps1') -UseBasicParsing
+    } catch {
+        Write-Host "warning: could not refresh manage.ps1; the restart may fail"
+    }
+
     Restart-Agent $existing.args
     Write-Host "updated to $Version; keys and certificate untouched"
     Warn-IfBlocked
