@@ -130,6 +130,23 @@ fi
 BIN="$PREFIX/multissh-agent"
 MANIFEST="$STATE/manifest"
 
+# launchd has two domains and they are not interchangeable. A LaunchDaemon in
+# /Library runs as root at boot and needs root to install; a LaunchAgent in the
+# user's own Library runs as them at login and needs nothing. Everything darwin
+# used the daemon path regardless of scope, so an install without sudo tried to
+# write to /Library/LaunchDaemons and stopped there.
+PLIST=
+LAUNCH_DOMAIN=
+if [ "$OS" = darwin ]; then
+    if [ "$SCOPE" = system ]; then
+        PLIST=/Library/LaunchDaemons/net.multissh.agent.plist
+        LAUNCH_DOMAIN=system
+    else
+        PLIST="$HOME/Library/LaunchAgents/net.multissh.agent.plist"
+        LAUNCH_DOMAIN="gui/$(id -u)"
+    fi
+fi
+
 # An existing manifest is authoritative about where this machine put things,
 # which a freshly fetched script could not know if the paths were customised.
 if [ -f "$MANIFEST" ]; then
@@ -144,14 +161,17 @@ svc_stop() {
     case "$OS-$SCOPE" in
         linux-system) systemctl stop "$(svc_name)" 2>/dev/null || true ;;
         linux-user)   systemctl --user stop "$(svc_name)" 2>/dev/null || true ;;
-        darwin-*)     launchctl bootout system/net.multissh.agent 2>/dev/null || true ;;
+        darwin-*)     launchctl bootout "$LAUNCH_DOMAIN/net.multissh.agent" 2>/dev/null || true ;;
     esac
 }
 svc_start() {
     case "$OS-$SCOPE" in
         linux-system) systemctl daemon-reload; systemctl enable --now "$(svc_name)" ;;
         linux-user)   systemctl --user daemon-reload; systemctl --user enable --now "$(svc_name)" ;;
-        darwin-*)     launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load "$PLIST" ;;
+        darwin-*)
+            mkdir -p "$(dirname "$PLIST")"
+            launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>/dev/null || launchctl load "$PLIST"
+            ;;
     esac
 }
 # svc_restart is the last thing an update does, and it may well kill this
@@ -163,7 +183,7 @@ svc_restart() {
     case "$OS-$SCOPE" in
         linux-system) systemctl restart "$(svc_name)" ;;
         linux-user)   systemctl --user restart "$(svc_name)" ;;
-        darwin-*)     launchctl kickstart -k system/net.multissh.agent ;;
+        darwin-*)     launchctl kickstart -k "$LAUNCH_DOMAIN/net.multissh.agent" ;;
     esac
 }
 
@@ -199,7 +219,7 @@ if [ "$MODE" = uninstall ]; then
     case "$OS-$SCOPE" in
         linux-system) rm -f /etc/systemd/system/multissh-agent.service ;;
         linux-user)   rm -f "$HOME/.config/systemd/user/multissh-agent.service" ;;
-        darwin-*)     rm -f /Library/LaunchDaemons/net.multissh.agent.plist ;;
+        darwin-*)     rm -f "$PLIST" ;;
     esac
     echo "removed."
     svc_stop
@@ -405,7 +425,25 @@ chmod 0600 "$STATE"/agent_identity "$STATE"/agent_host_key "$STATE/config"
 
 # ---------------------------------------------------------------- service
 
-ARGS="-proxy $PROXY_LIST -identity $STATE/agent_identity -host-key $STATE/agent_host_key -identity-cert $STATE/agent_identity-cert.pub -ca $STATE/proxy_ca.pub -authorized-keys $STATE/agent_authorized_keys"
+# The agent's arguments, one per line, so that a path containing a space stays
+# one argument. macOS puts a system install's state in
+#   /Library/Application Support/multissh-agent
+# and the previous single string was word-split when the plist was built, which
+# turned that into two arguments and handed the agent a path that does not
+# exist. Nothing on Linux has a space by default, which is why it never showed.
+agent_args() {
+    printf '%s\n' \
+        -proxy "$PROXY_LIST" \
+        -identity "$STATE/agent_identity" \
+        -host-key "$STATE/agent_host_key" \
+        -identity-cert "$STATE/agent_identity-cert.pub" \
+        -ca "$STATE/proxy_ca.pub" \
+        -authorized-keys "$STATE/agent_authorized_keys"
+}
+
+# systemd accepts quoted arguments, so quote every one rather than hoping none
+# of them needs it.
+ARGS=$(agent_args | sed 's/.*/"&"/' | tr '\n' ' ')
 
 case "$OS-$SCOPE" in
     linux-*)
@@ -430,18 +468,29 @@ EOF
         ;;
     darwin-*)
         PLIST=/Library/LaunchDaemons/net.multissh.agent.plist
-        cat > "$PLIST" <<EOF
+        mkdir -p "$(dirname "$PLIST")"
+        # & and < are legal in a path and would produce a plist launchd
+        # refuses to parse, which it reports as the job simply not existing.
+        xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+        {
+            cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>net.multissh.agent</string>
   <key>ProgramArguments</key><array>
-    <string>$BIN</string>$(for a in $ARGS; do printf '<string>%s</string>' "$a"; done)
+EOF
+            printf '%s\n' "$BIN" | xml_escape | sed 's|.*|    <string>&</string>|'
+            agent_args      | xml_escape | sed 's|.*|    <string>&</string>|'
+            cat <<EOF
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$(printf '%s' "$STATE/agent.log" | xml_escape)</string>
+  <key>StandardErrorPath</key><string>$(printf '%s' "$STATE/agent.log" | xml_escape)</string>
 </dict></plist>
 EOF
+        } > "$PLIST"
         ;;
 esac
 
