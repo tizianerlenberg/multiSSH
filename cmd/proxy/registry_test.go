@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -173,5 +174,61 @@ func TestSetHostFPCoversEveryNameOfOneMachine(t *testing.T) {
 				t.Errorf("another machine picked up the host key: %+v", row)
 			}
 		}
+	}
+}
+
+// Every accepted connection costs a goroutine and a socket, and once
+// authenticated whatever the session holds. Nothing capped that, so anyone at
+// all -- an unauthenticated connection is accepted before it proves anything --
+// could open sockets until the proxy ran out of memory, taking every
+// registered target down with it.
+func TestSlotsBoundConcurrency(t *testing.T) {
+	s := newSlots(2, "test")
+
+	if !s.take() || !s.take() {
+		t.Fatal("the first two slots were refused")
+	}
+	if s.take() {
+		t.Error("a third connection was admitted past a limit of two")
+	}
+	if s.inUse() != 2 {
+		t.Errorf("inUse = %d, want 2", s.inUse())
+	}
+
+	// A finished connection frees its slot for the next one.
+	s.give()
+	if !s.take() {
+		t.Error("a slot was not released when a connection ended")
+	}
+
+	// take must never block: a caller made to queue holds its socket open,
+	// which is the resource being protected.
+	done := make(chan bool, 1)
+	go func() { done <- s.take() }()
+	select {
+	case admitted := <-done:
+		if admitted {
+			t.Error("admitted past the limit")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("take blocked instead of refusing")
+	}
+}
+
+// Zero means unlimited, and a nil limiter must be safe to use so the
+// unlimited case needs no branches at the call sites.
+func TestSlotsZeroIsUnlimited(t *testing.T) {
+	var s *slots = newSlots(0, "test")
+	if s != nil {
+		t.Fatal("a limit of zero produced a limiter")
+	}
+	for i := 0; i < 1000; i++ {
+		if !s.take() {
+			t.Fatal("an unlimited limiter refused a connection")
+		}
+	}
+	s.give()
+	if s.inUse() != 0 {
+		t.Error("an unlimited limiter reported connections in use")
 	}
 }

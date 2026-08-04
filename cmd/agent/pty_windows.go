@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
+	"unsafe"
 
 	"github.com/UserExistsError/conpty"
 	"golang.org/x/sys/windows"
@@ -19,6 +21,35 @@ import (
 type windowsShell struct {
 	pty *conpty.ConPty
 	pid int
+	// job holds the shell and everything it starts. Windows has no process
+	// group to signal, so without this only the shell itself was killed when a
+	// session ended and anything it had started was orphaned -- left running
+	// forever on a machine nobody is sitting at. Closing the job handle kills
+	// the whole tree.
+	job windows.Handle
+}
+
+// newKillOnCloseJob creates a job object whose members die when the last
+// handle to it closes. That is the property that makes it a reliable teardown:
+// it holds even if this process is killed rather than exiting cleanly.
+func newKillOnCloseJob() (windows.Handle, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{
+		BasicLimitInformation: windows.JOBOBJECT_BASIC_LIMIT_INFORMATION{
+			LimitFlags: windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+		},
+	}
+	_, err = windows.SetInformationJobObject(job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)))
+	if err != nil {
+		windows.CloseHandle(job)
+		return 0, err
+	}
+	return job, nil
 }
 
 func startShell(command, term string, cols, rows uint16) (ptyProcess, error) {
@@ -34,7 +65,28 @@ func startShell(command, term string, cols, rows uint16) (ptyProcess, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &windowsShell{pty: p, pid: p.Pid()}, nil
+
+	s := &windowsShell{pty: p, pid: p.Pid()}
+
+	// Best effort. A shell that cannot be put in a job still works; it just
+	// leaves its children behind on disconnect, which is what always happened
+	// before. Refusing to open a session over it would be the worse trade for
+	// a tool whose job is getting you in.
+	if job, err := newKillOnCloseJob(); err != nil {
+		log.Printf("no job object, so processes this session starts will outlive it: %v", err)
+	} else if h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(s.pid)); err != nil {
+		log.Printf("could not open the shell to place it in a job: %v", err)
+		windows.CloseHandle(job)
+	} else {
+		if err := windows.AssignProcessToJobObject(job, h); err != nil {
+			log.Printf("could not place the shell in a job: %v", err)
+			windows.CloseHandle(job)
+		} else {
+			s.job = job
+		}
+		windows.CloseHandle(h)
+	}
+	return s, nil
 }
 
 // shellCommandLine builds a command line, since Windows takes one string
@@ -64,12 +116,19 @@ func (s *windowsShell) Wait() (uint32, error) {
 	return s.pty.Wait(context.Background())
 }
 
-// Terminate closes the pseudo-console and then kills the shell if it outlived
-// it. Windows has no process group to signal, so processes the shell started
-// itself are not reaped; a Job Object would be the thorough fix. In practice
-// this is the same gap as backgrounded jobs on Unix.
+// Terminate closes the pseudo-console, then the job, which kills the shell and
+// everything it started. The explicit TerminateProcess is a fallback for the
+// case where the job could not be created at all.
 func (s *windowsShell) Terminate() {
 	s.pty.Close()
+
+	if s.job != 0 {
+		// KILL_ON_JOB_CLOSE means this is the kill.
+		windows.CloseHandle(s.job)
+		s.job = 0
+		return
+	}
+
 	if s.pid <= 0 {
 		return
 	}

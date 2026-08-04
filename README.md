@@ -470,8 +470,7 @@ concurrent connections, and no per-user access control — any key in
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
 | 🟡 | Windows: a machine-wide install is a real service; a user install is a scheduled task, because creating a service needs rights a user does not have. | The user-scope agent restarts three times on failure and stops when you log out. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
-| 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
-| 🟡 | No cap on concurrent connections. | A user key is enough to exhaust memory on the proxy. |
+| 🟡 | Backgrounded jobs (`cmd &`) survive disconnect on Unix, as they do under a normal sshd. | Deliberate. Windows now kills the whole tree through a Job Object. |
 | 🟡 | Everyone with a user key reaches every target. No ACLs. | Fine for one operator; wrong the moment a second key is added for someone else. |
 | 🟡 | Proxy configuration is entirely flags, held in the systemd unit. | `install-proxy.sh` writes the unit once and never overwrites it, so changes are edited on the server. |
 | 🟡 | Agents are never updated automatically. | A sweep is something you run; nothing happens on its own. Deliberate — an automatic update that goes wrong takes out every machine at once. |
