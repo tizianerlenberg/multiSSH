@@ -448,7 +448,7 @@ concurrent connections, and no per-user access control — any key in
 |---|---|---|
 | 🟡 | Windows and macOS are **built but never run**. | Unknown. The Windows installer is parse-checked and its logic exercised under PowerShell on Linux, but no part of it has touched a real Windows machine. |
 | 🟡 | No `sftp`/`scp`. | No file recovery. |
-| 🟡 | Windows registers a scheduled task, not a real service. | Restarts three times on failure and has no execution time limit, but a proper service would be better. |
+| 🟡 | Windows: a machine-wide install is a real service; a user install is a scheduled task, because creating a service needs rights a user does not have. | The user-scope agent restarts three times on failure and stops when you log out. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect, as they do under a normal sshd. Windows also does not reap processes the shell itself spawned. | Deliberate on Unix; a Job Object is the proper Windows fix. |
 | 🟡 | No cap on concurrent connections. | A user key is enough to exhaust memory on the proxy. |
@@ -458,6 +458,11 @@ concurrent connections, and no per-user access control — any key in
 | ⚪ | A machine that enrolled but never once connected is invisible to the proxy — enrolment writes nothing there. | The installer reports success on the target instead. |
 
 ## Installing a target
+
+The proxy serves a page at its own address with the install commands and a
+button that copies them — worth having, because the machine you are installing
+on is by definition one with no convenient way to get text onto it.
+
 
 The proxy serves the installer and the agent builds itself. It has to be
 reachable for the agent to work at all, so serving from it adds no failure mode
@@ -567,7 +572,15 @@ by hand on the box; `push.sh` only builds, copies and calls it.
 ```bash
 sh deploy/update-agents.sh multissh          # every target reported OUTDATED
 sh deploy/update-agents.sh multissh laptop   # just this one
+sh deploy/update-agents.sh multissh --stop   # stop at the first failure
 ```
+
+Every step is bounded and a machine that does not answer is **skipped**, not
+allowed to stall the sweep — unreachable targets are the normal state for this
+tool, not an exception. The run reports what it could not do and exits
+non-zero. The command sent depends on the target's platform, which the agent
+reports: a POSIX snippet pasted into PowerShell is not a graceful failure, it
+is a page of parser errors and no update.
 
 Targets are updated **one at a time**, waiting for each to come back before
 touching the next, and stopping at the first failure. That ordering is the

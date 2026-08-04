@@ -91,12 +91,28 @@ function Get-Manifest {
     return $null
 }
 
+# A machine-wide install is a real service; a user install is a scheduled task,
+# because creating a service needs administrator rights the user does not have.
+# The agent detects which it is on its own, so one binary serves both.
+$ServiceName = 'multissh-agent'
+
 function Stop-Agent {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($Scope -eq 'system') {
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    } else {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
 }
 
 function Remove-AgentTask {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    if ($Scope -eq 'system') {
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        # sc.exe rather than Remove-Service, which only exists in PowerShell 6+
+        # and this may well be Windows PowerShell 5.1.
+        & sc.exe delete $ServiceName | Out-Null
+    } else {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
 }
 
 # Start-Agent registers the task and starts it.
@@ -108,6 +124,24 @@ function Remove-AgentTask {
 # three-day execution time limit in place, which would have killed the agent
 # after three days with nothing to say why.
 function Start-Agent($argline) {
+    if ($Scope -eq 'system') {
+        # A service, started at boot as LocalSystem, restarted by the service
+        # manager if it ever dies. The registry holds the command line, so
+        # none of schtasks' 261-character limit applies here either.
+        $bin = "`"$Binary`" $argline"
+        if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+            & sc.exe config $ServiceName binPath= "$bin" start= auto | Out-Null
+        } else {
+            New-Service -Name $ServiceName -BinaryPathName $bin `
+                -DisplayName 'multiSSH agent' -StartupType Automatic `
+                -Description 'Reverse SSH agent: dials out to the multiSSH proxy and holds the connection open.' | Out-Null
+        }
+        # Restart on failure, forever. New-Service cannot express this.
+        & sc.exe failure $ServiceName reset= 0 actions= restart/5000/restart/5000/restart/30000 | Out-Null
+        Start-Service -Name $ServiceName
+        return
+    }
+
     $action = New-ScheduledTaskAction -Execute $Binary -Argument $argline
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
@@ -116,11 +150,7 @@ function Start-Agent($argline) {
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
     if ($Scope -eq 'system') {
-        # At boot, as SYSTEM: reachable before anyone logs in, which is the
-        # whole reason a rescue tool wants this scope.
-        $trigger   = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
-            -LogonType ServiceAccount -RunLevel Highest
+        Die 'internal error: the system scope installs a service, not a task'
     } else {
         # At logon, as you. Registering a task for yourself needs no
         # administrator, and the agent then has your profile, your PATH and
@@ -361,7 +391,7 @@ Write-Host "  state in     $StateDir"
 # that went and how to get the other -- otherwise the only way to find out is
 # to finish the install and notice what you ended up with.
 if ($Scope -eq 'system') {
-    Write-Host "  scope        system, as SYSTEM, started at boot"
+    Write-Host "  scope        system, a Windows service running as LocalSystem"
     Write-Host "  reachable    always, including before anyone logs in"
     Write-Host "  note         no user profile: winget and other per-user tools"
     Write-Host "               are not on SYSTEM's PATH"
@@ -434,7 +464,13 @@ Write-KeyFile (Join-Path $StateDir 'agent_identity-cert.pub') $resp.certificate
 Write-KeyFile (Join-Path $StateDir 'proxy_ca.pub')            $resp.ca
 Write-KeyFile (Join-Path $StateDir 'agent_authorized_keys')   $resp.authorized_keys
 
-$argline = "-proxy $Proxies -identity `"$idPath`" -host-key `"$hostPath`" " +
+# The Windows agent is linked as a GUI binary, so that a user-scope install
+# does not put a console window on the desktop for somebody to close -- which
+# killed the agent with it. That leaves no usable stderr, so the log has to go
+# to a file, and -log is not optional here.
+$logPath = Join-Path $StateDir 'agent.log'
+
+$argline = "-proxy $Proxies -log `"$logPath`" -identity `"$idPath`" -host-key `"$hostPath`" " +
            "-identity-cert `"$(Join-Path $StateDir 'agent_identity-cert.pub')`" " +
            "-ca `"$(Join-Path $StateDir 'proxy_ca.pub')`" " +
            "-authorized-keys `"$(Join-Path $StateDir 'agent_authorized_keys')`""
@@ -470,6 +506,8 @@ if ($Scope -eq 'system') {
 } else {
     Write-Host "  (the username is ignored; the shell runs as $env:USERNAME)"
 }
+Write-Host ""
+Write-Host "  log        $StateDir\agent.log"
 Write-Host ""
 Write-Host "  update, roll back or remove:"
 Write-Host "    `$m = '$StateDir\manage.ps1'"

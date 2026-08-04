@@ -21,7 +21,18 @@ for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; d
     arch=${target#*-}
     name=$target
     echo "  $name"
-    GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$OUT/$name" ./cmd/agent
+
+    # Windows gets the GUI subsystem. A console-subsystem binary launched by
+    # Task Scheduler as the logged-in user pops a console window on their
+    # desktop -- which they can close, killing the agent. With -H windowsgui
+    # no console is allocated at all, and the agent logs to the file the
+    # installer points -log at instead.
+    ldflags="-s -w"
+    if [ "$os" = windows ]; then
+        ldflags="$ldflags -H windowsgui"
+    fi
+
+    GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" -o "$OUT/$name" ./cmd/agent
 done
 
 echo "  multissh-proxy"

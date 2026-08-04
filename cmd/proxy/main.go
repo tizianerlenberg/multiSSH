@@ -69,10 +69,11 @@ func sourceHost(addr net.Addr) string {
 // It is also the handle revocation works on, which is why it is shown to the
 // user rather than kept in the log.
 type registration struct {
-	conn  ssh.Conn
-	fp    string
-	proto int
-	build string
+	conn     ssh.Conn
+	fp       string
+	proto    int
+	build    string
+	platform string
 	// hostFP is the fingerprint of the agent's *host* key, as ssh prints it on
 	// first connect. Reported by the agent and checked against the canonical
 	// name before it is stored, so it can be compared with what a client is
@@ -87,6 +88,7 @@ type target struct {
 	Proto     int
 	FP        string
 	Build     string
+	Platform  string
 	HostFP    string
 }
 
@@ -109,14 +111,14 @@ func newRegistry() *registry { return &registry{m: make(map[string]registration)
 // connection must win. A *different* key claiming a name that is already taken
 // is refused. Allowing it to evict instead would let two machines kick each
 // other off forever, leaving neither reliably reachable.
-func (r *registry) add(name string, conn ssh.Conn, fp string, proto int, build string) error {
+func (r *registry) add(name string, conn ssh.Conn, fp string, proto int, build, platform string) error {
 	r.mu.Lock()
 	old, existed := r.m[name]
 	if existed && old.fp != fp {
 		r.mu.Unlock()
 		return fmt.Errorf("%q is held by a different machine (%s)", name, old.fp)
 	}
-	r.m[name] = registration{conn: conn, fp: fp, proto: proto, build: build}
+	r.m[name] = registration{conn: conn, fp: fp, proto: proto, build: build, platform: platform}
 	r.mu.Unlock()
 
 	if existed && old.conn != conn {
@@ -169,6 +171,7 @@ func (r *registry) listing() []target {
 			Proto:     reg.proto,
 			FP:        reg.fp,
 			Build:     reg.build,
+			Platform:  reg.platform,
 			HostFP:    reg.hostFP,
 		})
 	}
@@ -219,6 +222,7 @@ func main() {
 		distDir    = flag.String("dist", "dist", "directory of agent builds named <os>-<arch>")
 		publicURL  = flag.String("public-url", "", "how targets reach this proxy, e.g. https://multissh.example.com; enables the installer")
 		enrolValid = flag.Duration("enrol-validity", 0, "lifetime of issued certificates; 0 never expires")
+		sshHost    = flag.String("ssh-host", "", "how users reach the ssh listener, e.g. proxy.example.com -p 2022; shown on the landing page")
 		staleAfter = flag.Duration("stale-after", 30*24*time.Hour, "flag targets not seen for this long as stale")
 		// The default accepts everything, including agents installed before
 		// the version handshake existed. Refusing old agents strands machines
@@ -477,6 +481,7 @@ func main() {
 				"fp":        fp,
 				"proto":     strconv.Itoa(proto),
 				"build":     sshx.ParseAgentBuild(c.ClientVersion()),
+				"platform":  sshx.ParseAgentPlatform(c.ClientVersion()),
 			}
 			for _, p := range cert.ValidPrincipals {
 				if !sshx.IsCanonicalName(p) {
@@ -510,10 +515,11 @@ func main() {
 			hashes, version := dist.snapshot()
 			log.Printf("installer at %s/install.sh, %d build(s), version %s", *publicURL, len(hashes), version)
 			extra = &httpExtras{
-				dist:    dist,
-				baseURL: strings.TrimSuffix(*publicURL, "/"),
-				proxies: agentURLs(*publicURL, *wsPath),
-				caPub:   caPub,
+				dist:     dist,
+				userHost: *sshHost,
+				baseURL:  strings.TrimSuffix(*publicURL, "/"),
+				proxies:  agentURLs(*publicURL, *wsPath),
+				caPub:    caPub,
 				enrol: &enroller{
 					ca:        ca,
 					usersFile: *usersFile,
@@ -698,11 +704,12 @@ func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler) {
 // httpExtras are the enrolment routes, served beside the agent websocket on
 // the same listener so one reverse-proxy entry covers everything.
 type httpExtras struct {
-	dist    *distributor
-	enrol   *enroller
-	baseURL string
-	proxies []string
-	caPub   ssh.PublicKey
+	dist     *distributor
+	enrol    *enroller
+	userHost string
+	baseURL  string
+	proxies  []string
+	caPub    ssh.PublicKey
 }
 
 // agentURLs turns the public https:// address into the wss:// the agent dials.
@@ -775,6 +782,7 @@ func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandle
 			io.WriteString(w, installPowerShell(extra.dist, extra.caPub, extra.baseURL, extra.proxies))
 		})
 		mux.HandleFunc("/dist/", extra.dist.serveBinary)
+		mux.HandleFunc("/", serveLanding(extra.dist, extra.baseURL, extra.userHost))
 		mux.HandleFunc("/enroll", extra.enrol.handle)
 	}
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
@@ -803,6 +811,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 	fp := conn.Permissions.Extensions["fp"]
 	proto, _ := strconv.Atoi(conn.Permissions.Extensions["proto"])
 	build := conn.Permissions.Extensions["build"]
+	platform := conn.Permissions.Extensions["platform"]
 
 	// Answer keepalives, accept a host key report, refuse everything else --
 	// tcpip-forward included.
@@ -839,7 +848,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 
 	// The canonical name is derived from the agent's own host key, so a clash
 	// here means someone ground a key or replayed a certificate. Refuse.
-	if err := reg.add(canonical, conn, fp, proto, build); err != nil {
+	if err := reg.add(canonical, conn, fp, proto, build, platform); err != nil {
 		log.Printf("REFUSING agent from %s: %v; arriving key %s", conn.RemoteAddr(), err, fp)
 		conn.Close()
 		return
@@ -855,7 +864,7 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 			log.Printf("agent %q wanted the name %q, which belongs to another machine; "+
 				"it is reachable canonically only", canonical, friendly)
 		default:
-			if err := reg.add(friendly, conn, fp, proto, build); err != nil {
+			if err := reg.add(friendly, conn, fp, proto, build, platform); err != nil {
 				log.Printf("agent %q could not take %q: %v", canonical, friendly, err)
 			} else {
 				names = append(names, friendly)
@@ -991,10 +1000,11 @@ func serveListing(reg *registry, seen *sightings, dist *distributor, staleAfter 
 			// misaligned everything the moment a name outgrew them, which for
 			// a canonical name -- a label plus a twelve-character hash -- is
 			// most of the time.
-			nameW, canonW := len("name"), len("address")
+			nameW, canonW, platW := len("name"), len("address"), 0
 			for _, t := range list {
 				nameW = max(nameW, len(t.Friendly))
 				canonW = max(canonW, len(t.Canonical))
+				platW = max(platW, len(t.Platform))
 			}
 
 			fmt.Fprintf(ch, "\r\n multiSSH proxy\r\n")
@@ -1005,9 +1015,9 @@ func serveListing(reg *registry, seen *sightings, dist *distributor, staleAfter 
 				fmt.Fprintf(ch, "\r\n ONLINE (%d)\r\n\r\n", len(list))
 				for _, t := range list {
 					state := buildState(t.Build, current, knowBuilds)
-					fmt.Fprintf(ch, "   %-*s  %-*s  %s %s\r\n",
+					fmt.Fprintf(ch, "   %-*s  %-*s  %-*s  %s %s\r\n",
 						nameW, t.Friendly, canonW, t.Canonical,
-						sshx.DescribeProtocol(t.Proto), state)
+						platW, t.Platform, sshx.DescribeProtocol(t.Proto), state)
 					// Two different keys, so both are named. Leaving them
 					// unlabelled invited exactly the reading that they were
 					// the same thing, or that one was checkable against the

@@ -54,10 +54,15 @@ const BuildIDLen = 12
 // actually running without an extra round trip and without the agent having to
 // be told at install time what it is. An empty build is omitted, which is what
 // an agent that could not read its own executable sends.
-func AgentVersion(build string) string {
+func AgentVersion(build, platform string) string {
 	v := agentVersionPrefix + strconv.Itoa(ProtocolVersion)
 	if build != "" {
 		v += "_" + build
+		// Only after a build, so the fields stay positional. Anything that
+		// cannot say what it is is simply older.
+		if platform != "" {
+			v += "_" + platform
+		}
 	}
 	return v
 }
@@ -70,36 +75,48 @@ func ProxyVersion() string { return proxyVersionPrefix + strconv.Itoa(ProtocolVe
 // carry one. It never reports an error: an unrecognised peer is old, not
 // broken, and the caller decides whether that is acceptable.
 func ParseAgentVersion(id []byte) int {
-	proto, _ := parseVersion(string(id), agentVersionPrefix)
+	proto, _, _ := parseVersion(string(id), agentVersionPrefix)
 	return proto
 }
 
 // ParseAgentBuild extracts the build ID, empty when the agent did not send one.
 func ParseAgentBuild(id []byte) string {
-	_, build := parseVersion(string(id), agentVersionPrefix)
+	_, build, _ := parseVersion(string(id), agentVersionPrefix)
 	return build
+}
+
+// ParseAgentPlatform extracts the operating system the agent runs on, empty
+// when it did not say. Knowing it matters because managing a target means
+// sending it a command, and a shell snippet for one platform is line noise on
+// another -- a POSIX loop pasted into PowerShell produces a page of parser
+// errors and no update.
+func ParseAgentPlatform(id []byte) string {
+	_, _, platform := parseVersion(string(id), agentVersionPrefix)
+	return platform
 }
 
 // ParseProxyVersion is the same for the proxy's identification string.
 func ParseProxyVersion(id []byte) int {
-	proto, _ := parseVersion(string(id), proxyVersionPrefix)
+	proto, _, _ := parseVersion(string(id), proxyVersionPrefix)
 	return proto
 }
 
-func parseVersion(id, prefix string) (int, string) {
+func parseVersion(id, prefix string) (proto int, build, platform string) {
 	rest, ok := strings.CutPrefix(id, prefix)
 	if !ok {
-		return LegacyProtocol, ""
+		return LegacyProtocol, "", ""
 	}
 	// A comment may follow the version, separated by a space.
 	rest, _, _ = strings.Cut(rest, " ")
-	// "<protocol>_<build>", with the build optional.
-	num, build, _ := strings.Cut(rest, "_")
+	// "<protocol>[_<build>[_<platform>]]" -- positional, each part optional
+	// from the right, so an older agent parses as far as it went.
+	num, rest, _ := strings.Cut(rest, "_")
 	n, err := strconv.Atoi(num)
 	if err != nil || n < 0 {
-		return LegacyProtocol, ""
+		return LegacyProtocol, "", ""
 	}
-	return n, build
+	build, platform, _ = strings.Cut(rest, "_")
+	return n, build, platform
 }
 
 // BuildIDOf reduces a full hex SHA256 to the short form used on the wire.

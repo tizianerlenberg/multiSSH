@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -425,15 +426,18 @@ func TestPowerShellSupportsBothScopes(t *testing.T) {
 	}
 
 	// A user-scope task must run as the user, at logon, without demanding
-	// rights the user does not have.
+	// rights the user does not have. The system scope is a service now and has
+	// no task principal at all.
 	for _, want := range []string{
 		"-AtLogOn -User $me",
 		"-LogonType Interactive -RunLevel Limited",
-		"-LogonType ServiceAccount -RunLevel Highest",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("install.ps1 is missing the task principal detail %q", want)
 		}
+	}
+	if strings.Contains(script, "-LogonType ServiceAccount") {
+		t.Error("the system scope still registers a scheduled task; it installs a service now")
 	}
 
 	// icacls hands the directory to SYSTEM and Administrators, which is wrong
@@ -477,5 +481,143 @@ func TestPowerShellSuggestsANonCollidingName(t *testing.T) {
 	}
 	if strings.Contains(script, "Test-Path $systemManifest") {
 		t.Error("the other scope is detected by its manifest, which an unelevated shell cannot read")
+	}
+}
+
+// Regression. The updater matched any indented line containing a dot, which
+// swept up prose from the CONNECT section and solemnly set about updating a
+// machine called "you." -- the sentence had ended in a full stop.
+func TestUpdateScriptParsesOnlyTheOnlineSection(t *testing.T) {
+	if _, err := exec.LookPath("awk"); err != nil {
+		t.Skip("no awk")
+	}
+	script, err := os.ReadFile("../../deploy/update-agents.sh")
+	if err != nil {
+		t.Skipf("no update-agents.sh: %v", err)
+	}
+	prog := section(t, string(script), `^    listing \| awk '`, `}'`)
+	prog = strings.TrimPrefix(prog, "    listing | awk '")
+	prog = strings.TrimSuffix(prog, "'")
+
+	listing := `
+ multiSSH proxy
+
+ ONLINE (2)
+
+   pcuser-pc        pcuser-pc.nth7qgghi7j7        linux    v1 OUTDATED
+       host key  SHA256:/XmRlLQzuatMnjzd87t4qacwiU+MNBNBwdkce60vTz4
+       identity  SHA256:hGFnasqDqhL/6mTmiGX/7ogUM6Y0XgDPMPc49Waqou0
+   rosa-maria-lapt  rosa-maria-lapt.eceqxx2be7uw  windows  v1 current
+       identity  SHA256:5UuBiRDBot0w6K7hUdVKe+zL/OZXtJsuJFuXGvtpxLE
+
+ NOT CONNECTED (1)
+
+     gone.5kfv27ccikum  last seen 27m ago
+
+ CONNECT
+
+   ssh -J <thisproxy> user@pcuser-pc
+
+   paste the host key above into it and ssh checks it for you.
+   'identity' is a different key: the handle for -revoke.
+`
+	cmd := exec.Command("awk", prog)
+	cmd.Stdin = strings.NewReader(listing)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("awk: %v", err)
+	}
+
+	got := strings.Fields(strings.TrimSpace(string(out)))
+	want := []string{
+		"pcuser-pc.nth7qgghi7j7", "linux", "OUTDATED",
+		"rosa-maria-lapt.eceqxx2be7uw", "windows", "current",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsed %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("field %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if strings.Contains(string(out), "you.") {
+		t.Error("prose from the CONNECT section was parsed as a target")
+	}
+	if strings.Contains(string(out), "gone.") {
+		t.Error("a disconnected target was listed for update; it cannot be reached")
+	}
+}
+
+// The user-scope agent used to open a console window on the desktop, and
+// closing it killed the agent. A GUI-subsystem binary allocates no console --
+// which leaves nowhere for logs to go, so the installer must pass -log.
+func TestWindowsAgentIsBuiltWithoutAConsole(t *testing.T) {
+	body, err := os.ReadFile("../../deploy/build.sh")
+	if err != nil {
+		t.Skipf("no build.sh: %v", err)
+	}
+	if !strings.Contains(string(body), "-H windowsgui") {
+		t.Error("the Windows agent is not linked as a GUI binary; it will open a console window a user can close")
+	}
+	if !strings.Contains(withoutComments(powershellInstaller(t)), "-log `\"$logPath`\"") {
+		t.Error("install.ps1 does not pass -log; a GUI binary has no stderr and its logs would go nowhere")
+	}
+}
+
+// A machine-wide install is a real service now. The scheduled task remains
+// correct for a user install, which cannot create services at all.
+func TestPowerShellInstallsAServiceForTheSystemScope(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+
+	if !strings.Contains(script, "New-Service -Name $ServiceName") {
+		t.Error("the system scope does not create a service")
+	}
+	if !strings.Contains(script, "sc.exe failure $ServiceName") {
+		t.Error("the service has no restart-on-failure configured")
+	}
+	// Remove-Service is PowerShell 6+, and this may be Windows PowerShell 5.1.
+	if strings.Contains(script, "Remove-Service") {
+		t.Error("Remove-Service is used, which does not exist in Windows PowerShell 5.1")
+	}
+	// The user scope must still use a task.
+	if !strings.Contains(script, "Register-ScheduledTask") {
+		t.Error("the user scope no longer registers a scheduled task")
+	}
+}
+
+// The landing page exists so a long, exact command can be copied rather than
+// retyped onto a machine that has no convenient way to receive text.
+func TestLandingPageOffersTheInstallCommands(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "linux-amd64"), []byte("b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	serveLanding(newDistributor(dir), "https://multissh.example.com/", "px.example.com -p 2022")(
+		rec, httptest.NewRequest("GET", "/", nil))
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		"curl -fsSL https://multissh.example.com/install.sh | sudo sh",
+		"irm https://multissh.example.com/install.ps1",
+		"ssh px.example.com -p 2022",
+		"navigator.clipboard.writeText",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the page does not offer %q", want)
+		}
+	}
+	// The trailing slash on the base URL must not survive into the commands.
+	if strings.Contains(body, "example.com//") {
+		t.Error("a doubled slash reached the install command")
+	}
+
+	// Anything but / is not the landing page; /healthz and /install.sh share
+	// this mux and must not be swallowed.
+	rec404 := httptest.NewRecorder()
+	serveLanding(newDistributor(dir), "https://x", "")(rec404, httptest.NewRequest("GET", "/nope", nil))
+	if rec404.Code != 404 {
+		t.Errorf("an unknown path returned %d, not 404", rec404.Code)
 	}
 }
