@@ -222,6 +222,35 @@ function Download-Binary {
 # Windows PowerShell and PowerShell 7, and a byte-order mark in front of an
 # ssh-ed25519 line makes the agent fail to parse its own certificate with a
 # message that points nowhere near the cause.
+# Invoke-Agent runs the agent and collects its output.
+#
+# `& $Binary` will not do: the Windows agent is linked as a GUI-subsystem
+# binary so that it never opens a console window, and PowerShell neither waits
+# for nor captures the output of a GUI application -- it returns immediately
+# with nothing, which read as "the agent could not generate its keys".
+# Start-Process waits and redirects whatever the subsystem.
+#
+# The argument string is quoted here rather than passed as an array, because
+# Windows PowerShell does not quote array elements for you and these paths sit
+# under a user profile: "C:\Users\Firstname Lastname\AppData\..." would
+# otherwise arrive as two arguments.
+function Invoke-Agent($argstring) {
+    $out = [IO.Path]::GetTempFileName()
+    $err = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $Binary -ArgumentList $argstring `
+            -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        return @{
+            Code = $p.ExitCode
+            Out  = @(Get-Content $out -ErrorAction SilentlyContinue)
+            Err  = (Get-Content $err -Raw -ErrorAction SilentlyContinue)
+        }
+    } finally {
+        Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Write-KeyFile($path, $content) {
     Set-Content -Path $path -Value $content -Encoding ascii -NoNewline
 }
@@ -464,8 +493,9 @@ Download-Binary
 # Windows install may not have one. Private halves never leave the machine.
 $idPath   = Join-Path $StateDir 'agent_identity'
 $hostPath = Join-Path $StateDir 'agent_host_key'
-$keys = & $Binary -show-keys -identity $idPath -host-key $hostPath
-if ($LASTEXITCODE -ne 0) { Die "the agent could not generate its keys" }
+$r = Invoke-Agent ('-show-keys -identity "{0}" -host-key "{1}"' -f $idPath, $hostPath)
+if ($r.Code -ne 0) { Die "the agent could not generate its keys: $($r.Err)" }
+$keys = $r.Out
 
 $identityKey = ($keys | Where-Object { $_ -like 'identity *' } | Select-Object -First 1) -replace '^identity ', ''
 $hostKey     = ($keys | Where-Object { $_ -like 'host *' }     | Select-Object -First 1) -replace '^host ', ''
