@@ -454,6 +454,10 @@ It builds all five platforms plus the proxy, ships them over ssh, and runs
 `deploy/install-proxy.sh` on the far end, which creates the `multissh` system
 user, the state directory and a hardened unit, then reports `/healthz`.
 
+It finishes by reading `/healthz` and checking the `build` there against the
+binary it just shipped, so a deployment is confirmed rather than assumed — a
+command exiting zero is not evidence the new binary is the one running.
+
 It is **safe to run against a live proxy**, and acts only on what changed:
 
 | What changed | What happens |
@@ -529,7 +533,7 @@ months ago, discovered during the emergency it was meant to cover.
 - `/healthz` on the agent listener answers monitoring:
 
 ```json
-{"status":"ok","connected":3,"known":5,"stale":1,"stale_after":"720h0m0s","outdated":1,"revoked":0,"protocol":1}
+{"status":"ok","connected":3,"known":5,"stale":1,"stale_after":"720h0m0s","outdated":1,"revoked":0,"protocol":1,"build":"a4e9348d8d24"}
 ```
 
 It is **unauthenticated and deliberately anonymous** — counts only, no names and

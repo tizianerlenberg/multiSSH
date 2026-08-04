@@ -306,7 +306,7 @@ func main() {
 	if ca == nil {
 		role = "standby (verify only)"
 	}
-	log.Printf("running as %s", role)
+	log.Printf("running as %s, build %s", role, describeBuild(ownBuildID()))
 	log.Printf("proxy host key %s", ssh.FingerprintSHA256(signer.PublicKey()))
 	log.Printf("certificate authority %s", ssh.FingerprintSHA256(caPub))
 
@@ -714,6 +714,9 @@ func serveHealth(reg *registry, seen *sightings, revoked *revocations, dist *dis
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
+		// The proxy's own build, so a deployment can be confirmed from the
+		// outside rather than taken on trust. Agents report theirs; this is
+		// the same question asked of the thing serving the answer.
 		json.NewEncoder(w).Encode(struct {
 			Status     string `json:"status"`
 			Connected  int    `json:"connected"`
@@ -723,6 +726,7 @@ func serveHealth(reg *registry, seen *sightings, revoked *revocations, dist *dis
 			Outdated   int    `json:"outdated"`
 			Revoked    int    `json:"revoked"`
 			Protocol   int    `json:"protocol"`
+			Build      string `json:"build"`
 		}{
 			Status:     "ok",
 			Connected:  len(list),
@@ -732,6 +736,7 @@ func serveHealth(reg *registry, seen *sightings, revoked *revocations, dist *dis
 			Outdated:   outdated,
 			Revoked:    revoked.count(),
 			Protocol:   sshx.ProtocolVersion,
+			Build:      ownBuildID(),
 		})
 	}
 }
@@ -989,6 +994,21 @@ func serveListing(reg *registry, seen *sightings, dist *distributor, staleAfter 
 		}
 	}
 }
+
+// ownBuildID hashes this executable, so `push.sh` can confirm from /healthz
+// that the binary it shipped is the one now running, rather than reporting
+// success because a command exited zero.
+var ownBuildID = sync.OnceValue(func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	id, err := sshx.BuildIDOfFile(exe)
+	if err != nil {
+		return ""
+	}
+	return id
+})
 
 // describeBuild renders a build ID for a log line.
 func describeBuild(build string) string {
