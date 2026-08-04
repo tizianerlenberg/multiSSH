@@ -484,6 +484,7 @@ concurrent connections, and no per-user access control — any key in
 | 🟡 | Everyone with a user key reaches every target. No ACLs. | Fine for one operator; wrong the moment a second key is added for someone else. |
 | 🟡 | Proxy configuration is entirely flags, held in the systemd unit. | `install-proxy.sh` writes the unit once and never overwrites it, so changes are edited on the server. |
 | 🟡 | Agents are never updated automatically. | A sweep is something you run; nothing happens on its own. Deliberate — an automatic update that goes wrong takes out every machine at once. |
+| 🔴 | **Updating a Windows agent leaves it stopped.** The update completes and reports success, but the agent does not come back until it is started by hand or the machine reboots. | Update Windows targets only when you can reach the machine another way. Under investigation; the agent's own `agent.log` in its state directory is where the evidence is. |
 | ⚪ | A machine that enrolled but never once connected is invisible to the proxy — enrolment writes nothing there. | The installer reports success on the target instead. |
 
 ## Installing a target

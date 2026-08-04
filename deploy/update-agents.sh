@@ -46,7 +46,14 @@ DEADLINE=$(( $(date +%s) + ${MULTISSH_DEADLINE:-1800} ))
 # Every ssh here is bounded. Without this a target that accepted the connection
 # and then stopped answering -- a laptop closing its lid mid-update, which is
 # exactly the population this tool serves -- hangs the sweep indefinitely.
-SSHOPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+# -T and -n are the important ones, and their absence is what made this look
+# broken. Run from a terminal, ssh with no command allocates a pseudo-terminal
+# and puts *your* terminal into raw mode. The sweep then hung, and Ctrl-C did
+# not stop it -- in raw mode the interrupt is passed to the far end as a byte
+# instead of becoming a signal locally, so the only way out was to close the
+# window. -T asks for no terminal and -n takes stdin away entirely, which is
+# what a script wants in any case: nothing here is interactive.
+SSHOPTS="-T -n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
 
 have_timeout=
 command -v timeout >/dev/null 2>&1 && have_timeout=1
