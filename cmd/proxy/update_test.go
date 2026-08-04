@@ -1,12 +1,16 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // Regressions in the agent update path.
@@ -273,5 +277,113 @@ func TestDistributorBuilds(t *testing.T) {
 	empty := newDistributor(t.TempDir())
 	if empty.serving() {
 		t.Error("an empty directory reports as serving builds")
+	}
+}
+
+// The Windows installer had never been run by anyone, and two of its bugs were
+// the kind that only appear at the last step of a real install -- after the
+// machine has already enrolled and taken a name on the proxy.
+
+// withoutComments strips PowerShell comment lines, so an assertion about what
+// the script *does* is not satisfied or defeated by a comment explaining what
+// it deliberately does not do.
+func withoutComments(script string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func powershellInstaller(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "windows-amd64"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return installPowerShell(newDistributor(dir), caPub,
+		"https://multissh.example.com", []string{"wss://multissh.example.com/agent"})
+}
+
+// Regression. PowerShell runs a function definition as a statement, so calling
+// one from a block placed above its definition fails at runtime with "the term
+// is not recognized". -Rollback did exactly that.
+func TestPowerShellDefinesEveryFunctionBeforeUse(t *testing.T) {
+	script := powershellInstaller(t)
+
+	lastDef := strings.LastIndex(script, "\nfunction ")
+	firstCall := strings.Index(script, "\nAssert-Admin\n")
+	if lastDef < 0 {
+		t.Fatal("no function definitions found")
+	}
+	if firstCall < 0 {
+		t.Fatal("could not find the first executable statement (Assert-Admin)")
+	}
+	if lastDef > firstCall {
+		t.Error("a function is defined after the script starts executing; anything calling it earlier fails at runtime")
+	}
+}
+
+// Regression. schtasks caps the whole /TR command line at 261 characters. The
+// real argument list is over 300, so registering the task failed outright --
+// at the very last step, on a machine that had already enrolled. It also could
+// not express restart-on-failure and left the default three-day execution time
+// limit in place, which would have killed the agent after three days.
+func TestPowerShellUsesRegisterScheduledTask(t *testing.T) {
+	script := powershellInstaller(t)
+
+	if strings.Contains(withoutComments(script), "schtasks") {
+		t.Error("install.ps1 still uses schtasks; its /TR argument is capped at 261 characters and the real one is longer")
+	}
+	for _, want := range []string{
+		"Register-ScheduledTask",
+		"New-ScheduledTaskAction",
+		"-ExecutionTimeLimit ([TimeSpan]::Zero)", // or the agent dies after three days
+		"-RestartCount",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("install.ps1 does not use %s", want)
+		}
+	}
+}
+
+// Executing a downloaded .ps1 is subject to the execution policy, which a
+// default Windows install refuses -- and not needing one changed is the whole
+// point of the piped installer. The re-fetch must run as a scriptblock.
+func TestPowerShellRefetchAvoidsTheExecutionPolicy(t *testing.T) {
+	script := powershellInstaller(t)
+
+	if !strings.Contains(script, "[scriptblock]::Create($fetched)") {
+		t.Error("the re-fetched installer is not run as a scriptblock; the execution policy would refuse a downloaded file")
+	}
+	if strings.Contains(script, "& $fresh") {
+		t.Error("the re-fetched installer is invoked as a file path")
+	}
+}
+
+// A byte-order mark in front of an ssh-ed25519 line makes the agent fail to
+// parse its own certificate, with a message pointing nowhere near the cause.
+// Set-Content's default encoding differs between Windows PowerShell and 7.
+func TestPowerShellWritesKeyFilesAsAscii(t *testing.T) {
+	script := powershellInstaller(t)
+	if !strings.Contains(script, "-Encoding ascii") {
+		t.Error("key files are written without an explicit encoding")
+	}
+	for _, f := range []string{"agent_identity-cert.pub", "proxy_ca.pub", "agent_authorized_keys"} {
+		if !strings.Contains(script, "Write-KeyFile (Join-Path $StateDir '"+f+"')") {
+			t.Errorf("%s is not written through Write-KeyFile", f)
+		}
 	}
 }

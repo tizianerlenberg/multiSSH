@@ -4,11 +4,19 @@
 # address below, so the agent pins the right authority from its first connect.
 #
 # Registered as a scheduled task at boot rather than a service: a proper
-# Windows service needs a service-control handler in the binary, and this path
-# has not been exercised on real hardware yet. Restart-on-failure is weaker as
-# a result; the agent's own reconnect loop covers the common case.
+# Windows service needs a service-control handler in the binary. The task is
+# set to restart on failure and to have no execution time limit, so the gap
+# between this and a service is smaller than it looks.
 #
-#   irm https://proxy/install.ps1 | iex
+# Recommended, because it survives an error without closing your window and
+# needs no execution-policy change:
+#
+#   irm https://proxy/install.ps1 -OutFile $env:TEMP\multissh-install.ps1
+#   powershell -ExecutionPolicy Bypass -File $env:TEMP\multissh-install.ps1
+#
+# Options need the file form, or the scriptblock form -- piping into iex gives
+# no way to pass arguments:
+#
 #   & ([scriptblock]::Create((irm https://proxy/install.ps1))) -Uninstall
 
 [CmdletBinding()]
@@ -36,7 +44,19 @@ $Binary     = Join-Path $InstallDir 'multissh-agent.exe'
 $Manifest   = Join-Path $StateDir 'manifest.json'
 $TaskName   = 'multiSSH agent'
 
-function Die($m) { Write-Error $m; exit 1 }
+# ------------------------------------------------------------- functions
+#
+# All of them, before anything that runs. PowerShell executes a function
+# definition as a statement, so a function called from a block placed above its
+# definition is simply not defined yet -- which is how -Rollback came to fail
+# with "the term 'Restart-Agent' is not recognized".
+
+# Write-Error would be turned into a terminating error by the preference above,
+# so the exit code would come from the error rather than from here.
+function Die($m) {
+    Write-Host "error: $m" -ForegroundColor Red
+    exit 1
+}
 
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -52,67 +72,41 @@ function Get-Manifest {
 }
 
 function Stop-Agent {
-    schtasks /End /TN $TaskName 2>$null | Out-Null
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
+function Remove-AgentTask {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+# Start-Agent registers the task and starts it.
+#
+# Register-ScheduledTask rather than schtasks.exe: schtasks caps the whole /TR
+# command line at 261 characters and the real argument list here is over 350,
+# so it failed outright -- at the very last step, on a machine that had already
+# enrolled. It also cannot express restart-on-failure, and leaves the default
+# three-day execution time limit in place, which would have killed the agent
+# after three days with nothing to say why.
 function Start-Agent($argline) {
-    schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
-    # Runs as SYSTEM at boot, so the machine is reachable before anyone logs in.
-    schtasks /Create /TN $TaskName /RU SYSTEM /SC ONSTART /RL HIGHEST /F `
-        /TR "`"$Binary`" $argline" | Out-Null
-    schtasks /Run /TN $TaskName | Out-Null
+    $action  = New-ScheduledTaskAction -Execute $Binary -Argument $argline
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+        -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Start-ScheduledTask -TaskName $TaskName
 }
 
-Assert-Admin
-
-# ------------------------------------------------------------- uninstall
-
-if ($Uninstall) {
-    $m = Get-Manifest
-    if (-not $m) { Die "nothing installed here (no $Manifest)" }
-    Write-Host "will remove:"
-    Write-Host "  $($m.binary)"
-    Write-Host "  $($m.state)  (identity key, host key, certificate)"
-    Write-Host "  scheduled task '$TaskName'"
-    if (-not $Yes) {
-        $c = Read-Host 'remove, including the keys? [y/N]'
-        if ($c -notmatch '^[yY]') { Write-Host 'cancelled'; exit 0 }
-    }
-    # Ordered so that an uninstall driven over the agent's own tunnel finishes:
-    # ending the task kills this script with it, so everything that can be done
-    # while the agent still runs is done first. Windows refuses to delete a
-    # running .exe but allows it to be renamed, so the binary is moved aside
-    # and only then deleted.
-    schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
-    Remove-Item -Recurse -Force $m.state -ErrorAction SilentlyContinue
-    if (Test-Path $m.binary) {
-        Move-Item -Force $m.binary "$($m.binary).removing" -ErrorAction SilentlyContinue
-    }
-    Remove-Item -Force "$($m.binary).prev", "$($m.binary).new" -ErrorAction SilentlyContinue
-    Write-Host 'removed.'
+function Restart-Agent($argline) {
     Stop-Agent
-    Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
-    exit 0
+    Start-Agent $argline
 }
-
-# ------------------------------------------------------------- rollback
-
-if ($Rollback) {
-    $m = Get-Manifest
-    if (-not $m) { Die "nothing installed here (no $Manifest)" }
-    if (-not (Test-Path "$Binary.prev")) { Die "no previous binary saved at $Binary.prev" }
-    Copy-Item -Force "$Binary.prev" "$Binary.rollback"
-    Move-Item -Force "$Binary.rollback" $Binary
-    # The recorded version no longer describes what is on disk, so clear it or
-    # the next -Update would decide there was nothing to do.
-    $m.version = 'rolled-back'
-    $m | ConvertTo-Json | Set-Content $Manifest
-    Restart-Agent $m.args
-    Write-Host 'rolled back to the previous binary; run -Update to go forward again'
-    exit 0
-}
-
-# ------------------------------------------------------------- download
 
 function Expected-Hash {
     foreach ($pair in $Hashes -split ' ') {
@@ -148,9 +142,61 @@ function Download-Binary {
     Move-Item -Force $new $Binary
 }
 
-function Restart-Agent($argline) {
-    schtasks /End /TN $TaskName 2>$null | Out-Null
-    Start-Agent $argline
+# Key files must be plain ASCII. Set-Content's default encoding differs between
+# Windows PowerShell and PowerShell 7, and a byte-order mark in front of an
+# ssh-ed25519 line makes the agent fail to parse its own certificate with a
+# message that points nowhere near the cause.
+function Write-KeyFile($path, $content) {
+    Set-Content -Path $path -Value $content -Encoding ascii -NoNewline
+}
+
+Assert-Admin
+
+# ------------------------------------------------------------- uninstall
+
+if ($Uninstall) {
+    $m = Get-Manifest
+    if (-not $m) { Die "nothing installed here (no $Manifest)" }
+    Write-Host "will remove:"
+    Write-Host "  $($m.binary)"
+    Write-Host "  $($m.state)  (identity key, host key, certificate)"
+    Write-Host "  scheduled task '$TaskName'"
+    if (-not $Yes) {
+        $c = Read-Host 'remove, including the keys? [y/N]'
+        if ($c -notmatch '^[yY]') { Write-Host 'cancelled'; exit 0 }
+    }
+    # Ordered so that an uninstall driven over the agent's own tunnel finishes:
+    # ending the task kills this script with it, so everything that can be done
+    # while the agent still runs is done first. Windows refuses to delete a
+    # running .exe but allows it to be renamed, so the binary is moved aside
+    # and only then deleted.
+    Remove-AgentTask
+    Remove-Item -Recurse -Force $m.state -ErrorAction SilentlyContinue
+    if (Test-Path $m.binary) {
+        Move-Item -Force $m.binary "$($m.binary).removing" -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Force "$($m.binary).prev", "$($m.binary).new" -ErrorAction SilentlyContinue
+    Write-Host 'removed.'
+    Stop-Agent
+    Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
+    exit 0
+}
+
+# ------------------------------------------------------------- rollback
+
+if ($Rollback) {
+    $m = Get-Manifest
+    if (-not $m) { Die "nothing installed here (no $Manifest)" }
+    if (-not (Test-Path "$Binary.prev")) { Die "no previous binary saved at $Binary.prev" }
+    Copy-Item -Force "$Binary.prev" "$Binary.rollback"
+    Move-Item -Force "$Binary.rollback" $Binary
+    # The recorded version no longer describes what is on disk, so clear it or
+    # the next -Update would decide there was nothing to do.
+    $m.version = 'rolled-back'
+    $m | ConvertTo-Json | Set-Content $Manifest
+    Restart-Agent $m.args
+    Write-Host 'rolled back to the previous binary; run -Update to go forward again'
+    exit 0
 }
 
 # ------------------------------------------------------------- update
@@ -158,21 +204,31 @@ function Restart-Agent($argline) {
 # This copy has the proxy's version frozen into it from install time and the
 # manifest holds that same value, so comparing them here would always report
 # "already current". Fetch what the proxy is serving now and hand over to it.
-if ($Update -and -not $env:MULTISSH_NO_REFETCH) {
+#
+# Run as a scriptblock rather than as a file: executing a downloaded .ps1 is
+# subject to the execution policy, which on a default Windows install refuses
+# it -- and the whole point of the piped installer is that it does not need one
+# changed.
+if ($Update -and -not $env:MULTISSH_NO_REFETCH -and (Test-Path $Manifest)) {
+    $fetched = $null
     try {
-        $fresh = Join-Path $StateDir 'install.fetched.ps1'
-        Invoke-WebRequest -Uri "$BaseUrl/install.ps1" -OutFile $fresh -UseBasicParsing
-        $env:MULTISSH_NO_REFETCH = '1'
-        & $fresh -Update
-        Remove-Item -Force $fresh -ErrorAction SilentlyContinue
-        exit $LASTEXITCODE
+        $fetched = (Invoke-WebRequest -Uri "$BaseUrl/install.ps1" -UseBasicParsing).Content
     } catch {
         Write-Host "could not reach $BaseUrl; continuing with this copy"
+    }
+    if ($fetched) {
+        $env:MULTISSH_NO_REFETCH = '1'
+        try {
+            & ([scriptblock]::Create($fetched)) -Update -Yes:$Yes
+        } finally {
+            Remove-Item Env:\MULTISSH_NO_REFETCH -ErrorAction SilentlyContinue
+        }
+        exit 0
     }
 }
 
 $existing = Get-Manifest
-if ($existing -and -not $Reenroll -and -not $Uninstall) {
+if ($existing -and -not $Reenroll) {
     if (-not $Update) {
         Write-Host "already installed here ($($existing.canonical)); updating instead."
         Write-Host "pass -Reenroll to discard that identity and enrol afresh."
@@ -230,8 +286,13 @@ Download-Binary
 $idPath   = Join-Path $StateDir 'agent_identity'
 $hostPath = Join-Path $StateDir 'agent_host_key'
 $keys = & $Binary -show-keys -identity $idPath -host-key $hostPath
-$identityKey = ($keys | Select-String '^identity ').ToString() -replace '^identity ', ''
-$hostKey     = ($keys | Select-String '^host ').ToString()     -replace '^host ', ''
+if ($LASTEXITCODE -ne 0) { Die "the agent could not generate its keys" }
+
+$identityKey = ($keys | Where-Object { $_ -like 'identity *' } | Select-Object -First 1) -replace '^identity ', ''
+$hostKey     = ($keys | Where-Object { $_ -like 'host *' }     | Select-Object -First 1) -replace '^host ', ''
+if (-not $identityKey -or -not $hostKey) {
+    Die "unexpected output from -show-keys; got: $keys"
+}
 
 Write-Host 'enrolling...'
 $body = @{
@@ -247,12 +308,12 @@ try {
     $resp = Invoke-RestMethod -Uri "$BaseUrl/enroll" -Method Post -Body $body `
         -ContentType 'application/json' -UseBasicParsing
 } catch {
-    Die 'enrolment refused (wrong or expired password?)'
+    Die "enrolment refused (wrong or expired password?): $($_.Exception.Message)"
 }
 
-Set-Content -Path (Join-Path $StateDir 'agent_identity-cert.pub') -Value $resp.certificate -NoNewline
-Set-Content -Path (Join-Path $StateDir 'proxy_ca.pub')            -Value $resp.ca -NoNewline
-Set-Content -Path (Join-Path $StateDir 'agent_authorized_keys')   -Value $resp.authorized_keys -NoNewline
+Write-KeyFile (Join-Path $StateDir 'agent_identity-cert.pub') $resp.certificate
+Write-KeyFile (Join-Path $StateDir 'proxy_ca.pub')            $resp.ca
+Write-KeyFile (Join-Path $StateDir 'agent_authorized_keys')   $resp.authorized_keys
 
 $argline = "-proxy $Proxies -identity `"$idPath`" -host-key `"$hostPath`" " +
            "-identity-cert `"$(Join-Path $StateDir 'agent_identity-cert.pub')`" " +
@@ -283,10 +344,12 @@ Write-Host ""
 Write-Host "  canonical  $($resp.canonical)   always works"
 Write-Host "  friendly   $($resp.friendly)   yours unless another machine already holds it"
 Write-Host ""
-Write-Host "  ssh -J <proxy> Administrator@$($resp.friendly)"
+Write-Host "  ssh -J <proxy> anything@$($resp.friendly)"
+Write-Host "  (the username is ignored; the shell runs as SYSTEM)"
 Write-Host ""
-Write-Host "  update or remove:"
-Write-Host "    & ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -Update"
-Write-Host "    & ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -Rollback"
-Write-Host "    & ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -Uninstall"
+Write-Host "  update, roll back or remove:"
+Write-Host "    `$m = '$StateDir\manage.ps1'"
+Write-Host "    & ([scriptblock]::Create((Get-Content `$m -Raw))) -Update"
+Write-Host "    & ([scriptblock]::Create((Get-Content `$m -Raw))) -Rollback"
+Write-Host "    & ([scriptblock]::Create((Get-Content `$m -Raw))) -Uninstall"
 Write-Host ""
