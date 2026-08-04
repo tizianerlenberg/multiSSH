@@ -436,8 +436,16 @@ func TestPowerShellSupportsBothScopes(t *testing.T) {
 			t.Errorf("install.ps1 is missing the task principal detail %q", want)
 		}
 	}
-	if strings.Contains(script, "-LogonType ServiceAccount") {
-		t.Error("the system scope still registers a scheduled task; it installs a service now")
+	// Start-Agent must not register a task for the system scope -- that is a
+	// service now. Checked against that function alone: the one-shot restart
+	// task legitimately runs as SYSTEM, and asserting over the whole script
+	// made a correct change look like a regression.
+	starter := section(t, script, `^function Start-Agent\(\$argline\) \{`, `^\}`)
+	if strings.Contains(starter, "-LogonType ServiceAccount") {
+		t.Error("Start-Agent still registers a scheduled task for the system scope; it installs a service now")
+	}
+	if !strings.Contains(starter, "New-Service -Name $ServiceName") {
+		t.Error("Start-Agent does not create the service for the system scope")
 	}
 
 	// icacls hands the directory to SYSTEM and Administrators, which is wrong
