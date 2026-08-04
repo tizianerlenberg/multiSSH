@@ -196,10 +196,11 @@ the machine, anyone else installs for themselves. The confirmation prompt names
 the scope it picked and why, so `-Scope` is only for overriding it — installing
 for yourself *from* an elevated shell, say.
 
-Give it a different name when prompted, or it will ask the proxy for one
-already held by the SYSTEM install and end up reachable only under its
-canonical name. The user-scope agent is **not reachable while you are logged
-out**, which is the trade.
+When the other scope is already installed, the suggested name avoids the one it
+holds — `winbox-user` beside `winbox` — because both agents can ask for a
+friendly name but only one can have it, and the loser is reachable under its
+canonical name alone. The user-scope agent is **not reachable while you are
+logged out**, which is the trade.
 
 There is no `sudo -u` on Windows to switch between them from inside a session:
 `runas` wants the password typed at a real console, and `Start-Process

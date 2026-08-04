@@ -306,6 +306,23 @@ if ($existing -and -not $Reenroll) {
 
 if (-not $Name) {
     $default = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9-]', '-'
+
+    # When the other scope is already installed on this machine, steer the
+    # default name away from the one it holds. Two agents can both ask for a
+    # friendly name but only one can have it, so the second would be reachable
+    # under its canonical name alone -- correct, and quietly baffling.
+    #
+    # The other scope's *task* is the thing to look for, not its manifest: a
+    # system install's state directory is locked to SYSTEM and Administrators,
+    # so an unelevated shell cannot see it at all.
+    $otherTask = if ($Scope -eq 'system') { "multiSSH agent ($env:USERNAME)" }
+                 else                     { 'multiSSH agent' }
+    if (Get-ScheduledTask -TaskName $otherTask -ErrorAction SilentlyContinue) {
+        $default = "$default-$Scope"
+        Write-Host "note: this machine already has a $(if ($Scope -eq 'system') { 'user' } else { 'system' })-scope agent,"
+        Write-Host "      so the suggested name avoids the one it holds."
+    }
+
     if ($Yes) { $Name = $default }
     else {
         $Name = Read-Host "name for this machine [$default]"
