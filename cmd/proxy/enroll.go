@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -169,8 +170,12 @@ type enrolResponse struct {
 
 // enroller answers POST /enroll.
 type enroller struct {
-	ca        ssh.Signer
-	passwords []password
+	ca ssh.Signer
+	// Behind a pointer so SIGHUP can swap it. Read once at startup, removing
+	// a password wrote the file and changed nothing: the running proxy went on
+	// accepting the credential you thought you had just withdrawn, until
+	// something happened to restart it.
+	passwords atomic.Pointer[[]password]
 	usersFile string
 	proxies   []string
 	limit     *limiter
@@ -199,7 +204,7 @@ func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
 	// which credential was used or how many exist.
 	var ok bool
 	var used string
-	for _, p := range e.passwords {
+	for _, p := range *e.passwords.Load() {
 		if p.matches(req.Password) && !p.expired() {
 			ok, used = true, p.Name
 		}
@@ -270,6 +275,17 @@ func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
 		Canonical:   canonical,
 		Friendly:    name,
 	})
+}
+
+// reload re-reads the password file, leaving the current set in place if it
+// cannot be read. Returns how many are now in force.
+func (e *enroller) reload(path string) (int, error) {
+	pws, err := loadPasswords(path)
+	if err != nil {
+		return 0, err
+	}
+	e.passwords.Store(&pws)
+	return len(pws), nil
 }
 
 func parseAuthorizedKey(s string) (ssh.PublicKey, error) {
@@ -344,6 +360,15 @@ func managePasswords(path, add, remove string, list bool, validity time.Duration
 		return savePasswords(path, kept)
 
 	default:
+		// Checked before anything is typed. This used to run after the
+		// prompt, so the way you discovered a name was taken was by entering
+		// a password twice and then being told it was all for nothing.
+		for _, existing := range pws {
+			if existing.Name == add {
+				return fmt.Errorf("a password named %q already exists; remove it first:\n"+
+					"    -remove-password %s", add, add)
+			}
+		}
 		secret, err := readSecret("enrollment password for " + add + ": ")
 		if err != nil {
 			return err
@@ -354,11 +379,6 @@ func managePasswords(path, add, remove string, list bool, validity time.Duration
 		p, err := newPassword(add, secret, validity)
 		if err != nil {
 			return err
-		}
-		for _, existing := range pws {
-			if existing.Name == add {
-				return fmt.Errorf("a password named %q already exists", add)
-			}
 		}
 		if err := savePasswords(path, append(pws, p)); err != nil {
 			return err
