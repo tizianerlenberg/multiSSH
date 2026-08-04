@@ -186,16 +186,20 @@ user one is the comfortable one, and they keep separate directories, keys and
 scheduled tasks:
 
 ```powershell
-# in a NORMAL (unelevated) PowerShell
+# in a NORMAL (unelevated) PowerShell -- no flag needed
 irm https://multissh.example.com/install.ps1 -OutFile $env:TEMP\ms.ps1
-powershell -ExecutionPolicy Bypass -File $env:TEMP\ms.ps1 -Scope user
+powershell -ExecutionPolicy Bypass -File $env:TEMP\ms.ps1
 ```
+
+Scope follows elevation, as it does on Linux: an elevated shell installs for
+the machine, anyone else installs for themselves. The confirmation prompt names
+the scope it picked and why, so `-Scope` is only for overriding it — installing
+for yourself *from* an elevated shell, say.
 
 Give it a different name when prompted, or it will ask the proxy for one
 already held by the SYSTEM install and end up reachable only under its
-canonical name. Scope follows elevation, as it does on Linux: an elevated shell
-installs for the machine, anyone else installs for themselves. The user-scope
-agent is **not reachable while you are logged out**, which is the trade.
+canonical name. The user-scope agent is **not reachable while you are logged
+out**, which is the trade.
 
 There is no `sudo -u` on Windows to switch between them from inside a session:
 `runas` wants the password typed at a real console, and `Start-Process
