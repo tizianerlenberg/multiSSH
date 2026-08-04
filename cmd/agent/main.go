@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"multissh/internal/sshx"
 )
@@ -427,6 +428,34 @@ func serveSession(nc ssh.NewChannel) {
 		started bool
 	)
 
+	// startSFTP serves the subsystem on this channel until the client is done.
+	// It shares the "started" flag with the shell: a channel is one thing or
+	// the other, never both.
+	startSFTP := func(ch ssh.Channel) bool {
+		mu.Lock()
+		if started {
+			mu.Unlock()
+			return false
+		}
+		started = true
+		mu.Unlock()
+
+		server, err := sftp.NewServer(ch)
+		if err != nil {
+			log.Printf("sftp: %v", err)
+			return false
+		}
+		go func() {
+			defer ch.Close()
+			// io.EOF is the ordinary way a client says it has finished.
+			if err := server.Serve(); err != nil && err != io.EOF {
+				log.Printf("sftp: %v", err)
+			}
+			server.Close()
+		}()
+		return true
+	}
+
 	// Whatever ends the session, the shell must go with it, or a rescue box
 	// slowly fills up with orphaned shells.
 	defer func() {
@@ -503,6 +532,27 @@ func serveSession(nc ssh.NewChannel) {
 			ok := start(e.Command)
 			if req.WantReply {
 				req.Reply(ok, nil)
+			}
+
+		case "subsystem":
+			// Only sftp, and only once. Copying a file off a machine that is
+			// half broken is a large part of what a rescue tool is for, and
+			// until now the embedded server could not do it at all: scp on a
+			// modern OpenSSH client speaks the sftp subsystem, so both were
+			// out.
+			var sub struct{ Name string }
+			if err := ssh.Unmarshal(req.Payload, &sub); err != nil || sub.Name != "sftp" {
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+				continue
+			}
+			ok := startSFTP(ch)
+			if req.WantReply {
+				req.Reply(ok, nil)
+			}
+			if !ok {
+				return
 			}
 
 		default:

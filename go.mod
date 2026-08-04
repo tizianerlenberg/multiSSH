@@ -10,4 +10,9 @@ require (
 	golang.org/x/term v0.45.0
 )
 
-require github.com/coder/websocket v1.8.15
+require (
+	github.com/coder/websocket v1.8.15
+	github.com/pkg/sftp v1.13.11
+)
+
+require github.com/kr/fs v0.1.0 // indirect

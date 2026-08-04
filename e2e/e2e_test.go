@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"multissh/internal/sshx"
 )
@@ -776,6 +777,88 @@ func TestListingShowsTheHostKeyFingerprintSshWillPrint(t *testing.T) {
 	}
 	if got := ssh.FingerprintSHA256(served); got != want {
 		t.Errorf("the key served to the client is %s, but the listing advertised %s", got, want)
+	}
+}
+
+// Copying a file off a machine that is half broken is a large part of what a
+// rescue tool is for, and until sftp existed the embedded server could not do
+// it at all -- scp on a modern OpenSSH client speaks the sftp subsystem, so
+// both were out.
+func TestSftpMovesFilesBothWays(t *testing.T) {
+	f := setup(t)
+	f.startProxy()
+	f.startAgent()
+	f.waitForTarget(f.canonical)
+
+	c := f.dialProxy()
+	inner, _, err := f.jumpTo(c, f.canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := sftp.NewClient(inner)
+	if err != nil {
+		t.Fatalf("opening the sftp subsystem: %v", err)
+	}
+	defer client.Close()
+
+	// Off the target: the rescue direction.
+	onTarget := filepath.Join(f.dir, "rescue-me.txt")
+	want := "the file we want to rescue\n"
+	if err := os.WriteFile(onTarget, []byte(want), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rf, err := client.Open(onTarget)
+	if err != nil {
+		t.Fatalf("opening a file on the target: %v", err)
+	}
+	got, err := io.ReadAll(rf)
+	rf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("read %q, want %q", got, want)
+	}
+
+	// And onto it.
+	dest := filepath.Join(f.dir, "landed.txt")
+	wf, err := client.Create(dest)
+	if err != nil {
+		t.Fatalf("creating a file on the target: %v", err)
+	}
+	if _, err := wf.Write([]byte("pushed from the client\n")); err != nil {
+		t.Fatal(err)
+	}
+	wf.Close()
+	back, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("the file never arrived: %v", err)
+	}
+	if string(back) != "pushed from the client\n" {
+		t.Errorf("landed as %q", back)
+	}
+}
+
+// Only sftp. The embedded server is not a general subsystem host, and adding
+// one must not have opened it up to others.
+func TestOtherSubsystemsAreStillRefused(t *testing.T) {
+	f := setup(t)
+	f.startProxy()
+	f.startAgent()
+	f.waitForTarget(f.canonical)
+
+	c := f.dialProxy()
+	inner, _, err := f.jumpTo(c, f.canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := inner.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := sess.RequestSubsystem("netconf"); err == nil {
+		t.Error("an unrelated subsystem was accepted")
 	}
 }
 

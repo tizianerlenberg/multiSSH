@@ -249,8 +249,17 @@ it runs the shell as whoever the agent runs as. So `ssh -J proxy root@laptop`
 on a user-scope install silently gives you a *non-root* shell. Write whatever
 you like; only your key matters.
 
-`scp`/`sftp` do **not** work yet — the embedded server serves interactive
-sessions and `exec` only.
+`scp` and `sftp` work, which matters because getting a file *off* a machine
+that is half broken is a large part of what a rescue tool is for:
+
+```bash
+scp -J proxy user@laptop:/etc/ssh/sshd_config .     # rescue a file
+sftp -J proxy user@laptop                           # or browse
+```
+
+Only the `sftp` subsystem is served; the embedded server is not a general
+subsystem host. On Windows the files are reached as SYSTEM or as you,
+[depending on scope](#what-you-get-on-windows).
 
 ---
 
@@ -431,6 +440,8 @@ those and leaves the unit tests.
 - a frozen agent (`SIGSTOP`) is evicted from the registry within ~30s, and a
   connection attempt to it fails in ~10s rather than hanging
 - reconnect backoff resets after a healthy session, so recovery stays fast
+- `sftp` and `scp` move files in both directions through the tunnel, while
+  other subsystems stay refused
 - the installer works over real TLS through real Caddy, end to end
 - failed ssh handshakes are counted per source address and refused past a
   threshold, as `/enroll` attempts already were
@@ -467,7 +478,6 @@ concurrent connections, and no per-user access control — any key in
 | | Issue | Impact |
 |---|---|---|
 | 🟡 | macOS is **built but never run**. | Unknown. Windows is now genuinely in use; macOS has never been started. |
-| 🟡 | No `sftp`/`scp`. | No file recovery. |
 | 🟡 | Windows: a machine-wide install is a real service; a user install is a scheduled task, because creating a service needs rights a user does not have. | The user-scope agent restarts three times on failure and stops when you log out. |
 | 🟡 | `wss://` to a bare IP does not override TLS SNI, so `-proxy-host` alone is not enough to bypass DNS over TLS. | Works for `ws://` behind a TLS-terminating reverse proxy; direct `wss://` needs a resolvable name. |
 | 🟡 | Backgrounded jobs (`cmd &`) survive disconnect on Unix, as they do under a normal sshd. | Deliberate. Windows now kills the whole tree through a Job Object. |
