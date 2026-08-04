@@ -257,6 +257,19 @@ scp -J proxy user@laptop:/etc/ssh/sshd_config .     # rescue a file
 sftp -J proxy user@laptop                           # or browse
 ```
 
+⚠️ **Do not quote the remote path.** In SFTP mode the path is taken literally,
+not passed through a shell, so quotes become part of the filename:
+
+```bash
+scp -J proxy file.txt 'winbox:C:/Users/Some Name/Downloads/file.txt'    # right
+scp -J proxy file.txt 'winbox:"C:\Users\Some Name\Downloads\file.txt"'  # wrong
+```
+
+Backslashes work as well as forward slashes on Windows. Quote the whole
+argument once, against your *local* shell, and stop there. Relative paths land
+in the agent's working directory, which is often not writable — use an absolute
+one.
+
 Only the `sftp` subsystem is served; the embedded server is not a general
 subsystem host. On Windows the files are reached as SYSTEM or as you,
 [depending on scope](#what-you-get-on-windows).

@@ -41,6 +41,9 @@ done
 SSH=${MULTISSH_SSH:-ssh}
 WAIT_SECONDS=${MULTISSH_WAIT:-120}
 CMD_TIMEOUT=${MULTISSH_TIMEOUT:-90}
+# How long a target may sit connected-but-outdated before that counts as a
+# verdict rather than something still in progress.
+STALE_VERDICT=${MULTISSH_STALE_VERDICT:-45}
 DEADLINE=$(( $(date +%s) + ${MULTISSH_DEADLINE:-1800} ))
 
 # Every ssh here is bounded. Without this a target that accepted the connection
@@ -218,6 +221,7 @@ for entry in $TODO; do
     if ! run_bounded "$CMD_TIMEOUT" \
             $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
             "update@$name" "$(update_command "$platform")" 2>&1 |
+            tr -d '\r' |
             sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/^/    /'; then
         # The agent restarts as the last thing it does, so the session is very
         # often cut off mid-sentence. Whether this worked is decided by the
@@ -232,11 +236,23 @@ for entry in $TODO; do
     started=$(date +%s)
     until_ts=$(( started + WAIT_SECONDS ))
     ok=
+    stale_since=
     while :; do
         now=$(date +%s)
         [ "$now" -lt "$until_ts" ] || break
         state=$(targets | awk -v n="$name" '$1 == n { print $3 }')
         if [ "$state" = current ]; then ok=1; break; fi
+
+        # Present but still on the old build is a different answer from absent,
+        # and a conclusive one: the machine is up, it just did not restart into
+        # the new binary. Waiting the full period for that to change is time
+        # spent learning nothing.
+        if [ "$state" = OUTDATED ]; then
+            [ -n "$stale_since" ] || stale_since=$now
+            if [ $(( now - stale_since )) -ge "$STALE_VERDICT" ]; then break; fi
+        else
+            stale_since=
+        fi
         elapsed=$(( now - started ))
         if [ "$state" = OUTDATED ]; then
             what="back, still on the old build"
@@ -259,6 +275,12 @@ for entry in $TODO; do
     if [ -n "$ok" ]; then
         echo "    now current"
         DONE="$DONE $name"
+    elif [ -n "$stale_since" ]; then
+        echo "    it is connected but still running the old build: the new binary" >&2
+        echo "    was installed and the restart did not take effect." >&2
+        echo "    On Windows check whether the restart task ran:" >&2
+        echo "      Get-ScheduledTaskInfo -TaskName 'multiSSH agent restart'" >&2
+        FAILED="$FAILED $name"
     else
         echo "    did NOT come back current within ${WAIT_SECONDS}s" >&2
         echo "    the previous binary is still on that machine: --rollback" >&2
