@@ -84,31 +84,42 @@ targets() {
         }'
 }
 
-# The saved installer lives beside the agent keys, and the command to run it
-# depends entirely on what shell is at the other end. A POSIX loop sent to a
-# Windows target is not a failure that degrades gracefully: PowerShell parses
-# it and prints a page of syntax errors while updating nothing.
-update_command() { # update_command PLATFORM
-    case "$1" in
-        windows)
-            cat <<'PS'
-$ErrorActionPreference='Stop'
-$dirs = @("$env:ProgramData\multiSSH", "$env:LOCALAPPDATA\multiSSH\state")
-foreach ($d in $dirs) {
-  $m = Join-Path $d 'manage.ps1'
-  if (Test-Path $m) { & ([scriptblock]::Create((Get-Content $m -Raw))) -Update -Yes; exit 0 }
-}
-Write-Host 'no multissh-agent install found on this machine'; exit 1
-PS
-            ;;
-        *)
-            cat <<'SH'
-for d in /var/lib/multissh-agent "$HOME/.config/multissh-agent" "/Library/Application Support/multissh-agent"; do
+# The command is passed as an argument to ssh, not fed to its stdin.
+#
+# With no command, ssh asks for a shell, and a shell is interactive: PowerShell
+# opens a prompt, echoes what arrives on stdin, and waits for more. It never
+# runs the script and never exits, so the update simply hung. It appeared to
+# work on Linux only because the update restarted the agent and killed the
+# session out from under itself.
+#
+# The payload is base64 so that neither shell has to survive the other's
+# quoting on the way through ssh: what crosses is [A-Za-z0-9+/=] and nothing
+# else.
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+POSIX_UPDATE='for d in /var/lib/multissh-agent "$HOME/.config/multissh-agent" "/Library/Application Support/multissh-agent"; do
     if [ -f "$d/manage.sh" ]; then exec sh "$d/manage.sh" --update -y; fi
 done
 echo "no multissh-agent install found on this machine" >&2
-exit 1
-SH
+exit 1'
+
+WINDOWS_UPDATE='$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+foreach ($d in @("$env:ProgramData\multiSSH", "$env:LOCALAPPDATA\multiSSH\state")) {
+    $m = Join-Path $d "manage.ps1"
+    if (Test-Path $m) { & ([scriptblock]::Create((Get-Content $m -Raw))) -Update -Yes; exit 0 }
+}
+Write-Host "no multissh-agent install found on this machine"
+exit 1'
+
+update_command() { # update_command PLATFORM
+    case "$1" in
+        windows)
+            printf "\$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'));Invoke-Expression \$s" \
+                "$(b64 "$WINDOWS_UPDATE")"
+            ;;
+        *)
+            printf "echo %s | base64 -d | sh" "$(b64 "$POSIX_UPDATE")"
             ;;
     esac
 }
@@ -175,9 +186,13 @@ for entry in $TODO; do
         continue
     fi
 
-    if ! update_command "$platform" | run_bounded "$CMD_TIMEOUT" \
+    # The agent always allocates a pseudo-terminal, even for a command, so
+    # Windows sends ConPTY setup sequences before anything readable. Strip
+    # them rather than print them.
+    if ! run_bounded "$CMD_TIMEOUT" \
             $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
-            "update@$name" 2>&1 | sed 's/^/    /'; then
+            "update@$name" "$(update_command "$platform")" 2>&1 |
+            sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/^/    /'; then
         # The agent restarts as the last thing it does, so the session is very
         # often cut off mid-sentence. Whether this worked is decided by the
         # machine coming back, not by an exit status from a command that
