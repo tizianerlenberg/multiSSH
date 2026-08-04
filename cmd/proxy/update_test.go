@@ -704,3 +704,20 @@ func TestPowerShellRunsTheAgentThroughStartProcess(t *testing.T) {
 		t.Error("the agent's arguments are not explicitly quoted; a user profile path containing a space would be split")
 	}
 }
+
+// Invoke-WebRequest draws a progress bar unless told not to, and over a
+// pseudo-terminal that is thousands of lines of redrawn counters -- which is
+// exactly what an update driven over the tunnel sees, burying whatever the
+// installer had to say. It also makes the download much slower.
+func TestPowerShellSilencesTheProgressBar(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+	if !strings.Contains(script, "$ProgressPreference = 'SilentlyContinue'") {
+		t.Error("install.ps1 does not silence the progress bar")
+	}
+	// Before the first download, or it does nothing.
+	pref := strings.Index(script, "$ProgressPreference")
+	dl := strings.Index(script, "Invoke-WebRequest")
+	if pref < 0 || dl < 0 || pref > dl {
+		t.Error("the progress preference is set after the first web request")
+	}
+}

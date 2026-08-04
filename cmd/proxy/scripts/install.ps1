@@ -38,6 +38,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Invoke-WebRequest draws a progress bar by default, and over a pseudo-terminal
+# that becomes thousands of lines of redrawn counters -- which is what an update
+# driven over the tunnel actually sees, burying whatever it needed to say. It
+# also makes the download dramatically slower.
+$ProgressPreference = 'SilentlyContinue'
+
 $BaseUrl  = '__BASE_URL__'
 $Proxies  = '__PROXIES__'
 $CaKey    = '__CA__'
