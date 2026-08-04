@@ -59,8 +59,24 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$STATE/dist"
+
+# The proxy treats a missing users file as a configuration error and exits, so
+# it has to exist before the service is started or the first install would
+# crash-loop and this script would report a proxy that will not run. Empty is
+# the right starting state: it means nobody can use the proxy yet, while agents
+# can still register.
+if [ ! -f "$STATE/users_authorized_keys" ]; then
+    cat > "$STATE/users_authorized_keys" <<'EOF'
+# Public keys allowed to use this proxy, one per line, ordinary
+# authorized_keys format. Until one is here, nobody can connect.
+#
+#   ssh-ed25519 AAAA... you@yourlaptop
+EOF
+fi
+
 chown -R "$USER_NAME:$USER_NAME" "$STATE"
 chmod 0750 "$STATE"
+chmod 0640 "$STATE/users_authorized_keys"
 
 # ---------------------------------------------------------------- binaries
 
@@ -167,15 +183,21 @@ fi
 if [ -n "$FIRST_RUN" ]; then
     systemctl start multissh-proxy
     echo
-    echo "  installed. Before it is useful:"
+    echo "  installed and running. It is not useful yet -- three things left:"
     echo
-    echo "    1. authorise your key:"
-    echo "         cat >> $STATE/users_authorized_keys   # paste your public key"
-    echo "         chown $USER_NAME:$USER_NAME $STATE/users_authorized_keys"
-    echo "    2. create an enrolment password:"
-    echo "         sudo -u $USER_NAME $BIN -passwords $STATE/enrol_passwords.json -add-password laptops"
-    echo "    3. trust the authority from your own machine:"
-    echo "         echo \"@cert-authority <host> \$(sudo -u $USER_NAME $BIN -ca-key $STATE/proxy_ca_key -show-ca)\" >> ~/.ssh/known_hosts"
+    echo "    1. authorise your own key, or nobody can connect:"
+    echo "         echo 'ssh-ed25519 AAAA... you' >> $STATE/users_authorized_keys"
+    echo "         systemctl reload multissh-proxy   # no agent loses its connection"
+    echo
+    echo "    2. create an enrolment password, or no machine can enrol:"
+    echo "         sudo -u $USER_NAME $BIN -passwords $STATE/enrol_passwords.json \\"
+    echo "              -add-password laptops -password-validity 720h"
+    echo
+    echo "    3. take the authority's public key back to your own machine:"
+    echo "         sudo -u $USER_NAME $BIN -ca-key $STATE/proxy_ca_key -show-ca"
+    echo
+    echo "       and put it in ~/.ssh/known_hosts there as:"
+    echo "         @cert-authority [<host>]:<port> ssh-ed25519 AAAA..."
     echo
 elif [ -n "$BINARY_CHANGED" ]; then
     # A new binary needs a real restart. Agents reconnect on their own within

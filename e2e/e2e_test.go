@@ -676,6 +676,64 @@ func TestBuildReportingAndReloadWithoutDisconnecting(t *testing.T) {
 	}
 }
 
+// A fresh install has no authorised users yet: install-proxy.sh creates the
+// file empty and you add your key afterwards. The proxy must come up in that
+// state -- it used to treat the missing file as fatal, so a first deployment
+// crash-looped -- and must pick up a key without a restart, because restarting
+// to authorise a person costs every agent its connection.
+func TestProxyStartsWithNoAuthorisedUsersAndReloadsThem(t *testing.T) {
+	f := setup(t)
+
+	users := filepath.Join(f.dir, "users_authorized_keys")
+	if err := os.WriteFile(users, []byte("# nobody yet\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f.startProxy()
+	f.startAgent()
+
+	// Agents register regardless: they authenticate by certificate, not by
+	// anything in this file. A proxy with no users is still collecting targets.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(f.proxyLog.String(), "agent registered") {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !strings.Contains(f.proxyLog.String(), "agent registered") {
+		t.Fatalf("the agent never registered against a proxy with no users:\n%s", f.proxyLog.String())
+	}
+
+	// Nobody can log in yet, though.
+	if _, err := ssh.Dial("tcp", f.userAddr, &ssh.ClientConfig{
+		User:            "me",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(f.userKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}); err == nil {
+		t.Error("a proxy with an empty users file let someone in")
+	}
+
+	// Authorise the key and reload rather than restart.
+	if err := os.WriteFile(users, ssh.MarshalAuthorizedKey(f.userKey.PublicKey()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.proxyCmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+
+	c := f.dialProxy()
+	if listing := f.shellListing(c); !strings.Contains(listing, f.canonical) {
+		t.Errorf("could not list targets after authorising a key by reload:\n%s", listing)
+	}
+	// And nobody was disconnected to do it.
+	if n := strings.Count(f.agentLog.String(), "registered with proxy"); n != 1 {
+		t.Errorf("the agent registered %d times across a users reload, want 1", n)
+	}
+}
+
 func TestHealthzReportsWithoutNamingTargets(t *testing.T) {
 	f := setup(t)
 	f.startProxy()
