@@ -7,7 +7,7 @@ import (
 )
 
 func TestVersionStringsRoundTrip(t *testing.T) {
-	if got := ParseAgentVersion([]byte(AgentVersion(""))); got != ProtocolVersion {
+	if got := ParseAgentVersion([]byte(AgentVersion("", ""))); got != ProtocolVersion {
 		t.Errorf("agent version round-tripped to %d, want %d", got, ProtocolVersion)
 	}
 	if got := ParseProxyVersion([]byte(ProxyVersion())); got != ProtocolVersion {
@@ -15,7 +15,7 @@ func TestVersionStringsRoundTrip(t *testing.T) {
 	}
 	// An agent must not read as a proxy or the floor check would pass for the
 	// wrong peer.
-	if got := ParseProxyVersion([]byte(AgentVersion(""))); got != LegacyProtocol {
+	if got := ParseProxyVersion([]byte(AgentVersion("", ""))); got != LegacyProtocol {
 		t.Errorf("an agent identification parsed as proxy version %d", got)
 	}
 }
@@ -24,7 +24,7 @@ func TestVersionStringsRoundTrip(t *testing.T) {
 // version. Getting this wrong would produce an identification string some
 // implementations reject outright.
 func TestVersionStringsAreLegal(t *testing.T) {
-	for _, v := range []string{AgentVersion(""), ProxyVersion()} {
+	for _, v := range []string{AgentVersion("", ""), ProxyVersion()} {
 		if len(v) < 8 || v[:8] != "SSH-2.0-" {
 			t.Errorf("%q does not begin with SSH-2.0-", v)
 		}
@@ -51,7 +51,7 @@ func TestUnknownIdentificationReadsAsLegacy(t *testing.T) {
 		}
 	}
 	// A trailing comment is allowed by the RFC and must not defeat parsing.
-	if got := ParseAgentVersion([]byte(AgentVersion("") + " some comment")); got != ProtocolVersion {
+	if got := ParseAgentVersion([]byte(AgentVersion("", "") + " some comment")); got != ProtocolVersion {
 		t.Errorf("a commented identification parsed as %d", got)
 	}
 }

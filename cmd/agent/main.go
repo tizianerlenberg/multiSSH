@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -56,9 +57,24 @@ func main() {
 		idCert    = flag.String("identity-cert", "agent_identity-cert.pub", "certificate naming this machine, issued by the proxy")
 		caFile    = flag.String("ca", "proxy_ca.pub", "the proxy's certificate authority, pinned")
 		showKeys  = flag.Bool("show-keys", false, "create the keys if absent, print their public halves, and exit")
+		logFile   = flag.String("log", "", "append logs to this file instead of stderr")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
+
+	// The Windows build is linked as a GUI binary so that starting it does not
+	// open a console window -- one that anybody could then close, taking the
+	// agent with it. That leaves it with no usable stderr, so on Windows this
+	// is the only place its logs can go, and the installer always passes it.
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Fatalf("log file: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+		log.SetFlags(log.Ldate | log.Ltime)
+	}
 
 	idSigner, err := sshx.LoadOrCreateHostKey(*identity)
 	if err != nil {
@@ -116,7 +132,7 @@ func main() {
 		// The identification string carries the protocol version, so a proxy
 		// too new for this agent can say so before authentication rather than
 		// failing in some later, less legible way.
-		ClientVersion:   sshx.AgentVersion(ownBuildID()),
+		ClientVersion:   sshx.AgentVersion(ownBuildID(), runtime.GOOS),
 		HostKeyCallback: hostKeyCB,
 		// Whatever the proxy refuses us for, it says here. Without this the
 		// message would be discarded and the operator would see only that
@@ -129,7 +145,8 @@ func main() {
 		},
 		Timeout: 10 * time.Second,
 	}
-	log.Printf("protocol %s, build %s", sshx.DescribeProtocol(sshx.ProtocolVersion), ownBuildID())
+	log.Printf("protocol %s, build %s, platform %s/%s",
+		sshx.DescribeProtocol(sshx.ProtocolVersion), ownBuildID(), runtime.GOOS, runtime.GOARCH)
 
 	// Hold a registration open with every proxy at once rather than failing
 	// over between them. One certificate is valid at all of them, so this
@@ -145,15 +162,25 @@ func main() {
 		log.Fatal("-proxy is required, e.g. wss://multissh.example.com/agent")
 	}
 
-	var wg sync.WaitGroup
-	for _, p := range proxies {
-		wg.Add(1)
-		go func(target string) {
-			defer wg.Done()
-			maintain(target, *proxyHost, clientCfg, hostSigner, *authKeys)
-		}(p)
+	work := func() {
+		var wg sync.WaitGroup
+		for _, p := range proxies {
+			wg.Add(1)
+			go func(target string) {
+				defer wg.Done()
+				maintain(target, *proxyHost, clientCfg, hostSigner, *authKeys)
+			}(p)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
+
+	// On Windows a machine-wide install runs under the service control
+	// manager, which has to be answered or it kills the process for not
+	// responding. Everywhere else, and for a Windows user install, this is a
+	// no-op and the work simply runs.
+	if !runAsServiceIfNeeded(work) {
+		work()
+	}
 }
 
 // ownBuildID hashes this executable, so a machine reports the binary it is

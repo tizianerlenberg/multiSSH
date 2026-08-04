@@ -37,10 +37,10 @@ func TestReconnectReplacesGhost(t *testing.T) {
 	reg := newRegistry()
 	ghost, live := &fakeConn{}, &fakeConn{}
 
-	if err := reg.add("laptop.abc", ghost, "SHA256:same", 1, ""); err != nil {
+	if err := reg.add("laptop.abc", ghost, "SHA256:same", 1, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.add("laptop.abc", live, "SHA256:same", 1, ""); err != nil {
+	if err := reg.add("laptop.abc", live, "SHA256:same", 1, "", ""); err != nil {
 		t.Fatalf("same machine was refused on reconnect: %v", err)
 	}
 
@@ -64,10 +64,10 @@ func TestDifferentKeyCannotStealAName(t *testing.T) {
 	reg := newRegistry()
 	holder, impostor := &fakeConn{}, &fakeConn{}
 
-	if err := reg.add("laptop", holder, "SHA256:mine", 1, ""); err != nil {
+	if err := reg.add("laptop", holder, "SHA256:mine", 1, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	err := reg.add("laptop", impostor, "SHA256:theirs", 1, "")
+	err := reg.add("laptop", impostor, "SHA256:theirs", 1, "", "")
 	if err == nil {
 		t.Fatal("a different key was allowed to take a held name")
 	}
@@ -86,8 +86,8 @@ func TestRemoveOnlyAffectsTheCurrentConnection(t *testing.T) {
 	reg := newRegistry()
 	ghost, live := &fakeConn{}, &fakeConn{}
 
-	reg.add("laptop.abc", ghost, "SHA256:same", 1, "")
-	reg.add("laptop.abc", live, "SHA256:same", 1, "")
+	reg.add("laptop.abc", ghost, "SHA256:same", 1, "", "")
+	reg.add("laptop.abc", live, "SHA256:same", 1, "", "")
 
 	// The ghost's handler now unwinds and cleans up after itself.
 	reg.remove("laptop.abc", ghost)
@@ -109,9 +109,9 @@ func TestListingPairsNames(t *testing.T) {
 	reg := newRegistry()
 	one, two := &fakeConn{}, &fakeConn{}
 
-	reg.add("laptop.aaaa", one, "SHA256:one", 1, "")
-	reg.add("laptop", one, "SHA256:one", 1, "")
-	reg.add("server.bbbb", two, "SHA256:two", 0, "") // no friendly name
+	reg.add("laptop.aaaa", one, "SHA256:one", 1, "", "")
+	reg.add("laptop", one, "SHA256:one", 1, "", "")
+	reg.add("server.bbbb", two, "SHA256:two", 0, "", "") // no friendly name
 
 	list := reg.listing()
 	if len(list) != 2 {
@@ -134,8 +134,8 @@ func TestListingPairsNames(t *testing.T) {
 func TestConnectionsDeduplicates(t *testing.T) {
 	reg := newRegistry()
 	conn := &fakeConn{}
-	reg.add("laptop.aaaa", conn, "SHA256:one", 1, "")
-	reg.add("laptop", conn, "SHA256:one", 1, "")
+	reg.add("laptop.aaaa", conn, "SHA256:one", 1, "", "")
+	reg.add("laptop", conn, "SHA256:one", 1, "", "")
 
 	got := reg.connections()
 	if len(got) != 1 {
@@ -152,9 +152,9 @@ func TestConnectionsDeduplicates(t *testing.T) {
 func TestSetHostFPCoversEveryNameOfOneMachine(t *testing.T) {
 	reg := newRegistry()
 	conn, other := &fakeConn{}, &fakeConn{}
-	reg.add("laptop.aaaa", conn, "SHA256:one", 1, "")
-	reg.add("laptop", conn, "SHA256:one", 1, "")
-	reg.add("server.bbbb", other, "SHA256:two", 1, "")
+	reg.add("laptop.aaaa", conn, "SHA256:one", 1, "", "")
+	reg.add("laptop", conn, "SHA256:one", 1, "", "")
+	reg.add("server.bbbb", other, "SHA256:two", 1, "", "")
 
 	reg.setHostFP(conn, "SHA256:hostkey")
 
