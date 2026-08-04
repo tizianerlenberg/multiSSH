@@ -316,12 +316,22 @@ if (-not $Name) {
 Write-Host ""
 Write-Host "  install to   $Binary"
 Write-Host "  state in     $StateDir"
+# The scope is named, not merely implied by its consequences. It was chosen for
+# you from whether this shell is elevated, so the summary has to say which way
+# that went and how to get the other -- otherwise the only way to find out is
+# to finish the install and notice what you ended up with.
 if ($Scope -eq 'system') {
-    Write-Host "  service      scheduled task at boot, as SYSTEM"
+    Write-Host "  scope        system, as SYSTEM, started at boot"
     Write-Host "  reachable    always, including before anyone logs in"
+    Write-Host "  note         no user profile: winget and other per-user tools"
+    Write-Host "               are not on SYSTEM's PATH"
 } else {
-    Write-Host "  service      scheduled task at logon, as $env:USERNAME"
+    Write-Host "  scope        user, as $env:USERNAME, started at logon"
     Write-Host "  reachable    only while you are logged in"
+    if (-not $elevated) {
+        Write-Host "               (chosen because this shell is not elevated;"
+        Write-Host "                run as Administrator for a system install)"
+    }
 }
 Write-Host "  proxy        $Proxies"
 Write-Host "  name         $Name"
