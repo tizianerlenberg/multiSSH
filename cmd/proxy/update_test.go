@@ -676,3 +676,31 @@ func TestPowerShellUninstallKillsTheRunningAgent(t *testing.T) {
 		t.Error("agent processes are matched by name alone; uninstalling one scope would kill the other")
 	}
 }
+
+// Regression. Linking the Windows agent as a GUI binary -- so it never opens a
+// console window a user could close -- broke reading its output: PowerShell
+// only waits for and captures console applications, so `& $Binary -show-keys`
+// returned immediately with nothing, and the install failed at enrolment with
+// "the agent could not generate its keys".
+func TestPowerShellRunsTheAgentThroughStartProcess(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+
+	if strings.Contains(script, "& $Binary -show-keys") {
+		t.Error("the agent is invoked with & , which neither waits for nor captures a GUI-subsystem binary")
+	}
+	if !strings.Contains(script, "Start-Process -FilePath $Binary") {
+		t.Error("the agent is not run through Start-Process")
+	}
+	for _, want := range []string{"-Wait -PassThru", "-RedirectStandardOutput $out"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Invoke-Agent is missing %q", want)
+		}
+	}
+
+	// Windows PowerShell does not quote array elements, and these paths live
+	// under a user profile -- "C:\Users\Firstname Lastname\..." would arrive
+	// as two arguments.
+	if !strings.Contains(script, `'-show-keys -identity "{0}" -host-key "{1}"' -f $idPath, $hostPath`) {
+		t.Error("the agent's arguments are not explicitly quoted; a user profile path containing a space would be split")
+	}
+}
