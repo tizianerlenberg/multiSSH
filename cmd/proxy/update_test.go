@@ -783,3 +783,40 @@ func TestPowerShellUnblocksTheDownloadedBinary(t *testing.T) {
 		t.Error("the warning does not name the error code the failure actually shows up as")
 	}
 }
+
+// Regression. The restart could not be done from inside the update, because
+// the update runs in a session hosted by the very process being restarted:
+// stopping the agent destroys the pseudo-console the script is attached to and
+// takes the script with it -- after the binary is swapped and before anything
+// is started again. Both Windows machines ended up installed, registered and
+// not running that way.
+func TestPowerShellRestartsFromOutsideTheSession(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+	restart := section(t, script, `^function Restart-Agent\(\$argline\) \{`, `^\}`)
+
+	// It must schedule, not stop.
+	if !strings.Contains(restart, "Register-ScheduledTask -TaskName $RestartTaskName") {
+		t.Error("Restart-Agent does not hand the restart to Task Scheduler")
+	}
+	for _, forbidden := range []string{"Stop-Agent", "Stop-Service", "Start-Agent"} {
+		if strings.Contains(restart, forbidden) {
+			t.Errorf("Restart-Agent calls %s inline; stopping the agent kills the script doing it", forbidden)
+		}
+	}
+	// EncodedCommand, because the command carries quotes and a path.
+	if !strings.Contains(restart, "-EncodedCommand $enc") {
+		t.Error("the scheduled command is not encoded, so quoting decides whether it runs")
+	}
+
+	// And the other half: a -StartOnly mode for the task to invoke, which does
+	// the stop and start and then removes itself.
+	if !strings.Contains(script, "if ($StartOnly) {") {
+		t.Error("there is no -StartOnly mode for the scheduled task to call")
+	}
+	only := section(t, script, `^if \(\$StartOnly\) \{`, `^\}`)
+	for _, want := range []string{"Stop-Agent", "Start-Agent $m.args", "Unregister-ScheduledTask"} {
+		if !strings.Contains(only, want) {
+			t.Errorf("-StartOnly is missing %q", want)
+		}
+	}
+}

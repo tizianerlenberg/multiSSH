@@ -528,7 +528,11 @@ sh /var/lib/multissh-agent/manage.sh --uninstall
 ```
 
 **These are safe to run over the tunnel itself**, which matters because for a
-machine behind NAT that is the only way to reach it. See
+machine behind NAT that is the only way to reach it. On Windows the restart is
+handed to Task Scheduler as a one-shot task rather than performed in place: the
+session is hosted by the process being restarted, so stopping it would kill the
+update halfway through. The agent returns a few seconds after the command
+finishes. See
 [Updating agents](#updating-agents) for why that took some doing.
 
 Piped from curl, options go after `--`:
