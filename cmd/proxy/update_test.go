@@ -756,3 +756,30 @@ func TestUpdateScriptNeverAllocatesATerminal(t *testing.T) {
 		}
 	}
 }
+
+// The agent is not code signed, and Windows blocks what it cannot attribute to
+// a publisher. A fresh install survived that; every update wrote a new
+// unrecognised file, downloaded from the internet and tagged as such, and the
+// machine stopped coming back -- reported only as scheduled task result
+// 0x800704C7, which says nothing about why.
+func TestPowerShellUnblocksTheDownloadedBinary(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+
+	if !strings.Contains(script, "Unblock-File -Path $Binary") {
+		t.Error("the downloaded binary keeps its Mark of the Web, which is what turns 'unknown publisher' into 'blocked'")
+	}
+	// After the swap, not before: unblocking the temporary file would be undone
+	// by the rename.
+	unblock := strings.Index(script, "Unblock-File -Path $Binary")
+	move := strings.Index(script, "Move-Item -Force $new $Binary")
+	if move < 0 || unblock < move {
+		t.Error("the binary is unblocked before it is moved into place")
+	}
+
+	if !strings.Contains(script, "VerifiedAndReputablePolicyState") {
+		t.Error("Smart App Control is never checked, so being blocked by it looks like an unexplained failure")
+	}
+	if !strings.Contains(script, "0x800704C7") {
+		t.Error("the warning does not name the error code the failure actually shows up as")
+	}
+}

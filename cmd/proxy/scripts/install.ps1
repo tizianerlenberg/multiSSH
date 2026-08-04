@@ -222,6 +222,12 @@ function Download-Binary {
         Move-Item -Force $Binary "$Binary.prev"
     }
     Move-Item -Force $new $Binary
+
+    # Strip the Mark of the Web. Invoke-WebRequest tags what it downloads as
+    # having come from the internet, and that tag is what pushes SmartScreen
+    # and Smart App Control from "unknown" to "blocked". A freshly installed
+    # agent survived it; every updated one was a new unrecognised file again.
+    Unblock-File -Path $Binary -ErrorAction SilentlyContinue
 }
 
 # Key files must be plain ASCII. Set-Content's default encoding differs between
@@ -255,6 +261,43 @@ function Invoke-Agent($argstring) {
     } finally {
         Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
     }
+}
+
+# Smart App Control blocks executables it cannot attribute to a known
+# publisher. The agent is not code signed -- signing needs a certificate this
+# project does not have -- so on a machine with it enforced the agent will be
+# stopped from starting, with Task Scheduler reporting 0x800704C7
+# (ERROR_CANCELLED) and nothing anywhere saying why.
+#
+# Worth reporting rather than letting it be discovered as a machine that
+# quietly stops coming back after an update.
+function Get-SmartAppControlState {
+    try {
+        $v = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' `
+              -Name 'VerifiedAndReputablePolicyState' -ErrorAction Stop).VerifiedAndReputablePolicyState
+        switch ($v) {
+            0 { 'off' }
+            1 { 'enforced' }
+            2 { 'evaluation' }
+            default { "unknown ($v)" }
+        }
+    } catch {
+        'off'   # the value is absent on Windows 10 and Server, where there is no such thing
+    }
+}
+
+function Warn-IfBlocked {
+    $sac = Get-SmartAppControlState
+    if ($sac -eq 'off') { return }
+    Write-Host ""
+    Write-Host "  NOTE: Smart App Control is $sac on this machine." -ForegroundColor Yellow
+    Write-Host "  The agent is not code signed, so it may be blocked from starting."
+    Write-Host "  A blocked start shows up as scheduled task result 0x800704C7 and an"
+    Write-Host "  agent that never reconnects. If that happens, either exclude"
+    Write-Host "    $Binary"
+    Write-Host "  in Windows Security, or turn Smart App Control off (Settings ->"
+    Write-Host "  Privacy & security -> Windows Security -> App & browser control)."
+    Write-Host ""
 }
 
 function Write-KeyFile($path, $content) {
@@ -417,6 +460,7 @@ if ($existing -and -not $Reenroll) {
     $existing | ConvertTo-Json | Set-Content $Manifest
     Restart-Agent $existing.args
     Write-Host "updated to $Version; keys and certificate untouched"
+    Warn-IfBlocked
     exit 0
 }
 
@@ -560,6 +604,7 @@ try { Invoke-WebRequest -Uri "$BaseUrl/install.ps1" -OutFile (Join-Path $StateDi
 Start-Agent $argline
 
 Write-Host ""
+Warn-IfBlocked
 Write-Host "  installed and running"
 Write-Host ""
 Write-Host "  canonical  $($resp.canonical)   always works"
