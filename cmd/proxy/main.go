@@ -50,6 +50,57 @@ const (
 	authFailBurst  = 10
 )
 
+// slots bounds how many connections may be in flight on one listener.
+//
+// Every accepted connection costs a goroutine, a socket and, once
+// authenticated, whatever the session holds. Nothing capped that, so a single
+// user key -- or anyone at all, since an unauthenticated connection is
+// accepted before it proves anything -- could open sockets until the proxy ran
+// out of memory and took every registered target down with it.
+//
+// A counting semaphore rather than a rate limit: the concern is how many exist
+// at once, not how fast they arrive. The two limits complement each other,
+// which is why both are here.
+type slots struct {
+	ch   chan struct{}
+	kind string
+}
+
+func newSlots(n int, kind string) *slots {
+	if n <= 0 {
+		return nil // unlimited
+	}
+	return &slots{ch: make(chan struct{}, n), kind: kind}
+}
+
+// take reports whether a slot was free. It never waits: a caller made to queue
+// would hold the socket open anyway, which is the resource being protected.
+func (s *slots) take() bool {
+	if s == nil {
+		return true
+	}
+	select {
+	case s.ch <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *slots) give() {
+	if s == nil {
+		return
+	}
+	<-s.ch
+}
+
+func (s *slots) inUse() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.ch)
+}
+
 // authFailures counts recent failed handshakes per source address, so a host
 // that keeps guessing is turned away before the expensive part.
 var authFailures = newLimiter(authFailWindow, authFailBurst)
@@ -228,7 +279,9 @@ func main() {
 		// the version handshake existed. Refusing old agents strands machines
 		// nobody is going to walk over to, so it stays a decision taken
 		// deliberately here rather than one a proxy upgrade makes for you.
-		minProto = flag.Int("min-agent-protocol", sshx.LegacyProtocol, "refuse agents older than this protocol version")
+		maxUsers  = flag.Int("max-user-connections", 64, "connections in flight on the user listener; 0 is unlimited")
+		maxAgents = flag.Int("max-agent-connections", 2048, "connections in flight on the agent listener; 0 is unlimited")
+		minProto  = flag.Int("min-agent-protocol", sshx.LegacyProtocol, "refuse agents older than this protocol version")
 
 		showCA        = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
 		signKey       = flag.String("sign", "", "issue a certificate for this public key file, then exit")
@@ -612,12 +665,19 @@ func main() {
 		}
 	}()
 
+	// The agent limit is generous and the user limit is not: agents are the
+	// population this exists to serve and each holds one long-lived
+	// connection, while user connections are few, short, and the cheaper thing
+	// to lose if someone is being a nuisance.
+	agentSlots := newSlots(*maxAgents, "agent")
+	userSlots := newSlots(*maxUsers, "user")
+
 	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler,
-		serveHealth(reg, seen, revoked, dist, *staleAfter), extra)
+		serveHealth(reg, seen, revoked, dist, *staleAfter), extra, agentSlots)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleUser(reg, seen, dist, *staleAfter, c, chans, reqs)
-	})
+	}, userSlots)
 }
 
 // issueCert signs a public key and writes "<path>-cert.pub" beside it, the
@@ -701,8 +761,14 @@ type connHandler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Reques
 
 // takeConn runs the SSH server handshake over any transport: a plain socket,
 // or a WebSocket presented as a net.Conn.
-func takeConn(nc net.Conn, kind string, cfg *ssh.ServerConfig, h connHandler) {
+func takeConn(nc net.Conn, kind string, cfg *ssh.ServerConfig, h connHandler, limit *slots) {
 	defer nc.Close()
+
+	if !limit.take() {
+		log.Printf("%s refusing %s: %d connections already in flight", kind, nc.RemoteAddr(), limit.inUse())
+		return
+	}
+	defer limit.give()
 
 	peer := sourceHost(nc.RemoteAddr())
 	if authFailures.count(peer) >= authFailBurst {
@@ -726,7 +792,7 @@ func takeConn(nc net.Conn, kind string, cfg *ssh.ServerConfig, h connHandler) {
 	h(conn, chans, reqs)
 }
 
-func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler) {
+func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler, limit *slots) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
@@ -738,7 +804,7 @@ func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler) {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go takeConn(nc, kind, cfg, h)
+		go takeConn(nc, kind, cfg, h, limit)
 	}
 }
 
@@ -815,7 +881,7 @@ func serveHealth(reg *registry, seen *sightings, revoked *revocations, dist *dis
 	}
 }
 
-func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, health http.HandlerFunc, extra *httpExtras) {
+func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, health http.HandlerFunc, extra *httpExtras, limit *slots) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", health)
 	if extra != nil {
@@ -839,7 +905,7 @@ func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandle
 		}
 		// Binary frames, and a context that outlives the handshake so the
 		// session is not cancelled underneath us.
-		takeConn(websocket.NetConn(context.Background(), c, websocket.MessageBinary), kind, cfg, h)
+		takeConn(websocket.NetConn(context.Background(), c, websocket.MessageBinary), kind, cfg, h, limit)
 	})
 
 	// No server-wide timeouts: these connections are meant to stay open.
