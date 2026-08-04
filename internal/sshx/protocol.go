@@ -164,3 +164,42 @@ func DescribeProtocol(v int) string {
 	}
 	return fmt.Sprintf("v%d", v)
 }
+
+// HostKeyRequestType is a global request the agent sends immediately after
+// registering, telling the proxy which host key its embedded SSH server will
+// present.
+//
+// The proxy cannot work this out for itself: the canonical name commits to the
+// host key through a one-way hash, and a hash cannot be run backwards. Without
+// being told, the proxy has nothing to show a user who wants to confirm, on
+// first connect, that the key being offered is the right one -- and the name's
+// own hash is no help there, being a different function in a different alphabet
+// from the fingerprint ssh prints.
+//
+// An agent predating this sends nothing, and the listing simply has no host key
+// to show for it.
+const HostKeyRequestType = "hostkey@multissh"
+
+// HostKeyReport carries the agent's host public key in SSH wire format.
+type HostKeyReport struct {
+	Key   []byte
+	Extra []byte
+}
+
+// MarshalHostKeyReport builds the payload for a host key.
+func MarshalHostKeyReport(key ssh.PublicKey) []byte {
+	return ssh.Marshal(HostKeyReport{Key: key.Marshal()})
+}
+
+// ParseHostKeyReport reads one back, returning nil for anything unreadable.
+func ParseHostKeyReport(payload []byte) ssh.PublicKey {
+	var r HostKeyReport
+	if len(payload) == 0 || ssh.Unmarshal(payload, &r) != nil {
+		return nil
+	}
+	key, err := ssh.ParsePublicKey(r.Key)
+	if err != nil {
+		return nil
+	}
+	return key
+}

@@ -286,6 +286,18 @@ func session(addr, wsHost string, cfg *ssh.ClientConfig, hostSigner ssh.Signer, 
 	}
 	log.Printf("registered with proxy at %s", addr)
 
+	// Tell the proxy which host key this machine's embedded server presents.
+	// It cannot derive that from the canonical name -- the name commits to the
+	// key through a one-way hash -- and without it the listing has nothing to
+	// show someone confirming the key ssh offers on first connect.
+	//
+	// Sent, not asked for: the proxy checks it against the name before
+	// believing it, so a wrong one is caught there rather than trusted here.
+	if _, _, err := client.SendRequest(sshx.HostKeyRequestType, false,
+		sshx.MarshalHostKeyReport(hostSigner.PublicKey())); err != nil {
+		log.Printf("could not report the host key: %v", err)
+	}
+
 	// Keep the NAT mapping alive from the inside; consumer routers can expire
 	// idle entries in well under a minute.
 	go func() {
