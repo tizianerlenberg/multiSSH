@@ -136,31 +136,44 @@ start if its certificate does not match its own host key.
 
 ```bash
 $ ssh proxy
+
  multiSSH proxy
 
- registered targets (2):
+ ONLINE (2)
 
-   homeserver           homeserver.4kfq2wtnbxue  v1    current
-     SHA256:0kA1pS9vHhLmXqR7dTgWc2ZuYbN4eJf6oPiK3sVrQ8w
-   laptop               laptop.niwru7dfuvu5abcd  v1    OUTDATED
-     SHA256:2LnQxYd8vTgMhR6pW3kZjB5cFsN1eUaHo9KiV7rXmY0
+   homeserver       homeserver.4kfq2wtnbxue       v1 current
+       host key  SHA256:/XmRlLQzuatMnjzd87t4qacwiU+MNBNBwdkce60vTz4
+       identity  SHA256:RJFA4HSiW9NQTFaJxSkTq1Zeu2dDIKpQIJjmO8yxe3Q
+   rosa-maria-lapt  rosa-maria-lapt.2pw3653v75s3  v1 OUTDATED
+       host key  SHA256:S24BJx1KW8bOzfIfTjNSByiP22NMpgLiJ3R/XpGwbtA
+       identity  SHA256:A/i8701DJUjVoBfI04Ae16VrJBpXDLA7p/yWs8EUu3Y
 
- connect with:  ssh -J proxy user@laptop
+ NOT CONNECTED (1)
 
- not connected (1):
+   ! oldbox.7hs3kqp2mfxa   last seen 94d ago
 
- ! oldbox.7hs3kqp2mfxa       last seen 94d ago
+   ! not seen in over 720h0m0s
 
- ! not seen in 720h0m0s
+ CONNECT
 
-$ ssh -J proxy tizian@laptop
+   ssh -J <thisproxy> user@homeserver
+
+$ ssh -J proxy tizian@homeserver
 tizian@target:~$
 ```
 
-The second line under each target is its **identity fingerprint**, which is
-what [revocation](#revoking-a-machine) takes. `v1` is the agent's protocol
-version, and `current`/`OUTDATED` says whether the machine is running a binary
-this proxy still serves — see [updating agents](#updating-agents).
+Each target shows **two different keys**, which is worth being clear about
+because they are easy to confuse and only one of them is for verifying:
+
+- **host key** — the target's SSH host key, the one your client checks. This is
+  the string ssh prints on first connect, in exactly this format. Compare them,
+  or paste it into ssh's `(yes/no/[fingerprint])` prompt and let ssh do it.
+- **identity** — a different key, used to authenticate the agent *to the proxy*.
+  It is the handle [`-revoke`](#revoking-a-machine) takes, and nothing else.
+
+`v1` is the agent's protocol version, and `current`/`OUTDATED` says whether the
+machine runs a binary this proxy still serves — see
+[updating agents](#updating-agents).
 
 ### What you get on Windows
 
@@ -277,8 +290,19 @@ The canonical name embeds a hash of the target's host key **and of its own
 label**, so it is unique by construction and needs no bookkeeping. More
 usefully, **the name commits to the key your client verifies**: no other machine
 can be given that name, because the string is derived from a key it does not
-hold. On the one connection where trust-on-first-use is exposed, you can check
-the fingerprint against the name you typed.
+hold.
+
+⚠️ The name's hash is **not** comparable by eye with what ssh prints. Both derive
+from the same host key, but through different functions and different alphabets:
+
+```
+sha256(key)              base64  3kii8sLzg3y2UzY4nmFwhzllHFj7lwCUDA5EB83tesk   <- ssh prints this
+sha256(domain|label|key) base32  p7tq2yx5krjg                                  <- the name uses this
+```
+
+To check the key on first connect, compare against the **host key** line in
+`ssh proxy`, which is the same string in the same format ssh prints — or paste
+it into ssh's `(yes/no/[fingerprint])` prompt and let ssh compare for you.
 
 The label goes into the hash as well as in front of it. Hashing the host key
 alone would leave the label free, so one machine could be presented under any

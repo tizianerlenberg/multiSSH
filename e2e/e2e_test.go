@@ -322,9 +322,13 @@ func (f *fixture) shellListing(c *ssh.Client) string {
 }
 
 // waitForTarget polls until name appears in the listing.
+//
+// The deadline is generous because `go test ./...` builds and runs every
+// package at once: the agent competes for CPU with whatever else is compiling,
+// and a tight bound here shows up as a test that fails only under load.
 func (f *fixture) waitForTarget(name string) string {
 	f.t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	var last string
 	for time.Now().Before(deadline) {
 		c := f.dialProxy()
@@ -731,6 +735,47 @@ func TestProxyStartsWithNoAuthorisedUsersAndReloadsThem(t *testing.T) {
 	// And nobody was disconnected to do it.
 	if n := strings.Count(f.agentLog.String(), "registered with proxy"); n != 1 {
 		t.Errorf("the agent registered %d times across a users reload, want 1", n)
+	}
+}
+
+// The check a person can actually make on first connect: ssh prints the
+// target's host key fingerprint, and the listing shows the same string. They
+// have to be byte-identical, because comparing them is the whole point --
+// the canonical name's own hash cannot serve, being a different function in a
+// different alphabet from anything ssh prints.
+func TestListingShowsTheHostKeyFingerprintSshWillPrint(t *testing.T) {
+	f := setup(t)
+	f.startProxy()
+	f.startAgent()
+	listing := f.waitForTarget(f.canonical)
+
+	// The agent's real host key, read from the file it was generated into.
+	hostSigner, err := sshx.LoadOrCreateHostKey(filepath.Join(f.dir, "agent_host_key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ssh.FingerprintSHA256(hostSigner.PublicKey())
+
+	if !strings.Contains(listing, "host key  "+want) {
+		t.Errorf("the listing does not show the host key fingerprint %s:\n%s", want, listing)
+	}
+	// And it must be distinguishable from the identity fingerprint, which is a
+	// different key entirely and is only the handle for -revoke.
+	if !strings.Contains(listing, "identity  "+f.agentFP) {
+		t.Errorf("the listing does not label the identity fingerprint:\n%s", listing)
+	}
+	if want == f.agentFP {
+		t.Fatal("host key and identity key are the same key; the whole distinction is gone")
+	}
+
+	// What ssh is offered on the wire must be that same key.
+	c := f.dialProxy()
+	_, served, err := f.jumpTo(c, f.canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ssh.FingerprintSHA256(served); got != want {
+		t.Errorf("the key served to the client is %s, but the listing advertised %s", got, want)
 	}
 }
 

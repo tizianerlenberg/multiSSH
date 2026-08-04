@@ -73,6 +73,11 @@ type registration struct {
 	fp    string
 	proto int
 	build string
+	// hostFP is the fingerprint of the agent's *host* key, as ssh prints it on
+	// first connect. Reported by the agent and checked against the canonical
+	// name before it is stored, so it can be compared with what a client is
+	// being offered.
+	hostFP string
 }
 
 // target is one row of the listing `ssh proxy` prints.
@@ -82,6 +87,7 @@ type target struct {
 	Proto     int
 	FP        string
 	Build     string
+	HostFP    string
 }
 
 // registry tracks which agents are currently connected. A target appears under
@@ -163,9 +169,24 @@ func (r *registry) listing() []target {
 			Proto:     reg.proto,
 			FP:        reg.fp,
 			Build:     reg.build,
+			HostFP:    reg.hostFP,
 		})
 	}
 	return out
+}
+
+// setHostFP records the agent's host key fingerprint against every name that
+// connection holds. It arrives as a separate request after registration, so it
+// cannot be set when the entry is created.
+func (r *registry) setHostFP(conn ssh.Conn, fp string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, reg := range r.m {
+		if reg.conn == conn {
+			reg.hostFP = fp
+			r.m[name] = reg
+		}
+	}
 }
 
 // connections returns every distinct live agent connection with its
@@ -783,9 +804,27 @@ func handleAgent(reg *registry, book *ledger, seen *sightings, conn *ssh.ServerC
 	proto, _ := strconv.Atoi(conn.Permissions.Extensions["proto"])
 	build := conn.Permissions.Extensions["build"]
 
-	// Answer keepalives; refuse everything else, including tcpip-forward.
+	// Answer keepalives, accept a host key report, refuse everything else --
+	// tcpip-forward included.
 	go func() {
 		for r := range reqs {
+			if r.Type == sshx.HostKeyRequestType {
+				// Believed only if it matches the name the agent is registered
+				// under. The name is derived from this very key, so a report
+				// that does not reproduce it is either a broken agent or one
+				// claiming to be a machine it is not.
+				if key := sshx.ParseHostKeyReport(r.Payload); key == nil {
+					log.Printf("agent %q sent an unreadable host key report", canonical)
+				} else if !sshx.VerifyCanonicalName(canonical, key) {
+					log.Printf("REFUSING host key from agent %q: it does not match that name", canonical)
+				} else {
+					reg.setHostFP(conn, ssh.FingerprintSHA256(key))
+				}
+				if r.WantReply {
+					r.Reply(true, nil)
+				}
+				continue
+			}
 			if r.WantReply {
 				r.Reply(r.Type == "keepalive@openssh.com", nil)
 			}
@@ -937,51 +976,75 @@ func serveListing(reg *registry, seen *sightings, dist *distributor, staleAfter 
 				continue
 			}
 			list := reg.listing()
-			fmt.Fprintf(ch, "\r\n multiSSH proxy\r\n\r\n")
-			if len(list) == 0 {
-				fmt.Fprintf(ch, " no targets currently registered\r\n")
-			} else {
-				fmt.Fprintf(ch, " registered targets (%d):\r\n\r\n", len(list))
-				for _, t := range list {
-					fmt.Fprintf(ch, "   %-20s %-24s %-5s %s\r\n", t.Friendly, t.Canonical,
-						sshx.DescribeProtocol(t.Proto), buildState(t.Build, current, knowBuilds))
-					// The identity fingerprint is what -revoke takes, so it
-					// belongs somewhere reachable without shell access to the
-					// proxy. Its own line, because a full fingerprint plus two
-					// names does not fit an 80-column terminal.
-					fmt.Fprintf(ch, "     %s\r\n", t.FP)
-				}
-				pick := list[0].Friendly
-				if pick == "" {
-					pick = list[0].Canonical
-				}
-				fmt.Fprintf(ch, "\r\n connect with:  ssh -J <thisproxy> user@%s\r\n", pick)
-			}
-
-			// Machines that have registered before but are not here now. A
-			// rescue tool is most likely to fail by quietly decaying, so an
-			// absence should be visible without being asked for.
 			online := map[string]bool{}
 			for _, t := range list {
 				online[t.Canonical] = true
 			}
-			var missing []string
+			var missing []sighting
 			for _, k := range seen.known() {
-				if online[k.Name] {
-					continue
+				if !online[k.Name] {
+					missing = append(missing, k)
 				}
-				mark := " "
-				if k.When.Before(staleBefore) {
-					mark = "!"
-				}
-				missing = append(missing, fmt.Sprintf(" %s %-24s last seen %s", mark, k.Name, ago(k.When)))
 			}
-			if len(missing) > 0 {
-				fmt.Fprintf(ch, "\r\n not connected (%d):\r\n\r\n", len(missing))
-				for _, m := range missing {
-					fmt.Fprintf(ch, "%s\r\n", m)
+
+			// Widths come from the data. Fixed ones truncated nothing but
+			// misaligned everything the moment a name outgrew them, which for
+			// a canonical name -- a label plus a twelve-character hash -- is
+			// most of the time.
+			nameW, canonW := len("name"), len("address")
+			for _, t := range list {
+				nameW = max(nameW, len(t.Friendly))
+				canonW = max(canonW, len(t.Canonical))
+			}
+
+			fmt.Fprintf(ch, "\r\n multiSSH proxy\r\n")
+
+			if len(list) == 0 {
+				fmt.Fprintf(ch, "\r\n no targets are connected right now.\r\n")
+			} else {
+				fmt.Fprintf(ch, "\r\n ONLINE (%d)\r\n\r\n", len(list))
+				for _, t := range list {
+					state := buildState(t.Build, current, knowBuilds)
+					fmt.Fprintf(ch, "   %-*s  %-*s  %s %s\r\n",
+						nameW, t.Friendly, canonW, t.Canonical,
+						sshx.DescribeProtocol(t.Proto), state)
+					// Two different keys, so both are named. Leaving them
+					// unlabelled invited exactly the reading that they were
+					// the same thing, or that one was checkable against the
+					// other.
+					if t.HostFP != "" {
+						fmt.Fprintf(ch, "       host key  %s\r\n", t.HostFP)
+					}
+					fmt.Fprintf(ch, "       identity  %s\r\n", t.FP)
 				}
-				fmt.Fprintf(ch, "\r\n ! not seen in %s\r\n", staleAfter)
+			}
+
+			if len(missing) > 0 {
+				fmt.Fprintf(ch, "\r\n NOT CONNECTED (%d)\r\n\r\n", len(missing))
+				anyStale := false
+				for _, m := range missing {
+					mark := " "
+					if m.When.Before(staleBefore) {
+						mark, anyStale = "!", true
+					}
+					fmt.Fprintf(ch, "   %s %-*s  last seen %s\r\n", mark, canonW, m.Name, ago(m.When))
+				}
+				if anyStale {
+					fmt.Fprintf(ch, "\r\n   ! not seen in over %s\r\n", staleAfter)
+				}
+			}
+
+			if len(list) > 0 {
+				pick := list[0].Friendly
+				if pick == "" {
+					pick = list[0].Canonical
+				}
+				fmt.Fprintf(ch, "\r\n CONNECT\r\n\r\n")
+				fmt.Fprintf(ch, "   ssh -J <thisproxy> user@%s\r\n", pick)
+				fmt.Fprintf(ch, "\r\n   The username is ignored. On first connect ssh shows the target's\r\n")
+				fmt.Fprintf(ch, "   host key fingerprint and offers a (yes/no/[fingerprint]) prompt --\r\n")
+				fmt.Fprintf(ch, "   paste the host key above into it and ssh checks it for you.\r\n")
+				fmt.Fprintf(ch, "\r\n   'identity' is a different key: the handle for -revoke.\r\n")
 			}
 			fmt.Fprintf(ch, "\r\n")
 			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))

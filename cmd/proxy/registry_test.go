@@ -145,3 +145,33 @@ func TestConnectionsDeduplicates(t *testing.T) {
 		t.Errorf("fingerprint came back as %q", got[conn])
 	}
 }
+
+// A host key report is believed only when it reproduces the name the agent is
+// registered under, so the listing cannot be made to advertise a fingerprint
+// that does not belong to that name.
+func TestSetHostFPCoversEveryNameOfOneMachine(t *testing.T) {
+	reg := newRegistry()
+	conn, other := &fakeConn{}, &fakeConn{}
+	reg.add("laptop.aaaa", conn, "SHA256:one", 1, "")
+	reg.add("laptop", conn, "SHA256:one", 1, "")
+	reg.add("server.bbbb", other, "SHA256:two", 1, "")
+
+	reg.setHostFP(conn, "SHA256:hostkey")
+
+	list := reg.listing()
+	if len(list) != 2 {
+		t.Fatalf("listing has %d rows", len(list))
+	}
+	for _, row := range list {
+		switch row.Canonical {
+		case "laptop.aaaa":
+			if row.HostFP != "SHA256:hostkey" {
+				t.Errorf("host key missing from the row: %+v", row)
+			}
+		case "server.bbbb":
+			if row.HostFP != "" {
+				t.Errorf("another machine picked up the host key: %+v", row)
+			}
+		}
+	}
+}
