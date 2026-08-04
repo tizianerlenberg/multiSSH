@@ -74,6 +74,12 @@ function Die($m) {
     exit 1
 }
 
+# Compared by SID, not by name: the account is called "NT AUTHORITY\SYSTEM" in
+# English and something else on every other Windows language.
+function Test-System {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
+}
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
@@ -191,6 +197,23 @@ $elevated = Test-Admin
 # refused itself, when what the person plainly wanted was their own.
 if (-not $Scope) {
     if ($elevated) { $Scope = 'system' } else { $Scope = 'user' }
+}
+
+# A user install run *by SYSTEM* would install into SYSTEM's own profile, which
+# is not a user in any sense that helps: same absent PATH, same missing winget,
+# just a second agent with none of the point of the first. The likely way to
+# arrive here is through a multiSSH session on this very machine, where the
+# shell is SYSTEM -- so say so, since from inside that session it looks exactly
+# like an ordinary elevated prompt.
+if ($Scope -eq 'user' -and (Test-System)) {
+    Die @"
+this shell is running as SYSTEM, so a user install would be installed for
+SYSTEM -- the same profile the existing agent already has, and none of the
+per-user tools you are presumably after.
+
+A user-scope agent has to be installed by the user it will run as. Log in to
+this machine as that person and run the installer from their own PowerShell.
+"@
 }
 
 if ($Scope -eq 'system') {
