@@ -326,6 +326,9 @@ those and leaves the unit tests.
 - an agent below the configured protocol floor is refused, and is *told why* in
   its own log
 - `/healthz` reports without naming a single target
+- a withdrawn enrolment password stops working on reload, and a corrupt
+  password file leaves the previous set in force rather than disabling
+  enrolment outright
 - publishing a new agent build and reloading with `SIGHUP` does not disconnect
   a single agent, and the listing flips to `OUTDATED`
 - four regressions are frozen against their original shapes: rate-limit keys
@@ -405,6 +408,31 @@ Piped from curl, options go after `--`:
 `curl -fsSL … | sudo sh -s -- --uninstall`. Unattended installs read
 `MULTISSH_PASSWORD` and friends, and the script detects the absence of a
 terminal rather than hanging on a prompt.
+
+### Managing enrolment passwords
+
+```bash
+multissh-proxy -passwords /var/lib/multissh/enrol_passwords.json -list-passwords
+multissh-proxy -passwords ... -add-password laptops -password-validity 720h
+multissh-proxy -passwords ... -remove-password laptops
+systemctl reload multissh-proxy      # picks it up; no agent is disconnected
+```
+
+There is no "change" command: passwords are stored only as argon2id hashes, so
+there is nothing to edit. Replace one by removing it and adding it again under
+the same name. Names are create-only, and the clash is reported *before* you
+are asked to type anything.
+
+**The reload is not optional.** Passwords are held in memory, so until the
+proxy re-reads the file a withdrawn password keeps working. Run it as root and
+hand the file back: the password is read from your terminal and a service
+account cannot open a terminal owned by you.
+
+```bash
+sudo multissh-proxy -passwords /var/lib/multissh/enrol_passwords.json -add-password laptops
+sudo chown multissh:multissh /var/lib/multissh/enrol_passwords.json
+sudo systemctl reload multissh-proxy
+```
 
 Passwords are argon2id-hashed with a lifetime chosen when created, `/enroll` is
 rate limited, and enrolment writes nothing to the proxy — so none of this adds

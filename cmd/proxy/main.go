@@ -383,26 +383,6 @@ func main() {
 	// is worth knowing even on a standby that enrols nobody.
 	dist := newDistributor(*distDir)
 
-	// Publishing a new agent build should not cost every agent its connection.
-	// SIGHUP re-reads the directory in place, so `systemctl reload` after
-	// shipping binaries is enough.
-	go func() {
-		hup := make(chan os.Signal, 1)
-		signal.Notify(hup, syscall.SIGHUP)
-		for range hup {
-			dist.scan()
-			hashes, version := dist.snapshot()
-			log.Printf("reloaded %d agent build(s), version %s", len(hashes), version)
-			// A bad users file must not empty the set of people who can log
-			// in: keep the previous one and say so.
-			if n, err := loadUsers(); err != nil {
-				log.Printf("reload: users: %v (keeping the previous %d)", err, len(*users.Load()))
-			} else {
-				log.Printf("reloaded %d user key(s)", n)
-			}
-		}
-	}()
-
 	userCfg := &ssh.ServerConfig{
 		ServerVersion: sshx.ProxyVersion(),
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -515,7 +495,6 @@ func main() {
 				caPub:   caPub,
 				enrol: &enroller{
 					ca:        ca,
-					passwords: pws,
 					usersFile: *usersFile,
 					proxies:   agentURLs(*publicURL, *wsPath),
 					limit:     newLimiter(enrolRateWindow, enrolRateBurst),
@@ -523,8 +502,42 @@ func main() {
 					revoked:   revoked,
 				},
 			}
+			extra.enrol.passwords.Store(&pws)
 		}
 	}
+
+	// SIGHUP re-reads everything that can change without a restart. Restarting
+	// costs every agent its connection, which is an absurd price for adding a
+	// key -- and for enrolment passwords it was worse than a price: read only
+	// at startup, withdrawing one wrote the file and changed nothing, so a
+	// credential you believed you had revoked went on working.
+	//
+	// Each reload keeps the previous value when the file cannot be read. A
+	// typo in one file must not empty the set of people who can log in, nor
+	// silently disable enrolment.
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		for range hup {
+			dist.scan()
+			hashes, version := dist.snapshot()
+			log.Printf("reloaded %d agent build(s), version %s", len(hashes), version)
+
+			if n, err := loadUsers(); err != nil {
+				log.Printf("reload: users: %v (keeping the previous %d)", err, len(*users.Load()))
+			} else {
+				log.Printf("reloaded %d user key(s)", n)
+			}
+
+			if extra != nil {
+				if n, err := extra.enrol.reload(*pwFile); err != nil {
+					log.Printf("reload: passwords: %v (keeping the previous set)", err)
+				} else {
+					log.Printf("reloaded %d enrolment password(s)", n)
+				}
+			}
+		}
+	}()
 
 	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler,
 		serveHealth(reg, seen, revoked, dist, *staleAfter), extra)
