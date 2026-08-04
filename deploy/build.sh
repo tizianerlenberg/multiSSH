@@ -12,7 +12,7 @@ case "$OUT" in
     /*) ;;
     *)  OUT=$(pwd)/$OUT ;;
 esac
-cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 
 mkdir -p "$OUT"
 

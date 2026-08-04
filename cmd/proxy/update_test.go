@@ -181,7 +181,7 @@ func TestBuildScriptResolvesItsOwnRoot(t *testing.T) {
 	if err != nil {
 		t.Skipf("no build.sh: %v", err)
 	}
-	if !strings.Contains(string(body), `cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"`) {
+	if !strings.Contains(string(body), `cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"`) {
 		t.Error("build.sh does not move to the repository root; calling it from anywhere else fails on go.mod")
 	}
 	// A relative output directory must still mean what the caller meant, which

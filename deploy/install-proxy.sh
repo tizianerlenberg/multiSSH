@@ -13,7 +13,7 @@
 # Expects multissh-proxy and dist/ beside it, which is what push.sh ships.
 set -eu
 
-SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SRC=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 USER_NAME=${MULTISSH_SERVICE_USER:-multissh}
 STATE=${MULTISSH_STATE:-/var/lib/multissh}

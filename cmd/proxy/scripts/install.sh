@@ -55,7 +55,7 @@ done
 # used paths that a freshly fetched script could never guess. Piped from curl
 # there is no path at all, and this resolves to somewhere harmless that simply
 # holds no manifest.
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF_DIR=
+SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF_DIR=
 
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
