@@ -33,6 +33,11 @@ const (
 	// healthySession is how long a connection must last to count as good
 	// enough to reset the backoff.
 	healthySession = 60 * time.Second
+
+	// outputDrainTimeout bounds the wait for a finished command's output to
+	// reach the client. Only reached when something the shell started is still
+	// holding the terminal open.
+	outputDrainTimeout = 5 * time.Second
 )
 
 // ptyProcess is a shell attached to a pseudo-terminal. The implementations
@@ -484,9 +489,31 @@ func serveSession(nc ssh.NewChannel) {
 		shell = s
 
 		go io.Copy(s, ch)
-		go io.Copy(ch, s)
+
+		// The output copy is waited on, not fired and forgotten.
+		//
+		// A process exiting does not mean its output has been read: the last
+		// of it is still sitting in the pseudo-terminal, and closing the
+		// channel the moment Wait returns throws it away. Silently, and more
+		// often the busier the machine is -- which for a command run to
+		// diagnose a struggling machine is precisely the wrong way round. It
+		// showed up as an exec returning nothing at all under load.
+		drained := make(chan struct{})
+		go func() {
+			io.Copy(ch, s)
+			close(drained)
+		}()
+
 		go func() {
 			code, _ := s.Wait()
+			select {
+			case <-drained:
+			case <-time.After(outputDrainTimeout):
+				// Something else is holding the terminal open -- a job the
+				// shell left behind, most likely. Its output is not worth
+				// hanging the session for.
+				log.Printf("output still draining after %s, closing anyway", outputDrainTimeout)
+			}
 			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{code}))
 			ch.Close()
 		}()

@@ -109,6 +109,10 @@ type fixture struct {
 	proxyLog  *safeLog
 	agentLog  *safeLog
 	proxyCmd  *exec.Cmd
+	// agentEnv is added to the agent's environment. Used to pin GOMAXPROCS,
+	// which is what makes a scheduling race reproduce here instead of once in
+	// twenty runs on a busy CI machine.
+	agentEnv []string
 }
 
 // stopProxy kills the running proxy and waits for its listener to go, so a
@@ -244,13 +248,16 @@ func (f *fixture) startAgent(extra ...string) {
 		"-ca", "proxy_ca.pub",
 		"-authorized-keys", "agent_authorized_keys",
 	}, extra...)
-	f.start(agentBin, args, f.agentLog)
+	f.start(agentBin, args, f.agentLog, f.agentEnv...)
 }
 
-func (f *fixture) start(bin string, args []string, log *safeLog) *exec.Cmd {
+func (f *fixture) start(bin string, args []string, log *safeLog, env ...string) *exec.Cmd {
 	f.t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = f.dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	// One sink for both streams: the programs log through the standard log
 	// package, whose writes are already serialised.
 	cmd.Stdout = log
@@ -859,6 +866,55 @@ func TestOtherSubsystemsAreStillRefused(t *testing.T) {
 	defer sess.Close()
 	if err := sess.RequestSubsystem("netconf"); err == nil {
 		t.Error("an unrelated subsystem was accepted")
+	}
+}
+
+// Regression. The session closed the channel as soon as the process exited,
+// while its output was still sitting in the pseudo-terminal waiting to be
+// copied. The last of it -- sometimes all of it -- was thrown away, silently,
+// and more often the busier the machine was. For a command run to diagnose a
+// struggling machine that is exactly the wrong way round.
+//
+// Caught as an intermittent CI failure where an exec returned "". Repeated
+// here with enough output to make truncation near-certain rather than lucky.
+func TestExecOutputIsNotTruncated(t *testing.T) {
+	f := setup(t)
+	f.startProxy()
+	// One processor in the agent, so the goroutine that drains the terminal
+	// and the one that closes the channel cannot simply run in parallel and
+	// hide the race. Without this the bug appears on a loaded CI machine and
+	// nowhere else.
+	f.agentEnv = []string{"GOMAXPROCS=1"}
+	f.startAgent()
+	f.waitForTarget(f.canonical)
+
+	c := f.dialProxy()
+	inner, _, err := f.jumpTo(c, f.canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const lines = 500
+	for attempt := 1; attempt <= 5; attempt++ {
+		sess, err := inner.NewSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := sess.Output(fmt.Sprintf("for i in $(seq 1 %d); do echo line-$i; done", lines))
+		sess.Close()
+		if err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+
+		text := string(out)
+		// The last line is the one truncation eats first.
+		if !strings.Contains(text, fmt.Sprintf("line-%d", lines)) {
+			t.Fatalf("attempt %d: output stops early, %d bytes, tail %q",
+				attempt, len(text), text[max(0, len(text)-80):])
+		}
+		if n := strings.Count(text, "line-"); n != lines {
+			t.Fatalf("attempt %d: got %d lines, want %d", attempt, n, lines)
+		}
 	}
 }
 
