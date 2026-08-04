@@ -41,6 +41,26 @@ $SSH "$HOST" "rm -rf $REMOTE_TMP"
 
 # The proxy's own report, fetched through the host rather than from here: the
 # agent listener is bound to loopback and is not meant to be reachable outside.
+# Confirms the shipped binary is the one now running, rather than trusting that
+# a command exited zero.
 echo "==> health"
-$SSH "$HOST" 'curl -fsS http://127.0.0.1:8080/healthz 2>/dev/null || echo "(could not read /healthz; check -agent-addr)"'
-echo
+WANT=$(sha256sum "$REPO/multissh-proxy" 2>/dev/null | cut -c1-12 ||
+       shasum -a 256 "$REPO/multissh-proxy" | cut -c1-12)
+GOT=$($SSH "$HOST" 'curl -fsS http://127.0.0.1:8080/healthz 2>/dev/null' || true)
+if [ -z "$GOT" ]; then
+    echo "    (could not read /healthz; check -agent-addr and that the proxy is up)"
+    exit 1
+fi
+echo "    $GOT"
+case "$GOT" in
+    *"\"build\":\"$WANT\""*)
+        echo "    running the build just shipped ($WANT)" ;;
+    *'"build"'*)
+        # It reports a build and it is not ours: the restart did not take.
+        echo "    WARNING: the proxy reports a different build than the one shipped ($WANT)" >&2 ;;
+    *)
+        # No build field at all, so it is older than build reporting -- which
+        # is expected exactly once, on the push that introduces it.
+        echo "    note: this proxy predates build reporting and cannot confirm its version;" >&2
+        echo "          the next push will be able to" >&2 ;;
+esac
