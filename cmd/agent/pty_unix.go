@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+	"time"
 )
 
 type unixShell struct {
@@ -70,3 +71,10 @@ func shellPath() string {
 	}
 	return "/bin/sh"
 }
+
+// outputDrainTimeout bounds the wait for a finished command's output to reach
+// the client. A pseudo-terminal here reports EOF once the child has gone and
+// its output has been read, so the wait normally ends immediately and this is
+// only reached when something the shell left behind still holds the terminal
+// open.
+const outputDrainTimeout = 5 * time.Second

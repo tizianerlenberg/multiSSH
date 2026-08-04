@@ -33,11 +33,6 @@ const (
 	// healthySession is how long a connection must last to count as good
 	// enough to reset the backoff.
 	healthySession = 60 * time.Second
-
-	// outputDrainTimeout bounds the wait for a finished command's output to
-	// reach the client. Only reached when something the shell started is still
-	// holding the terminal open.
-	outputDrainTimeout = 5 * time.Second
 )
 
 // ptyProcess is a shell attached to a pseudo-terminal. The implementations
