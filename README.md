@@ -620,7 +620,14 @@ by hand on the box; `push.sh` only builds, copies and calls it.
 sh deploy/update-agents.sh multissh          # every target reported OUTDATED
 sh deploy/update-agents.sh multissh laptop   # just this one
 sh deploy/update-agents.sh multissh --stop   # stop at the first failure
+sh deploy/update-agents.sh multissh --yes    # do not ask about Windows
 ```
+
+**Windows targets are asked about one at a time** and skipped unless confirmed,
+including when there is no terminal to ask at. Updating one restarts it, and a
+restart that does not take leaves the machine offline — which for a rescue tool
+means losing the way back in. Linux and macOS restart through systemd or
+launchd and have not shown that problem, so they go without asking.
 
 Every step is bounded and a machine that does not answer is **skipped**, not
 allowed to stall the sweep — unreachable targets are the normal state for this

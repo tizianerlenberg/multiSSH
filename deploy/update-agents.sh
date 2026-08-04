@@ -4,6 +4,12 @@
 #   sh deploy/update-agents.sh multissh            # every outdated target
 #   sh deploy/update-agents.sh multissh laptop     # just these
 #   sh deploy/update-agents.sh multissh --all      # including ones already current
+#   sh deploy/update-agents.sh multissh --yes      # do not ask about Windows
+#
+# Windows targets are asked about one at a time and skipped unless confirmed.
+# Updating one restarts it, and if that restart does not take, the machine goes
+# offline -- which for a rescue tool means losing the way back in. Linux and
+# macOS restart through systemd or launchd and have not shown that problem.
 #
 # The argument is however you reach the proxy with a stock ssh client: a Host
 # alias from ~/.ssh/config, or user@host.
@@ -21,18 +27,21 @@
 #   MULTISSH_TIMEOUT   seconds to allow the update command itself   (default 90)
 #   MULTISSH_DEADLINE  seconds for the whole sweep                  (default 1800)
 #   MULTISSH_STOP      set to 1 to stop at the first failure instead of skipping
+#   MULTISSH_YES       set to 1 to update Windows targets without asking
 set -eu
 
-[ $# -ge 1 ] || { echo "usage: sh deploy/update-agents.sh <proxy> [name...] [--all] [--stop]" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: sh deploy/update-agents.sh <proxy> [name...] [--all] [--stop] [--yes]" >&2; exit 2; }
 PROXY=$1; shift
 
 ALL=
 NAMES=
 STOP=${MULTISSH_STOP:-}
+ASSUME_YES=${MULTISSH_YES:-}
 for arg in "$@"; do
     case "$arg" in
         --all)  ALL=1 ;;
         --stop) STOP=1 ;;
+        -y|--yes) ASSUME_YES=1 ;;
         -*)     echo "unknown option: $arg" >&2; exit 2 ;;
         *)      NAMES="$NAMES $arg" ;;
     esac
@@ -136,6 +145,35 @@ update_command() { # update_command PLATFORM
     esac
 }
 
+# confirm asks before touching a Windows target.
+#
+# The prompt reads the terminal directly rather than stdin: stdin may be a
+# pipe, and in any case nothing else here is interactive. With no terminal at
+# all the answer is no -- an unattended run must not decide on its own to risk
+# a machine.
+# /dev/tty exists as a device node whether or not there is a controlling
+# terminal behind it, so testing for the file says nothing. Opening it is the
+# only real test, and doing that quietly keeps the failure from leaking out as
+# "No such device or address".
+have_tty() {
+    { : >/dev/tty; } 2>/dev/null
+}
+
+confirm() { # confirm NAME
+    if [ -n "$ASSUME_YES" ]; then
+        return 0
+    fi
+    if ! have_tty; then
+        return 1
+    fi
+    printf 'update %s? A Windows restart that does not take leaves it offline. [y/N]: ' "$1" > /dev/tty
+    read -r _answer < /dev/tty || _answer=
+    case "$_answer" in
+        y|Y|yes|YES) return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
 matches() { # matches CANONICAL
     if [ -z "$NAMES" ]; then
         return 0
@@ -153,10 +191,12 @@ matches() { # matches CANONICAL
 # all, leaving no way to tell which machines had already been done.
 DONE=
 FAILED=
+SKIPPED=
 summary() {
     echo
-    [ -n "$DONE" ]   && echo "updated:$DONE"
-    [ -n "$FAILED" ] && echo "did not update:$FAILED" >&2
+    if [ -n "$DONE" ];    then echo "updated:$DONE"; fi
+    if [ -n "$SKIPPED" ]; then echo "skipped:$SKIPPED"; fi
+    if [ -n "$FAILED" ];  then echo "did not update:$FAILED" >&2; fi
     return 0
 }
 trap 'echo; echo "interrupted." >&2; summary; exit 130' INT TERM
@@ -193,7 +233,13 @@ if [ -z "$TODO" ]; then
 fi
 
 echo "will update:"
-for entry in $TODO; do echo "    ${entry%/*}  (${entry#*/})"; done
+for entry in $TODO; do
+    if [ "${entry#*/}" = windows ]; then
+        echo "    ${entry%/*}  (${entry#*/}, will ask first)"
+    else
+        echo "    ${entry%/*}  (${entry#*/})"
+    fi
+done
 echo
 
 for entry in $TODO; do
@@ -207,6 +253,19 @@ for entry in $TODO; do
         continue
     fi
     echo "==> $name"
+
+    if [ "$platform" = windows ]; then
+        if ! confirm "$name"; then
+            if have_tty; then
+                echo "    skipped."
+            else
+                echo "    skipped: Windows targets are only updated when confirmed," >&2
+                echo "    and there is no terminal to ask at. Pass --yes to override." >&2
+            fi
+            SKIPPED="$SKIPPED $name"
+            continue
+        fi
+    fi
 
     if [ "$platform" = unknown ]; then
         echo "    skipped: this agent is too old to say what platform it is on." >&2
