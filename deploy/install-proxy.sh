@@ -190,8 +190,12 @@ if [ -n "$FIRST_RUN" ]; then
     echo "         systemctl reload multissh-proxy   # no agent loses its connection"
     echo
     echo "    2. create an enrolment password, or no machine can enrol:"
-    echo "         sudo -u $USER_NAME $BIN -passwords $STATE/enrol_passwords.json \\"
+    echo "         sudo $BIN -passwords $STATE/enrol_passwords.json \\"
     echo "              -add-password laptops -password-validity 720h"
+    echo "         sudo chown $USER_NAME:$USER_NAME $STATE/enrol_passwords.json"
+    echo
+    echo "       (as root, not as $USER_NAME: the password is read from your"
+    echo "        terminal, and $USER_NAME cannot open a terminal owned by you)"
     echo
     echo "    3. take the authority's public key back to your own machine:"
     echo "         sudo -u $USER_NAME $BIN -ca-key $STATE/proxy_ca_key -show-ca"
