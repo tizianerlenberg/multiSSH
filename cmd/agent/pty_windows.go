@@ -5,13 +5,12 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
 	"os"
 	"os/exec"
-	"unsafe"
 
 	"github.com/UserExistsError/conpty"
 	"golang.org/x/sys/windows"
+	"time"
 )
 
 // windowsShell is a shell attached to a ConPTY pseudo-console. ConPTY needs
@@ -21,36 +20,23 @@ import (
 type windowsShell struct {
 	pty *conpty.ConPty
 	pid int
-	// job holds the shell and everything it starts. Windows has no process
-	// group to signal, so without this only the shell itself was killed when a
-	// session ended and anything it had started was orphaned -- left running
-	// forever on a machine nobody is sitting at. Closing the job handle kills
-	// the whole tree.
-	job windows.Handle
 }
 
-// newKillOnCloseJob creates a job object whose members die when the last
-// handle to it closes. That is the property that makes it a reliable teardown:
-// it holds even if this process is killed rather than exiting cleanly.
-func newKillOnCloseJob() (windows.Handle, error) {
-	job, err := windows.CreateJobObject(nil, nil)
-	if err != nil {
-		return 0, err
-	}
-	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{
-		BasicLimitInformation: windows.JOBOBJECT_BASIC_LIMIT_INFORMATION{
-			LimitFlags: windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-		},
-	}
-	_, err = windows.SetInformationJobObject(job,
-		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)))
-	if err != nil {
-		windows.CloseHandle(job)
-		return 0, err
-	}
-	return job, nil
-}
+// A job object would kill the shell and everything it started when a session
+// ends, which Windows otherwise cannot do -- there is no process group to
+// signal, so children are orphaned. It was tried and had to come out.
+//
+// The agent updates itself over its own tunnel: the update runs in a session,
+// and its last act is to restart the agent. With the shell in a job that dies
+// with the session, stopping the agent killed the update script halfway
+// through -- after the binary was swapped and before anything was started
+// again -- and left the machine with an agent that was installed, registered,
+// and not running. Losing a few orphaned processes is a far smaller problem
+// than losing the machine.
+//
+// The way back to it is to take the restart out of the session entirely: a
+// one-shot scheduled task, owned by Task Scheduler rather than by the job, so
+// that nothing the session does can interrupt it. Then the job can return.
 
 func startShell(command, term string, cols, rows uint16) (ptyProcess, error) {
 	if !conpty.IsConPtyAvailable() {
@@ -66,27 +52,7 @@ func startShell(command, term string, cols, rows uint16) (ptyProcess, error) {
 		return nil, err
 	}
 
-	s := &windowsShell{pty: p, pid: p.Pid()}
-
-	// Best effort. A shell that cannot be put in a job still works; it just
-	// leaves its children behind on disconnect, which is what always happened
-	// before. Refusing to open a session over it would be the worse trade for
-	// a tool whose job is getting you in.
-	if job, err := newKillOnCloseJob(); err != nil {
-		log.Printf("no job object, so processes this session starts will outlive it: %v", err)
-	} else if h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(s.pid)); err != nil {
-		log.Printf("could not open the shell to place it in a job: %v", err)
-		windows.CloseHandle(job)
-	} else {
-		if err := windows.AssignProcessToJobObject(job, h); err != nil {
-			log.Printf("could not place the shell in a job: %v", err)
-			windows.CloseHandle(job)
-		} else {
-			s.job = job
-		}
-		windows.CloseHandle(h)
-	}
-	return s, nil
+	return &windowsShell{pty: p, pid: p.Pid()}, nil
 }
 
 // shellCommandLine builds a command line, since Windows takes one string
@@ -116,19 +82,11 @@ func (s *windowsShell) Wait() (uint32, error) {
 	return s.pty.Wait(context.Background())
 }
 
-// Terminate closes the pseudo-console, then the job, which kills the shell and
-// everything it started. The explicit TerminateProcess is a fallback for the
-// case where the job could not be created at all.
+// Terminate closes the pseudo-console and kills the shell. Processes the shell
+// started are left behind -- see the note above the type for why the job
+// object that would have caught them had to be removed.
 func (s *windowsShell) Terminate() {
 	s.pty.Close()
-
-	if s.job != 0 {
-		// KILL_ON_JOB_CLOSE means this is the kill.
-		windows.CloseHandle(s.job)
-		s.job = 0
-		return
-	}
-
 	if s.pid <= 0 {
 		return
 	}
@@ -139,3 +97,16 @@ func (s *windowsShell) Terminate() {
 	defer windows.CloseHandle(h)
 	windows.TerminateProcess(h, 1)
 }
+
+// outputDrainTimeout is short here on purpose.
+//
+// ConPTY does not close its output pipe when the child exits, so the read
+// never reports EOF and this wait *always* runs to the end. At five seconds --
+// the figure that suits a Unix pseudo-terminal, where EOF arrives promptly --
+// every command and every logout on Windows took five seconds longer than it
+// should, which is exactly what was reported.
+//
+// The bug the wait exists for is a scheduling race: the copying goroutine not
+// having run even once before the channel is closed. A fraction of a second
+// covers that with room to spare.
+const outputDrainTimeout = 300 * time.Millisecond
