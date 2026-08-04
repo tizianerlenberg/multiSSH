@@ -188,40 +188,70 @@ function Start-Agent($argline) {
     Start-ScheduledTask -TaskName $TaskName
 }
 
-# Restart-Agent hands the restart to Task Scheduler instead of doing it here.
+# Restarting the agent cannot be done from here, and that has taken three
+# attempts to get right.
 #
-# It cannot be done here. The update runs inside a session, and that session is
-# hosted by the very process being restarted: stopping the agent destroys the
-# pseudo-console this script is attached to and takes the script with it --
-# after the binary has been swapped and before anything has been started again.
-# The machine is then installed, registered, and not running, which is exactly
-# what happened to both of them.
+# Doing it inline -- stop, then start -- fails because this script runs inside a
+# session hosted by the very process being stopped: the stop takes the script
+# with it, after the binary has been swapped and before anything has been
+# started again, leaving the machine installed, registered and not running.
 #
-# A one-shot task belongs to Task Scheduler, not to this process tree, so
-# nothing the session does can interrupt it. This function therefore only
-# schedules the work and returns; the update finishes and exits normally, and
-# the agent comes back a few seconds later.
+# Scheduling a one-shot task fails too, but only sometimes and only from here:
+# Register-ScheduledTask called from inside that session is refused with
+# 0x80070005, while the same call from an ordinary shell succeeds. So it is
+# tried first and must not be relied on.
+#
+# What is left needs no privileges at all: end the agent abruptly and let
+# whatever supervises it put it back. A service has failure actions configured
+# at install (restart after five seconds); the user-scope task has
+# restart-on-failure. A clean stop would not trigger either -- it has to look
+# like a crash, which is precisely what killing it is.
+function Try-ScheduleRestart {
+    try {
+        $inner = "& ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -StartOnly"
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $enc"
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+
+        if ($Scope -eq 'system') {
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+                -LogonType ServiceAccount -RunLevel Highest
+        } else {
+            $me = "$env:USERDOMAIN\$env:USERNAME"
+            $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+        }
+
+        Register-ScheduledTask -TaskName $RestartTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Restart-Agent($argline) {
-    $inner = "& ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -StartOnly"
-    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $enc"
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-
-    if ($Scope -eq 'system') {
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
-            -LogonType ServiceAccount -RunLevel Highest
-    } else {
-        $me = "$env:USERDOMAIN\$env:USERNAME"
-        $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+    if (Try-ScheduleRestart) {
+        Write-Host "the agent will restart in a few seconds"
+        return
     }
 
-    Register-ScheduledTask -TaskName $RestartTaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Host "the agent will restart in a few seconds"
+    Write-Host "could not schedule a restart from inside this session; ending the"
+    Write-Host "agent instead and letting its supervisor bring it back."
+
+    $running = @(Find-AgentProcesses $Binary)
+    if ($running.Count -eq 0) {
+        # Nothing to end. Starting it here is safe precisely because there is
+        # no session of its own to lose.
+        Start-Agent $argline
+        return
+    }
+    # Everything is already committed -- binary swapped, manifest written -- so
+    # it does not matter that this also ends the session running these lines.
+    $running | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 function Expected-Hash {

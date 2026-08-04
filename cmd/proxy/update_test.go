@@ -802,18 +802,27 @@ func TestPowerShellRestartsFromOutsideTheSession(t *testing.T) {
 	script := withoutComments(powershellInstaller(t))
 	restart := section(t, script, `^function Restart-Agent\(\$argline\) \{`, `^\}`)
 
-	// It must schedule, not stop.
-	if !strings.Contains(restart, "Register-ScheduledTask -TaskName $RestartTaskName") {
-		t.Error("Restart-Agent does not hand the restart to Task Scheduler")
+	// Never a stop followed by a start in the same breath: the stop takes
+	// this script with it and nothing performs the start.
+	if strings.Contains(restart, "Stop-Agent") {
+		t.Error("Restart-Agent stops the agent inline, which kills the script that would start it again")
 	}
-	for _, forbidden := range []string{"Stop-Agent", "Stop-Service", "Start-Agent"} {
-		if strings.Contains(restart, forbidden) {
-			t.Errorf("Restart-Agent calls %s inline; stopping the agent kills the script doing it", forbidden)
-		}
+	// Scheduling is tried first...
+	if !strings.Contains(restart, "Try-ScheduleRestart") {
+		t.Error("Restart-Agent does not try to hand the restart to Task Scheduler")
 	}
-	// EncodedCommand, because the command carries quotes and a path.
-	if !strings.Contains(restart, "-EncodedCommand $enc") {
+	// ...and cannot be relied on, because registering a task from inside the
+	// agent's own session is refused with 0x80070005 on some machines.
+	if !strings.Contains(restart, "Stop-Process -Force") {
+		t.Error("there is no fallback for when the restart cannot be scheduled")
+	}
+
+	sched := section(t, script, `^function Try-ScheduleRestart \{`, `^\}`)
+	if !strings.Contains(sched, "-EncodedCommand $enc") {
 		t.Error("the scheduled command is not encoded, so quoting decides whether it runs")
+	}
+	if !strings.Contains(sched, "catch") {
+		t.Error("a failure to register the task is not caught, so the fallback never runs")
 	}
 
 	// And the other half: a -StartOnly mode for the task to invoke, which does
