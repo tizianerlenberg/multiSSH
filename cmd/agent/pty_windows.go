@@ -4,13 +4,16 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
+	"time"
+	"unicode/utf16"
 
 	"github.com/UserExistsError/conpty"
 	"golang.org/x/sys/windows"
-	"time"
 )
 
 // windowsShell is a shell attached to a ConPTY pseudo-console. ConPTY needs
@@ -58,17 +61,34 @@ func startShell(command, term string, cols, rows uint16) (ptyProcess, error) {
 // shellCommandLine builds a command line, since Windows takes one string
 // rather than an argv. PowerShell is preferred, with cmd.exe as the fallback
 // for stripped-down installs.
+//
+// An exec'd command goes to PowerShell base64-encoded. Passed as -Command it
+// has to survive CreateProcess assembling one string and then PowerShell
+// parsing it again, and anything containing quotes does not: the quotes are
+// eaten somewhere in between and the command arrives as a different one.
+// -EncodedCommand crosses both without interpretation.
 func shellCommandLine(command string) string {
 	if _, err := exec.LookPath("powershell.exe"); err == nil {
 		if command == "" {
 			return "powershell.exe -NoLogo"
 		}
-		return "powershell.exe -NoLogo -Command " + command
+		return "powershell.exe -NoLogo -EncodedCommand " + encodeForPowerShell(command)
 	}
 	if command == "" {
 		return "cmd.exe"
 	}
 	return "cmd.exe /C " + command
+}
+
+// encodeForPowerShell renders a command as PowerShell's -EncodedCommand wants
+// it: base64 of UTF-16, little-endian.
+func encodeForPowerShell(command string) string {
+	units := utf16.Encode([]rune(command))
+	buf := make([]byte, len(units)*2)
+	for i, u := range units {
+		binary.LittleEndian.PutUint16(buf[i*2:], u)
+	}
+	return base64.StdEncoding.EncodeToString(buf)
 }
 
 func (s *windowsShell) Read(p []byte) (int, error)  { return s.pty.Read(p) }

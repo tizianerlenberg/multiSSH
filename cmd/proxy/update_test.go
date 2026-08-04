@@ -858,3 +858,31 @@ func TestPowerShellSwapSurvivesALockedPreviousBinary(t *testing.T) {
 		t.Error("parked binaries are never cleaned up")
 	}
 }
+
+// Regression. manage.ps1 was written only at install time, so it aged while
+// everything else was updated -- and the restart works by invoking it. A copy
+// from before -StartOnly existed was handed that switch, rejected it, and
+// returned 1: the scheduled task ran, did nothing, and the agent stayed on the
+// old binary with nothing anywhere saying why. Uninstall and rollback ran from
+// the same stale copy.
+func TestPowerShellRefreshesTheSavedScriptOnUpdate(t *testing.T) {
+	script := withoutComments(powershellInstaller(t))
+
+	refresh := strings.Index(script, `-OutFile (Join-Path $StateDir 'manage.ps1')`)
+	if refresh < 0 {
+		t.Fatal("manage.ps1 is never written")
+	}
+	// Twice: once on install, once on update.
+	if strings.Count(script, `-OutFile (Join-Path $StateDir 'manage.ps1')`) < 2 {
+		t.Error("manage.ps1 is only written at install time, so it goes stale while the agent is updated")
+	}
+
+	body := section(t, script, `^\$existing = Get-Manifest`, `^\}`)
+	saved := strings.Index(body, "manage.ps1")
+	restart := strings.Index(body, "Restart-Agent")
+	if saved < 0 {
+		t.Error("the update path does not refresh manage.ps1")
+	} else if restart >= 0 && saved > restart {
+		t.Error("manage.ps1 is refreshed after the restart is scheduled; the restart would still run the stale copy")
+	}
+}
