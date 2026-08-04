@@ -911,6 +911,22 @@ func TestMacInstallerHandlesBothDomainsAndSpaces(t *testing.T) {
 		t.Error("the system launchd domain is still hardcoded; a user install would try to stop a daemon it does not own")
 	}
 
+	// Choosing PLIST by scope is worth nothing if something later overwrites
+	// it, which is exactly what happened: the unit-writing branch reassigned it
+	// to the daemon path, so a user install enrolled and then died writing to
+	// /Library/LaunchDaemons. Assert the daemon path is named once, where the
+	// scope is decided, and nowhere else.
+	if n := strings.Count(script, "PLIST=/Library/LaunchDaemons"); n != 1 {
+		t.Errorf("the LaunchDaemon path is assigned to PLIST %d times, want 1: a later assignment silently undoes the scope split", n)
+	}
+
+	// A user-scope Linux agent is gone the moment the user logs out unless the
+	// user manager lingers -- absent for precisely the state this tool exists
+	// to reach.
+	if !strings.Contains(script, "enable-linger") {
+		t.Error("a user-scope Linux install neither enables lingering nor mentions it; the agent would not survive logout")
+	}
+
 	// The default macOS state directory contains a space. Splitting the
 	// argument string on whitespace turned that path into two arguments.
 	if strings.Contains(script, "for a in $ARGS") {

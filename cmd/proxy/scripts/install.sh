@@ -167,7 +167,21 @@ svc_stop() {
 svc_start() {
     case "$OS-$SCOPE" in
         linux-system) systemctl daemon-reload; systemctl enable --now "$(svc_name)" ;;
-        linux-user)   systemctl --user daemon-reload; systemctl --user enable --now "$(svc_name)" ;;
+        linux-user)
+            systemctl --user daemon-reload; systemctl --user enable --now "$(svc_name)"
+            # Without lingering the user manager is torn down at logout and not
+            # started until the next login, so the agent is absent for exactly
+            # the machine states a rescue tool exists for: nobody logged in.
+            # Needs root, so it is a request rather than a step; if it is
+            # refused the install is still good, just only while logged in.
+            if command -v loginctl >/dev/null 2>&1 && [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
+                if ! loginctl enable-linger "$(id -un)" 2>/dev/null; then
+                    echo "note: this agent runs only while you are logged in."
+                    echo "      to keep it running across logout and reboot:"
+                    echo "        sudo loginctl enable-linger $(id -un)"
+                fi
+            fi
+            ;;
         darwin-*)
             mkdir -p "$(dirname "$PLIST")"
             launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>/dev/null || launchctl load "$PLIST"
@@ -467,7 +481,10 @@ WantedBy=$( [ "$SCOPE" = system ] && echo multi-user.target || echo default.targ
 EOF
         ;;
     darwin-*)
-        PLIST=/Library/LaunchDaemons/net.multissh.agent.plist
+        # PLIST is chosen by scope far above. Do not set it here: an earlier
+        # version reassigned it to the LaunchDaemon path at this point, which
+        # undid the scope split silently -- a user install enrolled, then died
+        # writing to /Library/LaunchDaemons.
         mkdir -p "$(dirname "$PLIST")"
         # & and < are legal in a path and would produce a plist launchd
         # refuses to parse, which it reports as the job simply not existing.
