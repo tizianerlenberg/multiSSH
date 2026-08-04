@@ -28,6 +28,7 @@ param(
     [switch]$Uninstall,
     [switch]$Update,
     [switch]$Rollback,
+    [switch]$StartOnly,
     [switch]$Reenroll,
     [switch]$Yes,
     [string]$Name,
@@ -101,6 +102,8 @@ function Get-Manifest {
 # because creating a service needs administrator rights the user does not have.
 # The agent detects which it is on its own, so one binary serves both.
 $ServiceName = 'multissh-agent'
+# The one-shot task that performs a restart from outside the session.
+$RestartTaskName = 'multiSSH agent restart'
 
 function Stop-Agent {
     if ($Scope -eq 'system') {
@@ -185,9 +188,40 @@ function Start-Agent($argline) {
     Start-ScheduledTask -TaskName $TaskName
 }
 
+# Restart-Agent hands the restart to Task Scheduler instead of doing it here.
+#
+# It cannot be done here. The update runs inside a session, and that session is
+# hosted by the very process being restarted: stopping the agent destroys the
+# pseudo-console this script is attached to and takes the script with it --
+# after the binary has been swapped and before anything has been started again.
+# The machine is then installed, registered, and not running, which is exactly
+# what happened to both of them.
+#
+# A one-shot task belongs to Task Scheduler, not to this process tree, so
+# nothing the session does can interrupt it. This function therefore only
+# schedules the work and returns; the update finishes and exits normally, and
+# the agent comes back a few seconds later.
 function Restart-Agent($argline) {
-    Stop-Agent
-    Start-Agent $argline
+    $inner = "& ([scriptblock]::Create((Get-Content '$StateDir\manage.ps1' -Raw))) -StartOnly"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $enc"
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+
+    if ($Scope -eq 'system') {
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+            -LogonType ServiceAccount -RunLevel Highest
+    } else {
+        $me = "$env:USERDOMAIN\$env:USERNAME"
+        $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+    }
+
+    Register-ScheduledTask -TaskName $RestartTaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Host "the agent will restart in a few seconds"
 }
 
 function Expected-Hash {
@@ -357,6 +391,20 @@ if ($Scope -eq 'system') {
 $Binary   = Join-Path $InstallDir 'multissh-agent.exe'
 $Manifest = Join-Path $StateDir 'manifest.json'
 
+# ------------------------------------------------------------- start only
+
+# Invoked by the one-shot task above, and by nothing else. Does the stop and
+# start that the update could not safely do itself, then removes the task that
+# ran it.
+if ($StartOnly) {
+    $m = Get-Manifest
+    if (-not $m) { Die "nothing installed here (no $Manifest)" }
+    Stop-Agent
+    Start-Agent $m.args
+    Unregister-ScheduledTask -TaskName $RestartTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    exit 0
+}
+
 # ------------------------------------------------------------- uninstall
 
 if ($Uninstall) {
@@ -386,6 +434,7 @@ if ($Uninstall) {
     $running = @(Find-AgentProcesses $m.binary)
 
     Remove-AgentTask
+    Unregister-ScheduledTask -TaskName $RestartTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $m.state -ErrorAction SilentlyContinue
     if (Test-Path $m.binary) {
         Move-Item -Force $m.binary "$($m.binary).removing" -ErrorAction SilentlyContinue
