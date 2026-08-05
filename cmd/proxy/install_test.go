@@ -175,3 +175,29 @@ func TestDistributorServesOnlyKnownBuilds(t *testing.T) {
 		t.Error("a traversal path is a known build")
 	}
 }
+
+// M9. A build file's name becomes a key in the rendered installer. A name
+// carrying shell metacharacters would inject into a script served to every
+// agent and run there as root, so write access to the dist directory would be
+// fleet-wide root execution. Names not of the form <os>-<arch> must be ignored
+// entirely, never reaching the script.
+func TestMaliciousBuildNameNeverReachesTheScript(t *testing.T) {
+	script := renderedInstaller(t, map[string]string{
+		"linux-amd64":      "a real build",
+		`x";touchpwned;"y`: "shell injection via the filename",
+		"has space":        "space breaks word splitting in the HASHES loop",
+		"UPPERCASE":        "not the documented lowercase form",
+		"three-part-name":  "arch field must not contain a dash",
+	})
+
+	// The one legitimate build is present.
+	if !strings.Contains(script, "linux-amd64:") {
+		t.Fatal("the valid build is missing from the rendered installer")
+	}
+	// None of the hostile names appear anywhere in the output.
+	for _, bad := range []string{"touchpwned", "has space", "UPPERCASE", "three-part-name"} {
+		if strings.Contains(script, bad) {
+			t.Errorf("a rejected build name reached the script: %q", bad)
+		}
+	}
+}

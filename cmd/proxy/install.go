@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +24,15 @@ var installShTemplate string
 
 //go:embed scripts/install.ps1
 var installPs1Template string
+
+// platformName is the only shape a build file may have: <os>-<arch>, lowercase
+// letters and digits. The name becomes a key in the rendered installer, so a
+// filename carrying a quote, space or semicolon would inject shell into a
+// script served to every agent and run there as root. Anyone able to write the
+// dist directory could otherwise turn one file into fleet-wide root execution.
+// Constraining the name at the source is what makes the later substitution
+// safe, whatever it does with the value.
+var platformName = regexp.MustCompile(`^[a-z0-9]+-[a-z0-9]+$`)
 
 // The proxy serves the installer and the agent binaries itself rather than
 // pointing at a release host. It has to be reachable for the agent to work at
@@ -56,7 +66,7 @@ func (d *distributor) scan() {
 	combined := sha256.New()
 	var names []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.Contains(e.Name(), "-") {
+		if e.IsDir() || !platformName.MatchString(e.Name()) {
 			continue
 		}
 		names = append(names, e.Name())

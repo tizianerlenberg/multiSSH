@@ -123,6 +123,30 @@ func TestScriptPrefersTheManifestBesideIt(t *testing.T) {
 	}
 }
 
+// H3. Piped from curl, $0 is "sh" with no slash, so dirname yields "." and
+// SELF_DIR became the current directory. A local user who dropped a manifest in
+// a directory an admin happened to be in before piping the installer to sudo
+// had its M_STATE/M_BIN sourced as root -- and --uninstall would rm -rf that
+// M_STATE. The self-location must therefore only run when $0 is a real path,
+// and a root-owned check must guard the source itself.
+func TestManifestIsNotAdoptedFromAPipedInstall(t *testing.T) {
+	script := installerSource(t)
+
+	// SELF_DIR is set only inside a `*/*)` branch: a path with a slash. A bare
+	// shell name never reaches the dirname.
+	if !strings.Contains(script, `*/*) SELF_DIR=`) {
+		t.Error("SELF_DIR is computed unconditionally; a piped install resolves it to the caller's cwd")
+	}
+	if strings.Contains(script, `SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF_DIR=`) &&
+		!strings.Contains(script, `case "$0" in`) {
+		t.Error("the old unconditional SELF_DIR assignment is still present")
+	}
+	// Sourcing a manifest as root requires it to be root-owned.
+	if !strings.Contains(script, `[ ! -O "$MANIFEST" ]`) {
+		t.Error("a manifest is sourced as root without checking it is root-owned")
+	}
+}
+
 // An uninstall run over the tunnel is killed the moment the service stops, so
 // everything that can be done beforehand must be.
 func TestUninstallRemovesBeforeStopping(t *testing.T) {
@@ -920,6 +944,20 @@ func TestMacInstallerHandlesBothDomainsAndSpaces(t *testing.T) {
 		t.Errorf("the LaunchDaemon path is assigned to PLIST %d times, want 1: a later assignment silently undoes the scope split", n)
 	}
 
+	// M8. PLIST/LAUNCH_DOMAIN follow SCOPE, and the manifest can change SCOPE.
+	// If they are derived before the manifest is read and never again, an
+	// uninstall run without sudo against a system install boots out the wrong
+	// domain and deletes the wrong plist, leaving a root daemon running with
+	// its keys gone. The derivation must be a function called after the
+	// manifest has been sourced.
+	setIdx := strings.Index(script, "set_launchd_paths\n") // the call, not the definition
+	srcIdx := strings.Index(script, `. "$MANIFEST"`)
+	if setIdx < 0 || srcIdx < 0 {
+		t.Error("launchd paths are not (re)derived after the manifest is sourced")
+	} else if setIdx < srcIdx {
+		t.Error("set_launchd_paths runs before the manifest can change SCOPE; the paths would be stale on uninstall")
+	}
+
 	// A user-scope Linux agent is gone the moment the user logs out unless the
 	// user manager lingers -- absent for precisely the state this tool exists
 	// to reach.
@@ -940,5 +978,28 @@ func TestMacInstallerHandlesBothDomainsAndSpaces(t *testing.T) {
 	}
 	if !strings.Contains(script, "StandardErrorPath") {
 		t.Error("the plist sends the agent's output nowhere, so a macOS failure would be silent")
+	}
+}
+
+// M7. ProgramData lets ordinary users create subdirectories, so a local user
+// could pre-create the system state directory and own it. An additive /grant
+// then leaves the creator's write access to a tree that runs as SYSTEM. The
+// lockdown must take ownership and *replace* the ACL, recursively, not add to
+// whatever was there.
+func TestPowerShellReplacesTheStateDirAcl(t *testing.T) {
+	script := powershellInstaller(t)
+	for _, want := range []string{
+		"takeown /F $StateDir", // seize ownership from any pre-creator
+		"/grant:r 'SYSTEM",     // replace, not add (/grant would be additive)
+		"/inheritance:r",       // drop inherited ACEs
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("install.ps1 state-dir lockdown is missing %q", want)
+		}
+	}
+	// The old additive form must be gone: a bare /grant (no :r) reintroduces
+	// the hole.
+	if strings.Contains(script, "/grant 'SYSTEM") {
+		t.Error("install.ps1 still uses an additive /grant; a pre-creator keeps write access")
 	}
 }

@@ -644,7 +644,17 @@ if (-not $Password) { Die 'a password is required' }
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 if ($Scope -eq 'system') {
     # Keys and certificate are readable only by SYSTEM and Administrators.
-    icacls $StateDir /inheritance:r /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' | Out-Null
+    #
+    # This must be a *replacement*, not an addition. ProgramData lets ordinary
+    # users create subdirectories, so a local user could pre-create this one and
+    # own it before the first install. New-Item -Force then adopts it, and a
+    # plain /grant leaves the creator's rights in place -- write access to a tree
+    # that runs as SYSTEM. So: take ownership, reset the ACL to discard any ACEs
+    # the creator added, then strip inheritance and grant only the two accounts
+    # -- all recursively (/T), in case files were pre-seeded too.
+    takeown /F $StateDir /A /R /D Y | Out-Null
+    icacls $StateDir /reset /T /C /Q | Out-Null
+    icacls $StateDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C /Q | Out-Null
 }
 # A user install lives under LOCALAPPDATA, which is already private to you --
 # and a local administrator could read it either way, exactly as on Linux.

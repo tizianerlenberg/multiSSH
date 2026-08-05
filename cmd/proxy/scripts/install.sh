@@ -52,10 +52,20 @@ done
 
 # Where this copy of the script is. The copy saved beside the agent lives in
 # the state directory, so it can find its own manifest even when the install
-# used paths that a freshly fetched script could never guess. Piped from curl
-# there is no path at all, and this resolves to somewhere harmless that simply
-# holds no manifest.
-SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF_DIR=
+# used paths that a freshly fetched script could never guess.
+#
+# Only when we were actually run from a file. Piped from curl, $0 is the shell
+# name with no slash and there is no script directory -- dirname would then
+# yield ".", making SELF_DIR the current directory. Adopting a manifest from
+# there is a local privilege escalation: any user can drop a manifest in a
+# world-writable directory an admin happens to `cd` into before piping the
+# installer to sudo, and its M_STATE/M_BIN would be sourced as root (and
+# --uninstall would rm -rf that M_STATE). So: a path with no slash means no
+# saved copy, and SELF_DIR stays empty.
+case "$0" in
+    */*) SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF_DIR= ;;
+    *)   SELF_DIR= ;;
+esac
 
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -132,12 +142,18 @@ MANIFEST="$STATE/manifest"
 
 # launchd has two domains and they are not interchangeable. A LaunchDaemon in
 # /Library runs as root at boot and needs root to install; a LaunchAgent in the
-# user's own Library runs as them at login and needs nothing. Everything darwin
-# used the daemon path regardless of scope, so an install without sudo tried to
-# write to /Library/LaunchDaemons and stopped there.
-PLIST=
-LAUNCH_DOMAIN=
-if [ "$OS" = darwin ]; then
+# user's own Library runs as them at login and needs nothing.
+#
+# These follow SCOPE, so they must be derived *after* SCOPE is final -- and the
+# manifest below can change it. Computing them here and not again meant an
+# uninstall that reads a system manifest while defaulting to user scope (a
+# no-sudo run) would boot out the wrong domain and delete the wrong plist,
+# leaving a root daemon running with its keys gone. So this is a function,
+# called once SCOPE has settled.
+set_launchd_paths() {
+    PLIST=
+    LAUNCH_DOMAIN=
+    [ "$OS" = darwin ] || return 0
     if [ "$SCOPE" = system ]; then
         PLIST=/Library/LaunchDaemons/net.multissh.agent.plist
         LAUNCH_DOMAIN=system
@@ -145,16 +161,32 @@ if [ "$OS" = darwin ]; then
         PLIST="$HOME/Library/LaunchAgents/net.multissh.agent.plist"
         LAUNCH_DOMAIN="gui/$(id -u)"
     fi
-fi
+}
 
 # An existing manifest is authoritative about where this machine put things,
 # which a freshly fetched script could not know if the paths were customised.
+#
+# Sourcing it runs its contents, so as root it must be root-owned. [ -O ] tests
+# ownership by the effective user; as root that is true only for a root-owned
+# file. This is a second line behind the SELF_DIR guard above: even a manifest
+# reached by some other path must not hand an unprivileged writer control of
+# what runs as root.
 if [ -f "$MANIFEST" ]; then
+    # -O (owned by the effective user) is outside the POSIX test spec but is
+    # implemented by every shell this runs under -- dash, bash, busybox ash --
+    # and is the exact question: as root, true only for a root-owned file.
+    # shellcheck disable=SC3067
+    if [ "$(id -u)" = 0 ] && [ ! -O "$MANIFEST" ]; then
+        die "refusing to read $MANIFEST as root: it is not owned by root"
+    fi
     # shellcheck disable=SC1090
     . "$MANIFEST"
     BIN=$M_BIN; STATE=$M_STATE; SCOPE=$M_SCOPE
     MANIFEST="$STATE/manifest"
 fi
+
+# SCOPE is now final -- the manifest, if any, has had its say.
+set_launchd_paths
 
 svc_name() { echo multissh-agent; }
 svc_stop() {
@@ -273,6 +305,9 @@ expected_hash() {
     return 0
 }
 
+# sha256_of prints the hash, or nothing if no hasher is installed. The caller
+# must treat the empty case as a failure, not as a pass: an absent hasher is
+# exactly when an unverified binary would slip through.
 sha256_of() {
     if have sha256sum; then sha256sum "$1" | cut -d' ' -f1
     elif have shasum; then shasum -a 256 "$1" | cut -d' ' -f1
@@ -307,7 +342,14 @@ download_binary() {
     echo "downloading agent $VERSION for $PLATFORM"
     fetch "$BASE_URL/dist/$PLATFORM" "$NEW" || { rm -f "$NEW"; die "download failed"; }
     GOT=$(sha256_of "$NEW")
-    if [ -n "$GOT" ] && [ "$GOT" != "$WANT" ]; then
+    # Fail closed. An empty GOT means no hasher is installed, so the binary is
+    # unverified -- which must stop the install, not pass it. This was the one
+    # place the two installers disagreed: install.ps1 always verifies, and a
+    # POSIX box without sha256sum or shasum silently did not.
+    if [ -z "$GOT" ]; then
+        rm -f "$NEW"; die "cannot verify the download: install sha256sum or shasum first"
+    fi
+    if [ "$GOT" != "$WANT" ]; then
         rm -f "$NEW"; die "checksum mismatch: expected $WANT, got $GOT"
     fi
     chmod 0755 "$NEW"
