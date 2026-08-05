@@ -129,3 +129,39 @@ func TestDescribeProtocol(t *testing.T) {
 		t.Errorf("DescribeProtocol(3) = %q", got)
 	}
 }
+
+// M1. The agent's identification string is attacker-controlled and its build
+// and platform are printed into the operator's terminal in the listing. CR and
+// LF are barred by the transport, but ESC is not, and a crafted value could
+// rewrite the very display the host-key eye-check relies on. Both fields must
+// be dropped unless they are exactly the shape a real agent sends.
+func TestParseVersionRejectsControlCharactersInBuildAndPlatform(t *testing.T) {
+	prefix := "SSH-2.0-multissh_agent_"
+
+	// A real one survives intact.
+	id := []byte(prefix + "1_deadbeefcafe_linux")
+	if b := ParseAgentBuild(id); b != "deadbeefcafe" {
+		t.Errorf("a valid build was mangled: %q", b)
+	}
+	if p := ParseAgentPlatform(id); p != "linux" {
+		t.Errorf("a valid platform was mangled: %q", p)
+	}
+
+	// An escape sequence in either field is dropped to empty, not passed on.
+	evil := []byte(prefix + "1_\x1b[2Kwiped_\x1b]0;title\x07")
+	if b := ParseAgentBuild(evil); b != "" {
+		t.Errorf("a build with an escape sequence reached the caller: %q", b)
+	}
+	if p := ParseAgentPlatform(evil); p != "" {
+		t.Errorf("a platform with an escape sequence reached the caller: %q", p)
+	}
+
+	// Uppercase, spaces and punctuation are not the expected shape either.
+	odd := []byte(prefix + "1_UPPER_deb;rm")
+	if b := ParseAgentBuild(odd); b != "" {
+		t.Errorf("a non-hex build was accepted: %q", b)
+	}
+	if p := ParseAgentPlatform(odd); p != "" {
+		t.Errorf("a platform with punctuation was accepted: %q", p)
+	}
+}

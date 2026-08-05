@@ -663,7 +663,10 @@ func main() {
 			if _, err := certChecker.Authenticate(c, key); err != nil {
 				return nil, fmt.Errorf("certificate rejected: %w", err)
 			}
-			if !sshx.IsCanonicalName(c.User()) {
+			// Strict, not just "has a dot": the name is logged and written to
+			// the last-seen file, so it must be a well-formed derived name and
+			// nothing that could carry a control character into either.
+			if !sshx.ValidCanonicalName(c.User()) {
 				return nil, fmt.Errorf("agents must connect under their canonical name")
 			}
 			// Principals are [canonical, friendly]; the friendly one is a
@@ -675,8 +678,14 @@ func main() {
 				"build":     sshx.ParseAgentBuild(c.ClientVersion()),
 				"platform":  sshx.ParseAgentPlatform(c.ClientVersion()),
 			}
+			// Take a friendly name only if it is a valid one. It is written to
+			// the ledger, the last-seen file and the log, so a principal
+			// carrying a newline or control character -- which a certificate
+			// issued outside the normal path could hold -- must never reach
+			// them. A machine with no valid friendly principal stays reachable
+			// canonically.
 			for _, p := range cert.ValidPrincipals {
-				if !sshx.IsCanonicalName(p) {
+				if !sshx.IsCanonicalName(p) && sshx.ValidFriendlyName(p) {
 					ext["friendly"] = p
 					break
 				}

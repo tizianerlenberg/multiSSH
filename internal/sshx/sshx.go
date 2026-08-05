@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,50 @@ type DirectTCPIP struct {
 	DestPort uint32
 	OrigHost string
 	OrigPort uint32
+}
+
+// WriteFileAtomic writes data to a temporary file in the same directory, syncs
+// it, and renames it over path. rename(2) is atomic within a filesystem, so a
+// reader sees either the whole old file or the whole new one, never a truncated
+// mix. This matters for the files whose partial write is silently wrong rather
+// than merely absent -- a half-written revocation list un-revokes whatever fell
+// past the cut, a half-written key is unparseable. The temp file must share the
+// directory, or the rename crosses filesystems and degrades to copy-and-unlink.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// Best-effort cleanup: harmless if the rename already consumed it.
+	defer os.Remove(tmp)
+
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Sync the directory so the rename itself survives a crash, not just the
+	// file's contents. Best-effort: some platforms disallow opening a dir.
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // LoadOrCreateHostKey reads an ed25519 private key, generating and persisting
@@ -49,7 +94,7 @@ func LoadOrCreateHostKey(path string) (ssh.Signer, error) {
 		return nil, err
 	}
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
-	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+	if err := WriteFileAtomic(path, pemBytes, 0o600); err != nil {
 		return nil, err
 	}
 	return ssh.NewSignerFromKey(priv)

@@ -108,7 +108,10 @@ func savePasswords(path string, list []password) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	// Atomic: a crash mid-write must not leave a truncated JSON file that fails
+	// to parse and disables enrolment, or worse, that drops a password you
+	// believed removed.
+	return sshx.WriteFileAtomic(path, append(data, '\n'), 0o600)
 }
 
 // limiter is a small fixed-window counter, keyed by client address.

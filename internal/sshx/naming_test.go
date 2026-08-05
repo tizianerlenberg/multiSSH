@@ -142,3 +142,31 @@ func TestCanonicalNamesAreAlwaysCanonicalShaped(t *testing.T) {
 		}
 	}
 }
+
+// M10. IsCanonicalName only checks for a dot, but the canonical name is logged
+// and written to the last-seen file. ValidCanonicalName is the strict form: it
+// accepts exactly what CanonicalName emits and refuses anything that could
+// smuggle a control character into those sinks.
+func TestValidCanonicalName(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signer, _ := ssh.NewSignerFromKey(priv)
+	real, err := CanonicalName("laptop", signer.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ValidCanonicalName(real) {
+		t.Errorf("a name from CanonicalName failed ValidCanonicalName: %q", real)
+	}
+
+	for _, bad := range []string{
+		"laptop",                 // no hash: a friendly name, not canonical
+		"laptop.short",           // hash too short / wrong alphabet
+		"laptop.\x1b[2Kaaaaaaaa", // control character in the hash
+		"ev\nil.abcdefghijkl",    // newline in the label
+		"laptop.ABCDEFGHIJKL",    // uppercase is outside the base32 alphabet
+	} {
+		if ValidCanonicalName(bad) {
+			t.Errorf("ValidCanonicalName accepted %q", bad)
+		}
+	}
+}

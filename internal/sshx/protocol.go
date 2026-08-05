@@ -6,10 +6,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
+)
+
+// The agent's identification string is attacker-controlled: any host can dial
+// the agent endpoint and send whatever version string it likes. It cannot
+// contain CR or LF (the SSH transport forbids them), but nothing stops an ESC,
+// and the build and platform are printed straight into the operator's terminal
+// in the listing. A crafted value could rewrite that display -- the very
+// surface the host-key eye-check depends on. So both fields are constrained to
+// exactly the shape a real agent sends, and anything else is dropped to empty,
+// indistinguishable from an agent that sent nothing.
+var (
+	buildIDRe  = regexp.MustCompile(`^[0-9a-f]{1,32}$`) // a short hex SHA
+	platformRe = regexp.MustCompile(`^[a-z0-9]{1,32}$`) // a GOOS name
 )
 
 // Versioning between the agent and the proxy.
@@ -116,6 +130,14 @@ func parseVersion(id, prefix string) (proto int, build, platform string) {
 		return LegacyProtocol, "", ""
 	}
 	build, platform, _ = strings.Cut(rest, "_")
+	// Drop anything not of the expected shape: the values reach the operator's
+	// terminal, and a control character there is an injection, not a build ID.
+	if !buildIDRe.MatchString(build) {
+		build = ""
+	}
+	if !platformRe.MatchString(platform) {
+		platform = ""
+	}
 	return n, build, platform
 }
 

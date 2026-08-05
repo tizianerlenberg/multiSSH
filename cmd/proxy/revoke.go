@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"multissh/internal/sshx"
 )
 
 // Revocation, and why it works on fingerprints.
@@ -96,6 +98,15 @@ func readRevocations(path string) (map[string]string, error) {
 			continue
 		}
 		fp, note, _ := strings.Cut(line, " ")
+		// Fail closed. A malformed line means a corrupted or hand-mangled
+		// revocation file; silently taking a truncated token as the barred key
+		// would leave the machine it was meant to bar un-revoked -- the one
+		// outcome a security control must never produce quietly. The callers
+		// treat this error as fatal at startup and keep the previous set on
+		// reload, both of which are safer than adopting a file we cannot trust.
+		if err := validFingerprint(fp); err != nil {
+			return nil, fmt.Errorf("%s: refusing to load a malformed revocation entry: %w", path, err)
+		}
 		m[fp] = strings.TrimSpace(note)
 	}
 	return m, sc.Err()
@@ -259,5 +270,7 @@ func writeRevocations(path string, m map[string]string) error {
 	for _, fp := range fps {
 		fmt.Fprintf(&b, "%s %s\n", fp, m[fp])
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o600)
+	// Atomic: a crash mid-write must not leave a truncated list that silently
+	// un-revokes whatever fell past the cut.
+	return sshx.WriteFileAtomic(path, []byte(b.String()), 0o600)
 }

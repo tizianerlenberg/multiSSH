@@ -42,8 +42,20 @@ var friendlyRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 func ValidFriendlyName(s string) bool { return friendlyRe.MatchString(s) }
 
 // IsCanonicalName reports whether s looks like a derived name rather than a
-// friendly one.
+// friendly one. It is the namespace check -- a dot is the whole distinction --
+// and is deliberately loose. For anything that will be logged or written to a
+// file, use ValidCanonicalName instead.
 func IsCanonicalName(s string) bool { return strings.Contains(s, ".") }
+
+// canonicalRe is exactly what CanonicalName emits: a valid label, a dot, and
+// hashLen base32 characters from the lowercase-no-padding alphabet.
+var canonicalRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}\.[a-z2-7]{12}$`)
+
+// ValidCanonicalName reports whether s is a well-formed derived name, not merely
+// one containing a dot. The name is written to the last-seen file and the log,
+// so a value carrying a control character -- which a certificate minted outside
+// the normal path could hold as a principal -- must be refused, not recorded.
+func ValidCanonicalName(s string) bool { return canonicalRe.MatchString(s) }
 
 // nameDomain separates this hash from any other use of the same key material,
 // so a digest computed elsewhere can never be mistaken for a name.
