@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -9,30 +10,71 @@ import (
 	"time"
 )
 
-// Regression. clientAddr once returned RemoteAddr whole, port included. Every
-// connection gets a fresh source port, so each attempt landed under its own key
-// and the rate limit counted to one forever -- while looking entirely correct
-// in the code and in any test that made a single request.
-//
-// It would also have stayed hidden in production: behind Caddy the
-// X-Forwarded-For path carries no port, so only a directly exposed proxy -- the
-// case where the limit actually matters -- was unprotected.
-func TestClientAddrStripsThePort(t *testing.T) {
+// realClientHost decides whose address a rate limit is charged to. Getting it
+// wrong two different ways was live at once: the header was trusted from
+// anyone, so a client on the open internet could forge its own key and evade
+// the limit -- or set someone else's address and frame them into it -- and the
+// leftmost entry was taken, the one entirely under the client's control.
+func TestRealClientHostTrustsTheHeaderOnlyFromAProxy(t *testing.T) {
+	// The documented deployment: a reverse proxy on loopback.
+	trusted, err := parseTrustedProxies("127.0.0.0/8,::1/128")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Directly exposed: the peer is a real remote address, not a trusted
+	// proxy, so its X-Forwarded-For is a forgery and must be ignored. The
+	// address charged is the socket peer, port stripped.
 	r := httptest.NewRequest("POST", "/enroll", nil)
 	r.RemoteAddr = "203.0.113.9:54321"
-	if got := clientAddr(r); got != "203.0.113.9" {
-		t.Errorf("clientAddr = %q, want the address without its port", got)
+	r.Header.Set("X-Forwarded-For", "10.0.0.1") // an attacker's invention
+	if got := realClientHost(r, trusted); got != "203.0.113.9" {
+		t.Errorf("exposed proxy honoured a forged header: got %q, want the real peer", got)
 	}
 
-	r.RemoteAddr = "[2001:db8::1]:54321"
-	if got := clientAddr(r); got != "2001:db8::1" {
-		t.Errorf("clientAddr for IPv6 = %q", got)
+	// Behind the trusted proxy on loopback: the forwarded client is believed.
+	r = httptest.NewRequest("POST", "/enroll", nil)
+	r.RemoteAddr = "127.0.0.1:44444"
+	r.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got := realClientHost(r, trusted); got != "198.51.100.7" {
+		t.Errorf("fronted proxy did not use the forwarded client: got %q", got)
 	}
 
-	// A reverse proxy's report wins, and its first entry is the client.
-	r.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.1")
-	if got := clientAddr(r); got != "198.51.100.7" {
-		t.Errorf("clientAddr behind a proxy = %q", got)
+	// A client that prepends forged hops cannot escape: the trusted proxy
+	// appends the address it actually saw, so the rightmost entry is the one
+	// still under our control.
+	r = httptest.NewRequest("POST", "/enroll", nil)
+	r.RemoteAddr = "127.0.0.1:44444"
+	r.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8, 198.51.100.7")
+	if got := realClientHost(r, trusted); got != "198.51.100.7" {
+		t.Errorf("took a forgeable leftmost entry instead of the rightmost: got %q", got)
+	}
+
+	// No header behind the proxy: fall back to the peer.
+	r = httptest.NewRequest("POST", "/enroll", nil)
+	r.RemoteAddr = "127.0.0.1:44444"
+	if got := realClientHost(r, trusted); got != "127.0.0.1" {
+		t.Errorf("no header, got %q", got)
+	}
+}
+
+// The rate-limiter map is keyed by attacker-chosen source address on a public
+// listener. Nothing dropped stale keys, so it grew for the life of the process.
+func TestLimiterForgetsAddressesThatAgeOut(t *testing.T) {
+	l := newLimiter(20*time.Millisecond, 3)
+	for i := 0; i < 500; i++ {
+		l.allow(fmt.Sprintf("10.0.0.%d", i)) // each a distinct, one-shot source
+	}
+	if n := len(l.seen); n < 400 {
+		t.Fatalf("only %d keys after 500 distinct sources; test is not exercising growth", n)
+	}
+
+	time.Sleep(40 * time.Millisecond) // everything is now older than the window
+
+	// A later call sweeps: the map must not still hold the aged-out crowd.
+	l.allow("10.0.1.1")
+	if n := len(l.seen); n > 5 {
+		t.Errorf("map still holds %d keys after the window elapsed; it is unbounded", n)
 	}
 }
 

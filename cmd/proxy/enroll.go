@@ -39,7 +39,14 @@ const (
 	argonMemory  = 64 * 1024
 	argonThreads = 4
 	argonKeyLen  = 32
+
+	// argonParallelism caps concurrent verifications so peak memory from them
+	// is bounded (this many times argonMemory) regardless of request volume.
+	argonParallelism = 4
 )
+
+// argonSlots bounds concurrent argon2id work across every enrolment request.
+var argonSlots = make(chan struct{}, argonParallelism)
 
 // password is one enrolment credential. Stored hashed, with an expiry.
 type password struct {
@@ -106,14 +113,41 @@ func savePasswords(path string, list []password) error {
 
 // limiter is a small fixed-window counter, keyed by client address.
 type limiter struct {
-	mu     sync.Mutex
-	seen   map[string][]time.Time
-	window time.Duration
-	burst  int
+	mu        sync.Mutex
+	seen      map[string][]time.Time
+	window    time.Duration
+	burst     int
+	lastSweep time.Time
 }
 
 func newLimiter(window time.Duration, burst int) *limiter {
 	return &limiter{seen: make(map[string][]time.Time), window: window, burst: burst}
+}
+
+// sweepLocked drops keys whose events have all aged out. The key space is the
+// set of source addresses seen in one window, so without this the map grows
+// for the life of the process, keyed by an address an attacker chooses -- a
+// slow leak on the public listener. Run at most once per window from the write
+// path, so it costs a full pass rarely rather than on every call. Caller holds
+// the lock.
+func (l *limiter) sweepLocked(now time.Time) {
+	if now.Sub(l.lastSweep) < l.window {
+		return
+	}
+	l.lastSweep = now
+	cutoff := now.Add(-l.window)
+	for k, times := range l.seen {
+		fresh := false
+		for _, t := range times {
+			if t.After(cutoff) {
+				fresh = true
+				break
+			}
+		}
+		if !fresh {
+			delete(l.seen, k)
+		}
+	}
 }
 
 // count reports recent events without recording one, so a check can be made
@@ -135,7 +169,10 @@ func (l *limiter) allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	cutoff := time.Now().Add(-l.window)
+	now := time.Now()
+	l.sweepLocked(now)
+
+	cutoff := now.Add(-l.window)
 	kept := l.seen[key][:0]
 	for _, t := range l.seen[key] {
 		if t.After(cutoff) {
@@ -146,7 +183,7 @@ func (l *limiter) allow(key string) bool {
 		l.seen[key] = kept
 		return false
 	}
-	l.seen[key] = append(kept, time.Now())
+	l.seen[key] = append(kept, now)
 	return true
 }
 
@@ -181,6 +218,7 @@ type enroller struct {
 	limit     *limiter
 	validity  time.Duration
 	revoked   *revocations
+	trusted   []*net.IPNet
 }
 
 func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +226,7 @@ func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	who := clientAddr(r)
+	who := realClientHost(r, e.trusted)
 	if !e.limit.allow(who) {
 		http.Error(w, "too many attempts", http.StatusTooManyRequests)
 		return
@@ -197,6 +235,20 @@ func (e *enroller) handle(w http.ResponseWriter, r *http.Request) {
 	var req enrolRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Verifying the password is the expensive part: one argon2id per stored
+	// credential, each argonMemory (64 MiB). Bound how many run at once across
+	// all requests, and shed load rather than queue when saturated, so a burst
+	// -- even one that slips past the per-source limit from enough addresses --
+	// cannot exhaust memory and take every agent down with it. Acquired after
+	// the cheap checks so a malformed request never occupies a slot.
+	select {
+	case argonSlots <- struct{}{}:
+		defer func() { <-argonSlots }()
+	default:
+		http.Error(w, "busy, retry shortly", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -294,23 +346,6 @@ func parseAuthorizedKey(s string) (ssh.PublicKey, error) {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
 	return pub, nil
-}
-
-// clientAddr prefers the address a reverse proxy reports, since every request
-// otherwise appears to come from loopback.
-//
-// The port must be stripped. RemoteAddr carries one, and every new connection
-// gets a new port, so keying a rate limit on it counts each attempt separately
-// and limits nothing whatsoever.
-func clientAddr(r *http.Request) string {
-	if f := r.Header.Get("X-Forwarded-For"); f != "" {
-		first, _, _ := strings.Cut(f, ",")
-		return strings.TrimSpace(first)
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
 }
 
 // logf mirrors the package's logging style without importing log here twice.

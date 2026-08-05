@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -112,6 +113,81 @@ func sourceHost(addr net.Addr) string {
 		return host
 	}
 	return addr.String()
+}
+
+// hostOnly strips a port from an address string, tolerating one that has none.
+func hostOnly(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
+// parseTrustedProxies turns a comma-separated list of CIDRs and bare IPs into
+// networks. A bare address becomes a single-host network. These are the only
+// peers whose X-Forwarded-For header is believed.
+func parseTrustedProxies(s string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(part); err == nil {
+			out = append(out, n)
+			continue
+		}
+		ip := net.ParseIP(part)
+		if ip == nil {
+			return nil, fmt.Errorf("not an IP or CIDR: %q", part)
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return out, nil
+}
+
+func ipInAny(host string, nets []*net.IPNet) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// realClientHost decides which address a request is attributed to for rate
+// limiting. X-Forwarded-For is honoured only when the immediate peer is a
+// trusted reverse proxy; from anyone else the header is attacker-controlled and
+// ignored, so a client on the open internet cannot forge its own limiter key --
+// nor frame someone else's address into the penalty box.
+//
+// When trusted, the *rightmost* entry is taken, not the leftmost. A client can
+// prepend any number of forged hops, but the trusted proxy appends the address
+// it actually saw, so the last element is the furthest-right value still under
+// our control. With a single front proxy that is exactly the real client.
+func realClientHost(r *http.Request, trusted []*net.IPNet) string {
+	peer := hostOnly(r.RemoteAddr)
+	if !ipInAny(peer, trusted) {
+		return peer
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return peer
+	}
+	parts := strings.Split(xff, ",")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	if last == "" {
+		return peer
+	}
+	return last
 }
 
 // registration is one connected agent under one of its names. The fingerprint
@@ -282,6 +358,11 @@ func main() {
 		maxUsers  = flag.Int("max-user-connections", 64, "connections in flight on the user listener; 0 is unlimited")
 		maxAgents = flag.Int("max-agent-connections", 2048, "connections in flight on the agent listener; 0 is unlimited")
 		minProto  = flag.Int("min-agent-protocol", sshx.LegacyProtocol, "refuse agents older than this protocol version")
+		// Only these peers' X-Forwarded-For is believed. The default matches
+		// the documented deployment -- a reverse proxy on loopback -- so an
+		// exposed proxy keys rate limits on the real peer and a fronted one on
+		// the forwarded client, both without configuration.
+		trustedProxies = flag.String("trusted-proxies", "127.0.0.0/8,::1/128", "CIDRs whose X-Forwarded-For is trusted for rate limiting")
 
 		showCA        = flag.Bool("show-ca", false, "print the certificate authority public key and exit")
 		signKey       = flag.String("sign", "", "issue a certificate for this public key file, then exit")
@@ -301,6 +382,11 @@ func main() {
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
+
+	trusted, err := parseTrustedProxies(*trustedProxies)
+	if err != nil {
+		log.Fatalf("-trusted-proxies: %v", err)
+	}
 
 	// Revocation is handled before anything else touches a key. It needs no
 	// authority at all -- a standby can revoke too, and should be able to,
@@ -372,7 +458,6 @@ func main() {
 	var (
 		ca    ssh.Signer
 		caPub ssh.PublicKey
-		err   error
 	)
 	if *caPubFile != "" {
 		caPub, err = sshx.LoadPublicKey(*caPubFile)
@@ -634,6 +719,7 @@ func main() {
 					limit:     newLimiter(enrolRateWindow, enrolRateBurst),
 					validity:  *enrolValid,
 					revoked:   revoked,
+					trusted:   trusted,
 				},
 			}
 			extra.enrol.passwords.Store(&pws)
@@ -688,7 +774,7 @@ func main() {
 	userSlots := newSlots(*maxUsers, "user")
 
 	go serveWebSocket(*wsAddr, *wsPath, "agent", agentCfg, agentHandler,
-		serveHealth(reg, seen, revoked, dist, *staleAfter), extra, agentSlots)
+		serveHealth(reg, seen, revoked, dist, *staleAfter), extra, agentSlots, trusted)
 
 	serve(*userAddr, "user", userCfg, func(c *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 		handleUser(reg, seen, dist, *staleAfter, c, chans, reqs)
@@ -776,16 +862,22 @@ type connHandler func(*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Reques
 
 // takeConn runs the SSH server handshake over any transport: a plain socket,
 // or a WebSocket presented as a net.Conn.
-func takeConn(nc net.Conn, kind string, cfg *ssh.ServerConfig, h connHandler, limit *slots) {
+//
+// peer is the address to attribute this connection to for the auth-failure
+// limiter, resolved by the caller: the direct socket peer on the plain
+// listener, and the forwarded client on the WebSocket one. It is not
+// re-derived from nc here, because behind a reverse proxy nc's remote address
+// is the proxy's loopback address -- the same for every agent -- so one
+// attacker's failures would lock out the entire fleet.
+func takeConn(nc net.Conn, peer, kind string, cfg *ssh.ServerConfig, h connHandler, limit *slots) {
 	defer nc.Close()
 
 	if !limit.take() {
-		log.Printf("%s refusing %s: %d connections already in flight", kind, nc.RemoteAddr(), limit.inUse())
+		log.Printf("%s refusing %s: %d connections already in flight", kind, peer, limit.inUse())
 		return
 	}
 	defer limit.give()
 
-	peer := sourceHost(nc.RemoteAddr())
 	if authFailures.count(peer) >= authFailBurst {
 		log.Printf("%s refusing %s: too many recent auth failures", kind, peer)
 		return
@@ -813,13 +905,29 @@ func serve(addr, kind string, cfg *ssh.ServerConfig, h connHandler, limit *slots
 		log.Fatalf("listen %s: %v", addr, err)
 	}
 	log.Printf("%s listener on %s", kind, addr)
+
+	// Back off on a transient accept error rather than spinning. A permanent
+	// one -- most often running out of file descriptors -- otherwise returns
+	// instantly every iteration, pinning a core and flooding the log while
+	// nothing gets served. A closed listener means shutdown; stop.
+	backoff := 5 * time.Millisecond
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("%s accept: %v (retrying in %s)", kind, err, backoff)
+			time.Sleep(backoff)
+			if backoff < time.Second {
+				backoff *= 2
+			}
 			continue
 		}
-		go takeConn(nc, kind, cfg, h, limit)
+		backoff = 5 * time.Millisecond
+		// The direct peer is the client on this listener: it is a plain TCP
+		// socket, not fronted by the reverse proxy.
+		go takeConn(nc, sourceHost(nc.RemoteAddr()), kind, cfg, h, limit)
 	}
 }
 
@@ -896,7 +1004,7 @@ func serveHealth(reg *registry, seen *sightings, revoked *revocations, dist *dis
 	}
 }
 
-func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, health http.HandlerFunc, extra *httpExtras, limit *slots) {
+func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandler, health http.HandlerFunc, extra *httpExtras, limit *slots, trusted []*net.IPNet) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", health)
 	if extra != nil {
@@ -918,9 +1026,13 @@ func serveWebSocket(addr, path, kind string, cfg *ssh.ServerConfig, h connHandle
 			log.Printf("%s websocket upgrade from %s failed: %v", kind, r.RemoteAddr, err)
 			return
 		}
+		// Behind the reverse proxy the socket peer is loopback; the real
+		// client is what the proxy forwarded. Resolved here, where the HTTP
+		// headers are, and handed to takeConn.
+		peer := realClientHost(r, trusted)
 		// Binary frames, and a context that outlives the handshake so the
 		// session is not cancelled underneath us.
-		takeConn(websocket.NetConn(context.Background(), c, websocket.MessageBinary), kind, cfg, h, limit)
+		takeConn(websocket.NetConn(context.Background(), c, websocket.MessageBinary), peer, kind, cfg, h, limit)
 	})
 
 	// No server-wide timeouts: these connections are meant to stay open.
