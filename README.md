@@ -298,8 +298,17 @@ would accept it in silence — pubkey auth would not leak your key, but you woul
 be typing into someone else's shell. Leaving targets on trust-on-first-use
 means such a substitution trips the usual `HOST KEY CHANGED` warning.
 
-A compromised proxy therefore cannot read your sessions, cannot log into your
-machines, and cannot impersonate one to you. It can deny service.
+A compromised proxy therefore cannot read your sessions and cannot impersonate
+a target to you — a substituted host key trips the `HOST KEY CHANGED` warning.
+
+It **can** do two things, and honesty about the second matters. It can deny
+service. And it can **push code to your machines through the update path**:
+`--update` fetches an installer from the proxy and runs it as root, with no
+signature the target checks (see [Update trust](#update-trust)). So a proxy you
+keep honest stays out of your machines; a proxy that turns hostile reaches them
+at the next update. That is inherent to a reverse jump host — the thing that
+serves the binary is trusted for it — and the way to bound it is documented
+below rather than claimed away here.
 
 ### Two names per target
 
@@ -430,59 +439,92 @@ hardware is genuinely out of your hands, `-remove-password` too.
 
 ### Verified by test
 
-`go test ./...` runs everything below. The end-to-end tests build the real
-proxy and agent binaries and run them over loopback, including a real PTY, so
-they check the shipped programs rather than a rehearsal of them. `-short` skips
-those and leaves the unit tests.
+`go test ./...` runs everything in this first list. The end-to-end tests build
+the real proxy and agent binaries and run them over loopback, including a real
+PTY, so they check the shipped programs rather than a rehearsal of them.
+`-short` skips those and leaves the unit tests. A second list, *Checked by hand*,
+follows — read the boundary between them, because the difference is the point.
 
-- `ssh -R` cannot make the proxy open a listening port
-- `exec`, `subsystem`, X11 and agent forwarding are refused on the proxy
-- an unregistered label is rejected
+The routing and identity boundaries:
+
 - **`ssh -L` reaches nothing** — routing is a map lookup, so the client-supplied
   host is never dialled and the client-supplied port is ignored. This matters:
   `-L` and `-J` are byte-identical on the wire, so that lookup *is* the
   security boundary, not merely routing
+- an unregistered label is rejected; `exec` and non-`sftp` subsystems are refused
 - a reconnecting agent cannot be deregistered by the ghost connection it
   replaced
-- session teardown signals the shell's whole process group; no orphans after
-  `kill -9` of the client
 - the proxy survives being destroyed: with only `proxy_ca_key` restored and a
   brand new host key, the agent re-registers unaided
-- a silent unauthenticated client is dropped after 30s, while an established
-  session survives well past that
-- a frozen agent (`SIGSTOP`) is evicted from the registry within ~30s, and a
-  connection attempt to it fails in ~10s rather than hanging
-- reconnect backoff resets after a healthy session, so recovery stays fast
-- `sftp` and `scp` move files in both directions through the tunnel, while
-  other subsystems stay refused
-- the installer works over real TLS through real Caddy, end to end
-- failed ssh handshakes are counted per source address and refused past a
-  threshold, as `/enroll` attempts already were
+- `sftp` moves files in both directions through the tunnel (`scp` rides the same
+  subsystem)
+
+The authentication boundaries, several added after an external audit found the
+first of them:
+
+- an agent presenting a certificate from **any other authority** is refused —
+  the proxy verifies the signing CA, not just that the certificate is
+  self-consistent (this was a real bypass; the test fails against the old code)
+- a proxy **host** certificate cannot be used as an **agent** credential
+- rate limits are charged to the real client: `X-Forwarded-For` is trusted only
+  from a `-trusted-proxies` peer, and its rightmost, unforgeable entry is used
+- a certificate principal carrying a control character cannot reach the log or
+  the last-seen file; a build/platform string carrying a terminal escape cannot
+  reach the listing
+- a build file whose name is not `<os>-<arch>` never reaches the rendered
+  installer
+- the revocation list, passwords and host key are written atomically; a
+  malformed revocation line fails closed
 - a revoked agent cannot register, and un-revoking lets it back in
-- an agent below the configured protocol floor is refused, and is *told why* in
-  its own log
+- failed ssh handshakes are counted per source and refused past a threshold
+- an agent below the configured protocol floor is refused, and told why
+
+The operational properties:
+
 - `/healthz` reports without naming a single target
 - a withdrawn enrolment password stops working on reload, and a corrupt
-  password file leaves the previous set in force rather than disabling
-  enrolment outright
-- publishing a new agent build and reloading with `SIGHUP` does not disconnect
-  a single agent, and the listing flips to `OUTDATED`
-- four regressions are frozen against their original shapes: rate-limit keys
-  must strip the source port; `expected_hash` must exit zero when the platform
-  is not the last entry; nothing may stop the agent before its binary is
-  swapped; and the saved installer must re-fetch rather than compare against
-  its own frozen version
+  password file leaves the previous set in force rather than disabling enrolment
+- publishing a new agent build and reloading with `SIGHUP` disconnects no agent,
+  and the listing flips to `OUTDATED`
+- the agent's inner handshake is bounded, so a tunnel opened and left silent is
+  closed rather than held
+- `authorize.sh` adds and removes login keys and refuses to push an empty set
+- several regressions are frozen against their original shapes, including two
+  that were invisible in exactly the configuration first tested — one build
+  served, one request made — and only appeared in the shape a real deployment
+  takes
 
-The last two are there because both bugs were invisible in exactly the
-configuration they were tested in — one build served, one request made — and
-only appeared in the shape a real deployment takes.
+### Checked by hand, not automated
+
+These held when last exercised by hand but are **not** in `go test`, so treat
+them as claims backed by a person, not a machine. The end-to-end package
+explains why some resist automation; the honest reason for the rest is that the
+shell harness that once verified them was lost.
+
+- session teardown leaves no orphan after `kill -9` of the client, and a frozen
+  agent (`SIGSTOP`) is evicted within ~30s
+- the proxy drops a silent *unauthenticated* client after 30s (the *agent's*
+  inner-handshake equivalent **is** tested)
+- reconnect backoff resets after a healthy session
+- X11 and agent forwarding are refused (only `exec`/`subsystem` refusal is tested)
+- the installer works over real TLS through real Caddy (Caddy appears only in a
+  comment and the manual walkthrough)
+- the Windows and macOS install paths on real hardware — the installers are
+  covered only by assertions against their rendered text
 
 ### Before exposing it publicly
 
-This has still only ever run on a LAN, against a single agent, on Linux. Treat
-internet exposure as untested. Concretely, what is *not* there: no cap on
-concurrent connections, and no per-user access control — any key in
-`users_authorized_keys` reaches every registered target.
+This has run on a LAN against a handful of agents on Linux, Windows and macOS,
+but not at scale or under hostile traffic; treat internet exposure as
+lightly tested rather than proven. Connection caps exist (`-max-user-connections`,
+`-max-agent-connections`, enforced before the handshake) and failed handshakes
+and `/enroll` attempts are rate limited per source — but the source is only
+trustworthy behind a reverse proxy listed in `-trusted-proxies` (default
+loopback), so set that correctly if you front it with anything else.
+
+What is genuinely *not* there: **no per-user access control** — any key in
+`users_authorized_keys` reaches every registered target — and the **unsigned
+update path** described under [Update trust](#update-trust).
 
 ---
 
@@ -498,6 +540,8 @@ concurrent connections, and no per-user access control — any key in
 | 🟡 | Everyone with a user key reaches every target. No ACLs. | Fine for one operator; wrong the moment a second key is added for someone else. |
 | 🟡 | Proxy configuration is entirely flags, held in the systemd unit. | `install-proxy.sh` writes the unit once and never overwrites it, so changes are edited on the server. |
 | 🟡 | Agents are never updated automatically. | A sweep is something you run; nothing happens on its own. Deliberate — an automatic update that goes wrong takes out every machine at once. |
+| 🟡 | **The update path is unsigned**: `--update` runs an installer fetched from the proxy as root, so a compromised **primary** proxy can push root code to every target at the next update. | Accepted for now (single proxy, host you control). [Update trust](#update-trust) describes it and the signed-release design that would close it. |
+| 🟡 | Revocation is **per-proxy**: `-revoke` on the primary does not reach a standby, which enforces its own list. | Matters only if you run standbys. Until then, moot; when you do, copy `revoked_keys` across as part of revoking. |
 | ⚪ | A machine that enrolled but never once connected is invisible to the proxy — enrolment writes nothing there. | The installer reports success on the target instead. |
 
 ## Installing a target
@@ -522,6 +566,32 @@ irm https://multissh.example.com/install.ps1 | iex                    # windows,
 Re-running the installer on an enrolled machine updates it rather than
 enrolling a second identity; `--reenroll` forces a fresh one.
 
+### Update trust
+
+`--update` fetches the installer from the proxy over HTTPS and runs it as root.
+There is no signature the target checks: the integrity check lives *inside* the
+fetched script, and the binary's hash is baked into that same script by the same
+server. So whatever can serve or tamper with the primary's HTTPS response — the
+primary host itself, or anything terminating its TLS — can run code as root on
+every target at the next update. This is inherent to a reverse jump host: the
+thing that ships the binary is trusted for it. Updates are at least **operator-driven** — nothing is pushed on its own, and the agent has no self-update path.
+
+**Current stance (accepted, single proxy):** the primary is trusted for updates.
+If you run it on infrastructure you control and keep `proxy_ca_key` safe, this is
+a conscious trade, not a surprise. Keep the proxy host well-patched, since it is
+a root channel into your fleet.
+
+**The design that would close it, if wanted later (a separate signing key kept
+off the proxy):** generate an update-signing keypair; pin its public half in the
+installer the way `proxy_ca.pub` already is; keep its private half on the
+machine that runs `deploy/push.sh`, never on the proxy. `push.sh` signs each
+release, the proxy serves the signature alongside the binary, and the installer
+verifies it before running. A compromised proxy — even the primary, even with
+the CA key — then cannot forge an update, dropping its blast radius from "root
+on every machine" to "can mint rogue agent certificates." The friction is one
+local signing step in `push.sh`, which already runs on that machine. Not built;
+recorded here so the choice stays visible.
+
 It asks two things — the machine's name, defaulting to the hostname, and the
 enrollment password — shows every path it will touch, and takes one
 confirmation. Answering `c` walks each setting. Scope follows reality: root
@@ -529,8 +599,10 @@ installs system-wide, anyone else installs for themselves.
 
 **Private keys are generated on the target and never transmitted.** Only public
 halves are sent for signing, which is what keeps the proxy out of the trust
-chain afterwards. Installation itself is the moment you trust the proxy, since
-it serves the binary; that trust is bounded to that moment.
+chain for your *sessions* afterwards. Installation is a moment you trust the
+proxy, since it serves the binary — and, being honest, so is **every update**,
+which re-fetches the installer and runs it as root. That trust is not bounded to
+install day; it is re-extended each time you update. See [Update trust](#update-trust).
 
 The script and a manifest of what it installed are saved beside the agent:
 
@@ -646,6 +718,29 @@ them. The agent hashes **its own executable** at startup and reports that, so
 what you see is the binary a machine is really running rather than what someone
 recorded at install time — the two drift apart the moment an update half
 finishes.
+
+## Changing who can log in
+
+The keys a target accepts are frozen at enrolment: removing someone from the
+proxy's `users_authorized_keys` does **not** reach the machines, and re-enrolling
+each one is impossible for a fleet you can only reach through this tool. The
+lever is an operator-driven push, deliberately outside the proxy's hands — the
+proxy is not in a position to rewrite who may log into your machines, so you are,
+over the authenticated session:
+
+```bash
+sh deploy/authorize.sh multissh users_authorized_keys          # every connected target
+sh deploy/authorize.sh multissh users_authorized_keys laptop   # just this one
+sh deploy/authorize.sh multissh users_authorized_keys --yes    # approve every change
+```
+
+It reads each target's current key set, diffs it against the file you give, and
+puts **each addition and removal to you one at a time**. Nothing is written
+unless you approve a change, and it refuses to push an empty set — at two points,
+so approving away every key cannot lock you out. The agent re-reads the file on
+its next connection, so there is no restart and no window where the machine is
+unreachable, which makes this safer than the update sweep. `KEYSFILE` is yours to
+curate; nothing trusts the proxy to supply it.
 
 ### Why updating over the tunnel needed care
 
@@ -804,7 +899,8 @@ container, or says plainly that it skipped them.
 
 Deployment lives in `deploy/`: `push.sh` (build and ship to the proxy host),
 `install-proxy.sh` (run there, idempotent), `update-agents.sh` (roll a build
-out to targets one at a time).
+out to targets one at a time), and `authorize.sh` (push a curated login-key set
+to targets, each change confirmed).
 
 CI runs `gofmt`, `go vet`, `go test -race`, a cross-compile of all five
 platforms, `sh -n` and `shellcheck` over the installer, and a PowerShell parse
