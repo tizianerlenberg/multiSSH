@@ -201,3 +201,82 @@ func TestMaliciousBuildNameNeverReachesTheScript(t *testing.T) {
 		}
 	}
 }
+
+// The trusted update path: a binary pushed over the authenticated ssh session
+// is installed without the proxy serving anything. This runs the rendered
+// installer's --update mode with MULTISSH_UPDATE_FROM set, against a stub
+// systemctl, and proves two things: the pushed bytes land as the new binary
+// with the old one kept for rollback, and nothing is fetched -- the baked
+// BASE_URL is unreachable (example.com), so any download attempt would fail the
+// update, and it succeeds.
+func TestPushedUpdateInstallsWithoutTheProxy(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		// A real systemctl would try to act; the stub must win. Prepending the
+		// stub dir to PATH handles that, so this is only a note, not a skip.
+	}
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	bindir := filepath.Join(dir, "bin")
+	stub := filepath.Join(dir, "stub")
+	for _, d := range []string{state, bindir, stub} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Stub systemctl (svc_restart on linux-system) so the update can complete
+	// off a real init system.
+	if err := os.WriteFile(filepath.Join(stub, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	binPath := filepath.Join(bindir, "multissh-agent")
+	if err := os.WriteFile(binPath, []byte("OLD-BINARY"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pushed := filepath.Join(dir, "pushed-agent")
+	if err := os.WriteFile(pushed, []byte("NEW-PUSHED-BINARY"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := "M_VERSION='oldver'\nM_BIN='" + binPath + "'\nM_STATE='" + state +
+		"'\nM_SCOPE='system'\nM_PLATFORM='linux-amd64'\nM_PROXY='wss://x/agent'\n" +
+		"M_CA='ssh-ed25519 AAAA'\nM_CANONICAL='x.aaaaaaaaaaaa'\nM_INSTALLED='now'\n"
+	if err := os.WriteFile(filepath.Join(state, "manifest"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	script := filepath.Join(dir, "manage.sh")
+	if err := os.WriteFile(script, []byte(renderedInstaller(t, map[string]string{"linux-amd64": "served"})), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", script, "--update", "-y")
+	cmd.Dir = state
+	cmd.Env = append(os.Environ(),
+		"PATH="+stub+":"+os.Getenv("PATH"),
+		"MULTISSH_UPDATE_FROM="+pushed,
+		"MULTISSH_NO_REFETCH=1",
+		"MULTISSH_STATE_DIR="+state,
+		"MULTISSH_PREFIX="+bindir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pushed update failed: %v\n%s", err, out)
+	}
+
+	got, _ := os.ReadFile(binPath)
+	if string(got) != "NEW-PUSHED-BINARY" {
+		t.Errorf("the binary was not replaced with the pushed bytes: %q", got)
+	}
+	prev, _ := os.ReadFile(binPath + ".prev")
+	if string(prev) != "OLD-BINARY" {
+		t.Errorf("the previous binary was not kept for rollback: %q", prev)
+	}
+	if !strings.Contains(string(out), "pushed binary") {
+		t.Errorf("did not report a pushed update:\n%s", out)
+	}
+}

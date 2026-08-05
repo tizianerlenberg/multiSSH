@@ -540,7 +540,7 @@ update path** described under [Update trust](#update-trust).
 | 🟡 | Everyone with a user key reaches every target. No ACLs. | Fine for one operator; wrong the moment a second key is added for someone else. |
 | 🟡 | Proxy configuration is entirely flags, held in the systemd unit. | `install-proxy.sh` writes the unit once and never overwrites it, so changes are edited on the server. |
 | 🟡 | Agents are never updated automatically. | A sweep is something you run; nothing happens on its own. Deliberate — an automatic update that goes wrong takes out every machine at once. |
-| 🟡 | **The update path is unsigned**: `--update` runs an installer fetched from the proxy as root, so a compromised **primary** proxy can push root code to every target at the next update. | Accepted for now (single proxy, host you control). [Update trust](#update-trust) describes it and the signed-release design that would close it. |
+| 🟡 | **The on-target `manage.sh --update` trusts the proxy** (fetches and runs an installer from it as root), and **Windows** updates this way. | The Linux/macOS workstation sweep (`update-agents.sh`) pushes the binary over the authenticated session instead, so a hostile proxy cannot inject code there. Windows and the on-box path remain proxy-trusting — see [Update trust](#update-trust). |
 | 🟡 | Revocation is **per-proxy**: `-revoke` on the primary does not reach a standby, which enforces its own list. | Matters only if you run standbys. Until then, moot; when you do, copy `revoked_keys` across as part of revoking. |
 | ⚪ | A machine that enrolled but never once connected is invisible to the proxy — enrolment writes nothing there. | The installer reports success on the target instead. |
 
@@ -568,29 +568,31 @@ enrolling a second identity; `--reenroll` forces a fresh one.
 
 ### Update trust
 
-`--update` fetches the installer from the proxy over HTTPS and runs it as root.
-There is no signature the target checks: the integrity check lives *inside* the
-fetched script, and the binary's hash is baked into that same script by the same
-server. So whatever can serve or tamper with the primary's HTTPS response — the
-primary host itself, or anything terminating its TLS — can run code as root on
-every target at the next update. This is inherent to a reverse jump host: the
-thing that ships the binary is trusted for it. Updates are at least **operator-driven** — nothing is pushed on its own, and the agent has no self-update path.
+There are two ways an agent's binary gets replaced, and they trust different
+things.
 
-**Current stance (accepted, single proxy):** the primary is trusted for updates.
-If you run it on infrastructure you control and keep `proxy_ca_key` safe, this is
-a conscious trade, not a surprise. Keep the proxy host well-patched, since it is
-a root channel into your fleet.
+**The trusted way — `deploy/update-agents.sh`, from your workstation.** For
+Linux and macOS this **pushes the binary over the authenticated ssh session**,
+encrypted end-to-end to the target's host key, and installs it without the
+target fetching anything from the proxy. The proxy only relays ciphertext — the
+same reason it is out of the trust chain for your interactive sessions — so it
+cannot substitute a binary it never carries. **A proxy that has turned hostile
+cannot push code to your machines this way.** No signing key, nothing extra to
+back up: the trust anchor is the ssh user key already in the target's
+`authorized_keys`. The one bootstrap it cannot cover is the *first* install,
+which is trust-on-first-use in the proxy by necessity; every update after that
+is proxy-independent.
 
-**The design that would close it, if wanted later (a separate signing key kept
-off the proxy):** generate an update-signing keypair; pin its public half in the
-installer the way `proxy_ca.pub` already is; keep its private half on the
-machine that runs `deploy/push.sh`, never on the proxy. `push.sh` signs each
-release, the proxy serves the signature alongside the binary, and the installer
-verifies it before running. A compromised proxy — even the primary, even with
-the CA key — then cannot forge an update, dropping its blast radius from "root
-on every machine" to "can mint rogue agent certificates." The friction is one
-local signing step in `push.sh`, which already runs on that machine. Not built;
-recorded here so the choice stays visible.
+**The proxy-trusting way — `manage.sh --update`, run on the target.** This
+fetches the installer from the proxy over HTTPS and runs it as root, with the
+hash baked into that same fetched script by the same server. So whatever can
+serve or tamper with the primary's HTTPS response can run code as root on that
+machine. This path still exists for convenience and is what **Windows** currently
+uses (the pushed path is not yet proven on real Windows hardware). Prefer the
+workstation sweep for anything you want to keep out of the proxy's reach.
+
+Either way, updates are **operator-driven** — nothing is pushed on its own, and
+the agent has no self-update path.
 
 It asks two things — the machine's name, defaulting to the hostname, and the
 enrollment password — shows every path it will touch, and takes one

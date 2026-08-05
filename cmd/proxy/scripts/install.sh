@@ -335,23 +335,36 @@ sha256_of() {
 # The temporary file must sit beside the target, or mv falls back to copy and
 # unlink across filesystems and ETXTBSY returns.
 download_binary() {
-    WANT=$(expected_hash)
-    [ -n "$WANT" ] || die "the proxy has no agent build for $PLATFORM"
     mkdir -p "$PREFIX"
     NEW="$BIN.new"
-    echo "downloading agent $VERSION for $PLATFORM"
-    fetch "$BASE_URL/dist/$PLATFORM" "$NEW" || { rm -f "$NEW"; die "download failed"; }
-    GOT=$(sha256_of "$NEW")
-    # Fail closed. An empty GOT means no hasher is installed, so the binary is
-    # unverified -- which must stop the install, not pass it. This was the one
-    # place the two installers disagreed: install.ps1 always verifies, and a
-    # POSIX box without sha256sum or shasum silently did not.
-    if [ -z "$GOT" ]; then
-        rm -f "$NEW"; die "cannot verify the download: install sha256sum or shasum first"
+
+    if [ -n "${MULTISSH_UPDATE_FROM:-}" ]; then
+        # A binary the operator pushed over the authenticated ssh session, from
+        # their own workstation. The proxy is not in this path at all, so there
+        # is no proxy-supplied hash to check against and none is needed: the
+        # bytes arrived end-to-end, encrypted to this machine's host key, which
+        # the proxy only relays. This is what lets an update outlive a proxy
+        # that has turned hostile -- see the update-trust notes in the README.
+        [ -f "$MULTISSH_UPDATE_FROM" ] || die "no pushed binary at $MULTISSH_UPDATE_FROM"
+        cp "$MULTISSH_UPDATE_FROM" "$NEW" || { rm -f "$NEW"; die "could not read $MULTISSH_UPDATE_FROM"; }
+    else
+        WANT=$(expected_hash)
+        [ -n "$WANT" ] || die "the proxy has no agent build for $PLATFORM"
+        echo "downloading agent $VERSION for $PLATFORM"
+        fetch "$BASE_URL/dist/$PLATFORM" "$NEW" || { rm -f "$NEW"; die "download failed"; }
+        GOT=$(sha256_of "$NEW")
+        # Fail closed. An empty GOT means no hasher is installed, so the binary
+        # is unverified -- which must stop the install, not pass it. This was
+        # the one place the two installers disagreed: install.ps1 always
+        # verifies, and a POSIX box without sha256sum or shasum silently did not.
+        if [ -z "$GOT" ]; then
+            rm -f "$NEW"; die "cannot verify the download: install sha256sum or shasum first"
+        fi
+        if [ "$GOT" != "$WANT" ]; then
+            rm -f "$NEW"; die "checksum mismatch: expected $WANT, got $GOT"
+        fi
     fi
-    if [ "$GOT" != "$WANT" ]; then
-        rm -f "$NEW"; die "checksum mismatch: expected $WANT, got $GOT"
-    fi
+
     chmod 0755 "$NEW"
     # Keep the outgoing binary so --rollback has something to go back to.
     if [ -f "$BIN" ]; then
@@ -384,7 +397,9 @@ fi
 #
 # The proxy has to be reachable to download a binary from in any case, so this
 # costs nothing that was not already required.
-if [ "$MODE" = update ] && [ -z "${MULTISSH_NO_REFETCH:-}" ]; then
+# Not on the pushed path: re-fetching the installer from the proxy would run
+# proxy-supplied code, and the whole point of a pushed update is that none does.
+if [ "$MODE" = update ] && [ -z "${MULTISSH_NO_REFETCH:-}" ] && [ -z "${MULTISSH_UPDATE_FROM:-}" ]; then
     [ -f "$MANIFEST" ] || die "nothing installed here (no $MANIFEST)"
     FRESH="$STATE/install.fetched.sh"
     if fetch "$BASE_URL/install.sh" "$FRESH"; then
@@ -403,8 +418,25 @@ fi
 
 if [ "$MODE" = update ]; then
     [ -f "$MANIFEST" ] || die "nothing installed here (no $MANIFEST)"
+
+    if [ -n "${MULTISSH_UPDATE_FROM:-}" ]; then
+        # Trusted, operator-pushed binary. Install it whatever version it is --
+        # the workstation decided, not a version string a proxy handed us -- and
+        # record a version derived from the file itself so the listing is honest.
+        NEWVER=$(sha256_of "$MULTISSH_UPDATE_FROM" | cut -c1-12)
+        [ -n "$NEWVER" ] || NEWVER=pushed
+        download_binary
+        set_manifest_version "$NEWVER"
+        svc_restart
+        echo "updated from a pushed binary ($NEWVER); keys and certificate untouched"
+        exit 0
+    fi
+
     [ "$M_CA" = "$CA_KEY" ] || die "this proxy has a different authority than the one enrolled with; refusing"
     if [ "$M_VERSION" = "$VERSION" ]; then echo "already current ($VERSION)"; exit 0; fi
+    # This path trusts the proxy: it serves the binary and the hash checked
+    # against it. To update independently of the proxy, roll out from your
+    # workstation with deploy/update-agents.sh, which pushes the binary itself.
     download_binary
     set_manifest_version "$VERSION"
     svc_restart

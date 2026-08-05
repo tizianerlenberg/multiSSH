@@ -6,6 +6,19 @@
 #   sh deploy/update-agents.sh multissh --all      # including ones already current
 #   sh deploy/update-agents.sh multissh --yes      # do not ask about Windows
 #
+# Linux and macOS targets are updated the trusted way: the binary is **pushed**
+# from here over the authenticated ssh session -- encrypted end-to-end to the
+# target's host key, which the proxy only relays -- and installed without the
+# target fetching anything from the proxy. So an update survives a proxy that
+# has turned hostile: it cannot substitute a binary it never carries. The binary
+# comes from a local build directory (deploy/build.sh writes it; push.sh leaves
+# it in ./dist), set with MULTISSH_DIST. Run this after push.sh, with the same
+# build, so the listing's "current" marker still means what it says.
+#
+# Windows still updates the old way -- the target fetches from the proxy -- which
+# trusts the proxy for that hop. That path is unverified on real hardware here;
+# until it is, it stays as it was, and is asked about one machine at a time.
+#
 # Windows targets are asked about one at a time and skipped unless confirmed.
 # Updating one restarts it, and if that restart does not take, the machine goes
 # offline -- which for a rescue tool means losing the way back in. Linux and
@@ -23,6 +36,7 @@
 # sweep: unreachable targets are the normal state for this tool, not an
 # exception, so the run reports them at the end and carries on.
 #
+#   MULTISSH_DIST      directory of local agent builds to push      (default dist)
 #   MULTISSH_WAIT      seconds to wait for a machine to come back  (default 120)
 #   MULTISSH_TIMEOUT   seconds to allow the update command itself   (default 90)
 #   MULTISSH_DEADLINE  seconds for the whole sweep                  (default 1800)
@@ -48,6 +62,8 @@ for arg in "$@"; do
 done
 
 SSH=${MULTISSH_SSH:-ssh}
+SFTP=${MULTISSH_SFTP:-sftp}
+DIST=${MULTISSH_DIST:-dist}
 WAIT_SECONDS=${MULTISSH_WAIT:-120}
 CMD_TIMEOUT=${MULTISSH_TIMEOUT:-90}
 # How long a target may sit connected-but-outdated before that counts as a
@@ -118,11 +134,52 @@ targets() {
 # else.
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
-POSIX_UPDATE='for d in /var/lib/multissh-agent "$HOME/.config/multissh-agent" "/Library/Application Support/multissh-agent"; do
-    if [ -f "$d/manage.sh" ]; then exec sh "$d/manage.sh" --update -y; fi
+# Where the agent's state directory may be. MULTISSH_AGENT_DIRS overrides it,
+# which a custom install path needs and the tests use.
+POSIX_DIRS='${MULTISSH_AGENT_DIRS:-/var/lib/multissh-agent:$HOME/.config/multissh-agent:/Library/Application Support/multissh-agent}'
+
+# detect_osarch asks the target what it is, so the right local binary is chosen.
+# uname is on every POSIX target; Windows has no business here.
+detect_osarch() { # detect_osarch NAME -> "<os>-<arch>" or empty
+    _u=$(run_bounded "$CMD_TIMEOUT" $SSH $SSHOPTS -J "$PROXY" \
+        -o StrictHostKeyChecking=accept-new "authorize@$1" 'uname -sm' 2>/dev/null | tr -d '\r')
+    case "$_u" in
+        Linux\ x86_64)  echo linux-amd64 ;;
+        Linux\ aarch64) echo linux-arm64 ;;
+        Linux\ arm64)   echo linux-arm64 ;;
+        Darwin\ x86_64) echo darwin-amd64 ;;
+        Darwin\ arm64)  echo darwin-arm64 ;;
+        *)              echo "" ;;
+    esac
+}
+
+# push_binary sends the local binary to a temp path on the target over sftp --
+# a raw channel, no PTY to corrupt the bytes, and end-to-end encrypted so the
+# proxy relays ciphertext it cannot alter.
+push_binary() { # push_binary NAME LOCALBIN REMOTE
+    printf 'put %s %s\n' "$2" "$3" | run_bounded "$CMD_TIMEOUT" \
+        $SFTP -J "$PROXY" -o BatchMode=yes -o ConnectTimeout=15 \
+        -o StrictHostKeyChecking=accept-new -b - "authorize@$1" >/dev/null 2>&1
+}
+
+# posix_push_update runs the target's own manage.sh against the pushed binary,
+# with no re-fetch, so no proxy-supplied code runs and no proxy download
+# happens. The temp file is removed whether or not the update succeeds.
+posix_push_update() { # posix_push_update REMOTE
+    _snip='IFS=:; found=; rc=1
+for d in '"$POSIX_DIRS"'; do
+    if [ -f "$d/manage.sh" ]; then
+        found=1
+        MULTISSH_UPDATE_FROM="'"$1"'" MULTISSH_NO_REFETCH=1 sh "$d/manage.sh" --update -y
+        rc=$?
+        break
+    fi
 done
-echo "no multissh-agent install found on this machine" >&2
-exit 1'
+rm -f "'"$1"'"
+[ -n "$found" ] || { echo "no multissh-agent install found on this machine" >&2; exit 1; }
+exit $rc'
+    printf "echo %s | base64 -d | sh" "$(b64 "$_snip")"
+}
 
 WINDOWS_UPDATE='$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -133,16 +190,10 @@ foreach ($d in @("$env:ProgramData\multiSSH", "$env:LOCALAPPDATA\multiSSH\state"
 Write-Host "no multissh-agent install found on this machine"
 exit 1'
 
-update_command() { # update_command PLATFORM
-    case "$1" in
-        windows)
-            printf "\$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'));Invoke-Expression \$s" \
-                "$(b64 "$WINDOWS_UPDATE")"
-            ;;
-        *)
-            printf "echo %s | base64 -d | sh" "$(b64 "$POSIX_UPDATE")"
-            ;;
-    esac
+# windows_update_command is the old, proxy-fetch path, kept only for Windows.
+windows_update_command() {
+    printf "\$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'));Invoke-Expression \$s" \
+        "$(b64 "$WINDOWS_UPDATE")"
 }
 
 # confirm asks before touching a Windows target.
@@ -274,19 +325,44 @@ for entry in $TODO; do
         continue
     fi
 
-    # The agent always allocates a pseudo-terminal, even for a command, so
-    # Windows sends ConPTY setup sequences before anything readable. Strip
-    # them rather than print them.
-    if ! run_bounded "$CMD_TIMEOUT" \
-            $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
-            "update@$name" "$(update_command "$platform")" 2>&1 |
-            tr -d '\r' |
-            sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/^/    /'; then
-        # The agent restarts as the last thing it does, so the session is very
-        # often cut off mid-sentence. Whether this worked is decided by the
-        # machine coming back, not by an exit status from a command that
-        # expected to be killed.
-        echo "    (command ended early -- checking whether it took anyway)"
+    # ConPTY / a Unix PTY prepend setup and echo bytes; strip them rather than
+    # print them. Reused for both paths below.
+    strip_pty() { tr -d '\r' | sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/^/    /'; }
+
+    if [ "$platform" = windows ]; then
+        # The old path: the target fetches from the proxy. Left as-is until the
+        # pushed path is proven on real Windows.
+        if ! run_bounded "$CMD_TIMEOUT" \
+                $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
+                "update@$name" "$(windows_update_command)" 2>&1 | strip_pty; then
+            echo "    (command ended early -- checking whether it took anyway)"
+        fi
+    else
+        # The trusted path: detect the architecture, push the matching local
+        # binary over sftp, then have the target install it without touching
+        # the proxy.
+        osarch=$(detect_osarch "$name")
+        if [ -z "$osarch" ]; then
+            echo "    could not determine this machine's architecture; skipped" >&2
+            FAILED="$FAILED $name"; continue
+        fi
+        localbin="$DIST/$osarch"
+        if [ ! -f "$localbin" ]; then
+            echo "    no local binary at $localbin to push -- build with deploy/build.sh" >&2
+            echo "    or set MULTISSH_DIST; skipped" >&2
+            FAILED="$FAILED $name"; continue
+        fi
+        remote="/tmp/multissh-agent.update.$$"
+        echo "    pushing $osarch binary ($(wc -c <"$localbin") bytes)"
+        if ! push_binary "$name" "$localbin" "$remote"; then
+            echo "    could not push the binary over sftp; skipped" >&2
+            FAILED="$FAILED $name"; continue
+        fi
+        if ! run_bounded "$CMD_TIMEOUT" \
+                $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
+                "update@$name" "$(posix_push_update "$remote")" 2>&1 | strip_pty; then
+            echo "    (command ended early -- checking whether it took anyway)"
+        fi
     fi
 
     # Progress with numbers on it. A row of dots for two minutes is

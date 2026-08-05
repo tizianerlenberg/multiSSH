@@ -93,7 +93,7 @@ func TestSavedScriptRefetchesBeforeComparingVersions(t *testing.T) {
 		t.Fatal("nothing re-fetches the installer; a saved copy can only ever compare its own frozen version against the manifest it wrote, and will always report 'already current'")
 	}
 
-	refetch := section(t, script, `if \[ "\$MODE" = update \] && \[ -z "\$\{MULTISSH_NO_REFETCH:-\}" \]; then`, `^fi`)
+	refetch := section(t, script, `if \[ "\$MODE" = update \] && \[ -z "\$\{MULTISSH_NO_REFETCH:-\}" \] &&`, `^fi`)
 	if !strings.Contains(refetch, "$BASE_URL/install.sh") {
 		t.Error("the re-fetch does not ask the proxy for the current script")
 	}
@@ -1001,5 +1001,48 @@ func TestPowerShellReplacesTheStateDirAcl(t *testing.T) {
 	// the hole.
 	if strings.Contains(script, "/grant 'SYSTEM") {
 		t.Error("install.ps1 still uses an additive /grant; a pre-creator keeps write access")
+	}
+}
+
+// The pushed-update path must not touch the proxy: download_binary installs a
+// local file, and the re-fetch of the installer from the proxy is skipped, so
+// no proxy-supplied code runs.
+func TestPushedUpdateSkipsTheProxy(t *testing.T) {
+	s := installerSource(t)
+
+	body := section(t, s, `^download_binary\(\) \{`, `^\}`)
+	if !strings.Contains(body, "MULTISSH_UPDATE_FROM") {
+		t.Error("download_binary has no pushed-binary branch; an update cannot avoid the proxy")
+	}
+	if !strings.Contains(body, `fetch "$BASE_URL/dist/$PLATFORM"`) {
+		t.Error("the proxy-fetch branch is gone; the non-pushed path still needs it")
+	}
+	// The installer re-fetch is guarded so it never runs on the pushed path.
+	if !strings.Contains(s, `[ -z "${MULTISSH_UPDATE_FROM:-}" ]`) {
+		t.Error("a pushed update could still re-fetch proxy-supplied install.sh")
+	}
+}
+
+// update-agents.sh pushes the binary over sftp for POSIX targets and installs
+// it with MULTISSH_UPDATE_FROM, and keeps Windows on the old proxy-fetch path
+// until the pushed one is proven on real hardware.
+func TestUpdateAgentsPushesRatherThanFetches(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/update-agents.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	for _, want := range []string{"detect_osarch", "push_binary", "MULTISSH_UPDATE_FROM=", "$SFTP"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("update-agents.sh is missing %q; the trusted push path is incomplete", want)
+		}
+	}
+	if !strings.Contains(s, "windows_update_command") {
+		t.Error("the Windows proxy-fetch path was removed; it must stay until the pushed path is proven on Windows")
+	}
+	// The binary must move over sftp (a raw channel), never through the exec
+	// PTY, which would corrupt the bytes.
+	if !strings.Contains(s, "no PTY to corrupt") {
+		t.Error("the rationale for sftp over exec is gone; a refactor may have reintroduced PTY transfer")
 	}
 }
