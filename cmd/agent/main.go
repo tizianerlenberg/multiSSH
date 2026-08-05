@@ -35,6 +35,18 @@ const (
 	healthySession = 60 * time.Second
 )
 
+// embeddedHandshakeTimeout bounds the inner SSH handshake, the way the proxy's
+// handshakeTimeout bounds an unauthenticated connection to it.
+//
+// It has to be enforced here by hand. The inner server runs over an
+// ssh.Channel wrapped in sshx.ChannelConn, whose SetDeadline is a no-op --
+// there is nothing underneath an SSH channel for a deadline to act on. So a
+// tunnel opened and then left silent held a goroutine and a channel on the
+// target for as long as the user's connection lasted, with nothing anywhere
+// reporting it. Overridable because the ten-second link this tool exists for
+// is exactly where a fixed bound is most likely to be wrong.
+var embeddedHandshakeTimeout = 30 * time.Second
+
 // ptyProcess is a shell attached to a pseudo-terminal. The implementations
 // live in pty_unix.go and pty_windows.go; nothing else in the agent knows
 // which platform it is on.
@@ -59,8 +71,10 @@ func main() {
 		caFile    = flag.String("ca", "proxy_ca.pub", "the proxy's certificate authority, pinned")
 		showKeys  = flag.Bool("show-keys", false, "create the keys if absent, print their public halves, and exit")
 		logFile   = flag.String("log", "", "append logs to this file instead of stderr")
+		hsTimeout = flag.Duration("handshake-timeout", embeddedHandshakeTimeout, "how long a tunnel may stay silent before the embedded server closes it")
 	)
 	flag.Parse()
+	embeddedHandshakeTimeout = *hsTimeout
 	log.SetFlags(log.Ltime)
 
 	// The Windows build is linked as a GUI binary so that starting it does not
@@ -382,10 +396,39 @@ func serveEmbedded(ch ssh.Channel, hostSigner ssh.Signer, authKeys string, tunne
 	}
 	cfg.AddHostKey(hostSigner)
 
+	// Closing the channel is what bounds the handshake: it makes the read
+	// underneath NewServerConn fail. Guarded so that a timer firing alongside a
+	// handshake that has just succeeded cannot tear down a good session.
+	var (
+		hsMu     sync.Mutex
+		hsDone   bool
+		timedOut bool
+	)
+	hsTimer := time.AfterFunc(embeddedHandshakeTimeout, func() {
+		hsMu.Lock()
+		defer hsMu.Unlock()
+		if hsDone {
+			return
+		}
+		hsDone, timedOut = true, true
+		ch.Close()
+	})
+
 	conn, chans, reqs, err := ssh.NewServerConn(
 		sshx.ChannelConn{Channel: ch, Local: "agent", Remote: "proxy"}, cfg)
+
+	hsMu.Lock()
+	hsDone = true
+	expired := timedOut
+	hsMu.Unlock()
+	hsTimer.Stop()
+
 	if err != nil {
-		log.Printf("embedded handshake failed: %v", err)
+		if expired {
+			log.Printf("tunnel stayed silent for %s, closed without a handshake", embeddedHandshakeTimeout)
+		} else {
+			log.Printf("embedded handshake failed: %v", err)
+		}
 		ch.Close()
 		return
 	}

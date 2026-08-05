@@ -962,3 +962,62 @@ func TestHealthzReportsWithoutNamingTargets(t *testing.T) {
 		}
 	}
 }
+
+// A tunnel that is opened and then never spoken on used to be held forever.
+// The inner server runs over an ssh.Channel, and a channel has nothing
+// underneath it for a deadline to act on -- sshx.ChannelConn's SetDeadline is a
+// no-op -- so nothing bounded the handshake the way the proxy bounds its own.
+// One goroutine, one channel and one pty-less session per silent tunnel, with
+// no log line and no counter moving.
+func TestSilentTunnelIsClosedRatherThanHeldOpen(t *testing.T) {
+	f := setup(t)
+	f.startProxy()
+	// Two seconds rather than the default thirty, so this test costs seconds.
+	f.startAgent("-handshake-timeout", "2s")
+	f.waitForTarget(f.canonical)
+
+	c := f.dialProxy()
+	conn, err := c.Dial("tcp", f.canonical+":22")
+	if err != nil {
+		t.Fatalf("opening a tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	// Read and discard whatever arrives -- the server sends its identification
+	// string straight away -- but never write. From the agent's side this is a
+	// client that connected and then said nothing.
+	closed := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				closed <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the agent held a silent tunnel open; the inner handshake is unbounded again")
+	}
+
+	// The bound must apply to the handshake, not to the connection: a session
+	// that completed one has to outlive it comfortably.
+	inner, _, err := f.jumpTo(f.dialProxy(), f.canonical)
+	if err != nil {
+		t.Fatalf("jumping to the target: %v", err)
+	}
+	defer inner.Close()
+	time.Sleep(4 * time.Second) // twice the handshake bound
+
+	sess, err := inner.NewSession()
+	if err != nil {
+		t.Fatalf("the session did not survive the handshake timeout: %v", err)
+	}
+	defer sess.Close()
+	if _, err := sess.Output("echo still-here"); err != nil {
+		t.Errorf("exec after the handshake bound elapsed: %v", err)
+	}
+}
