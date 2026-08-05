@@ -543,10 +543,19 @@ func main() {
 				return nil, fmt.Errorf("agent protocol %s is below the minimum %s",
 					sshx.DescribeProtocol(proto), sshx.DescribeProtocol(*minProto))
 			}
-			// Only a certificate we signed. CheckCert verifies the signature,
-			// the validity window, and that the name the agent claims is one
-			// of the principals we put in the certificate -- so names remain
-			// ours to assign without our storing them anywhere.
+			// Only a certificate we signed: the signature is what carries the
+			// name, which is why this proxy needs no list of machines.
+			//
+			// It must be Authenticate, never CheckCert. CheckCert verifies the
+			// signature against cert.SignatureKey -- the authority named
+			// INSIDE the certificate, chosen by whoever presents it -- and
+			// never consults IsUserAuthority or the certificate type. Setting
+			// IsUserAuthority and then calling CheckCert reads as correct and
+			// checks nothing at all: any host able to reach this endpoint
+			// could mint its own authority, derive a real canonical name from
+			// a host key it held, self-sign that name, and register. It would
+			// then pass the first-connect fingerprint check too, because the
+			// name really was derived from the key it serves.
 			cert, ok := key.(*ssh.Certificate)
 			if !ok {
 				return nil, fmt.Errorf("agents must present a certificate")
@@ -560,7 +569,13 @@ func main() {
 				log.Printf("REFUSING revoked agent %s from %s (%s)", fp, c.RemoteAddr(), reason)
 				return nil, fmt.Errorf("this identity key is revoked")
 			}
-			if err := certChecker.CheckCert(c.User(), cert); err != nil {
+			// Authenticate performs everything CheckCert does, and first checks
+			// that the signing authority is ours and that this is a user
+			// certificate rather than a host one. Without the type check, the
+			// host certificate a standby proxy carries -- issued with no
+			// principals, so valid for every name -- would itself be a
+			// permanent credential to register as any agent.
+			if _, err := certChecker.Authenticate(c, key); err != nil {
 				return nil, fmt.Errorf("certificate rejected: %w", err)
 			}
 			if !sshx.IsCanonicalName(c.User()) {
