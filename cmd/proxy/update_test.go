@@ -536,10 +536,10 @@ func TestUpdateScriptParsesOnlyTheOnlineSection(t *testing.T) {
 
  ONLINE (2)
 
-   pcuser-pc        pcuser-pc.nth7qgghi7j7        linux    v1 OUTDATED
+   workstation      workstation.nth7qgghi7j7      linux    v1 OUTDATED
        host key  SHA256:/XmRlLQzuatMnjzd87t4qacwiU+MNBNBwdkce60vTz4
        identity  SHA256:hGFnasqDqhL/6mTmiGX/7ogUM6Y0XgDPMPc49Waqou0
-   rosa-maria-lapt  rosa-maria-lapt.eceqxx2be7uw  windows  v1 current
+   laptop           laptop.eceqxx2be7uw           windows  v1 current
        identity  SHA256:5UuBiRDBot0w6K7hUdVKe+zL/OZXtJsuJFuXGvtpxLE
 
  NOT CONNECTED (1)
@@ -548,7 +548,7 @@ func TestUpdateScriptParsesOnlyTheOnlineSection(t *testing.T) {
 
  CONNECT
 
-   ssh -J <thisproxy> user@pcuser-pc
+   ssh -J <thisproxy> user@workstation
 
    paste the host key above into it and ssh checks it for you.
    'identity' is a different key: the handle for -revoke.
@@ -562,8 +562,8 @@ func TestUpdateScriptParsesOnlyTheOnlineSection(t *testing.T) {
 
 	got := strings.Fields(strings.TrimSpace(string(out)))
 	want := []string{
-		"pcuser-pc.nth7qgghi7j7", "linux", "OUTDATED",
-		"rosa-maria-lapt.eceqxx2be7uw", "windows", "current",
+		"workstation.nth7qgghi7j7", "linux", "OUTDATED",
+		"laptop.eceqxx2be7uw", "windows", "current",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("parsed %v, want %v", got, want)
