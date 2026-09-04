@@ -15,6 +15,18 @@
 # it in ./dist), set with MULTISSH_DIST. Run this after push.sh, with the same
 # build, so the listing's "current" marker still means what it says.
 #
+# The installer is pushed with it, and it is that copy which runs. Handing the
+# work to the target's own saved manage.sh does not work: that copy is frozen
+# at install time, so an agent installed before the pushed path existed does
+# not understand MULTISSH_UPDATE_FROM, ignores the binary just pushed to it,
+# and falls through to downloading from the proxy -- where it checks what it
+# gets against its install-time hash and dies with a checksum mismatch. Older
+# the agent, more certain the failure, which is the wrong way round for a tool
+# whose job is reaching machines that have been left alone. Pushing the
+# installer makes the update independent of how old the target is, and keeps
+# the promise this path is built on: the code that runs came from here, not
+# from the proxy.
+#
 # Windows still updates the old way -- the target fetches from the proxy -- which
 # trusts the proxy for that hop. That path is unverified on real hardware here;
 # until it is, it stays as it was, and is asked about one machine at a time.
@@ -37,6 +49,8 @@
 # exception, so the run reports them at the end and carries on.
 #
 #   MULTISSH_DIST      directory of local agent builds to push      (default dist)
+#   MULTISSH_INSTALLER installer to push and run on the target
+#                      (default cmd/proxy/scripts/install.sh in this checkout)
 #   MULTISSH_WAIT      seconds to wait for a machine to come back  (default 120)
 #   MULTISSH_TIMEOUT   seconds to allow the update command itself   (default 90)
 #   MULTISSH_DEADLINE  seconds for the whole sweep                  (default 1800)
@@ -64,6 +78,11 @@ done
 SSH=${MULTISSH_SSH:-ssh}
 SFTP=${MULTISSH_SFTP:-sftp}
 DIST=${MULTISSH_DIST:-dist}
+# Resolved against this script rather than the working directory, because the
+# whole point is to push a known-good installer and the caller may be standing
+# anywhere.
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+INSTALLER=${MULTISSH_INSTALLER:-$SCRIPT_DIR/../cmd/proxy/scripts/install.sh}
 WAIT_SECONDS=${MULTISSH_WAIT:-120}
 CMD_TIMEOUT=${MULTISSH_TIMEOUT:-90}
 # How long a target may sit connected-but-outdated before that counts as a
@@ -153,29 +172,51 @@ detect_osarch() { # detect_osarch NAME -> "<os>-<arch>" or empty
     esac
 }
 
-# push_binary sends the local binary to a temp path on the target over sftp --
+# push_files sends the local files to temp paths on the target over sftp --
 # a raw channel, no PTY to corrupt the bytes, and end-to-end encrypted so the
-# proxy relays ciphertext it cannot alter.
-push_binary() { # push_binary NAME LOCALBIN REMOTE
-    printf 'put %s %s\n' "$2" "$3" | run_bounded "$CMD_TIMEOUT" \
+# proxy relays ciphertext it cannot alter. One session for both, so a target
+# that goes away mid-push does not leave one half of the pair behind.
+push_files() { # push_files NAME LOCALBIN REMOTEBIN LOCALINSTALLER REMOTEINSTALLER
+    printf 'put %s %s\nput %s %s\n' "$2" "$3" "$4" "$5" | run_bounded "$CMD_TIMEOUT" \
         $SFTP -J "$PROXY" -o BatchMode=yes -o ConnectTimeout=15 \
         -o StrictHostKeyChecking=accept-new -b - "authorize@$1" >/dev/null 2>&1
 }
 
-# posix_push_update runs the target's own manage.sh against the pushed binary,
-# with no re-fetch, so no proxy-supplied code runs and no proxy download
-# happens. The temp file is removed whether or not the update succeeds.
-posix_push_update() { # posix_push_update REMOTE
-    _snip='IFS=:; found=; rc=1
+# posix_push_update runs the pushed installer against the pushed binary, with
+# no re-fetch, so no proxy-supplied code runs and no proxy download happens.
+# Both temp files are removed whether or not the update succeeds -- when the
+# script gets that far. A successful update ends in a restart, and driven over
+# the agent's own tunnel that restart tears down the cgroup this snippet runs
+# in, so the trailing rm is not reached on exactly the runs that work. Clearing
+# any earlier pair on the way in is what actually keeps /tmp from filling up,
+# one leaked binary per update; the two paths in flight are skipped by name.
+#
+# The state directory is still found the same way, but by its manifest rather
+# than by manage.sh: the manifest is what --update actually needs, and it
+# records where this install put things. Reading M_STATE and M_BIN from it and
+# passing them on is what lets the pushed installer, which is running from
+# /tmp and cannot guess, act on a non-default install path.
+posix_push_update() { # posix_push_update REMOTEBIN REMOTEINSTALLER
+    _snip='for f in /tmp/multissh-agent.update.* /tmp/multissh-install.update.*; do
+    [ -e "$f" ] || continue
+    [ "$f" = "'"$1"'" ] || [ "$f" = "'"$2"'" ] || rm -f "$f"
+done
+IFS=:; found=; rc=1
 for d in '"$POSIX_DIRS"'; do
-    if [ -f "$d/manage.sh" ]; then
+    if [ -f "$d/manifest" ]; then
         found=1
-        MULTISSH_UPDATE_FROM="'"$1"'" MULTISSH_NO_REFETCH=1 sh "$d/manage.sh" --update -y
+        M_STATE=; M_BIN=
+        . "$d/manifest"
+        [ -n "$M_STATE" ] || M_STATE=$d
+        [ -n "$M_BIN" ] || M_BIN=$d/multissh-agent
+        MULTISSH_UPDATE_FROM="'"$1"'" MULTISSH_NO_REFETCH=1 \
+        MULTISSH_STATE_DIR="$M_STATE" MULTISSH_PREFIX="$(dirname "$M_BIN")" \
+            sh "'"$2"'" --update -y
         rc=$?
         break
     fi
 done
-rm -f "'"$1"'"
+rm -f "'"$1"'" "'"$2"'"
 [ -n "$found" ] || { echo "no multissh-agent install found on this machine" >&2; exit 1; }
 exit $rc'
     printf "echo %s | base64 -d | sh" "$(b64 "$_snip")"
@@ -251,6 +292,14 @@ summary() {
     return 0
 }
 trap 'echo; echo "interrupted." >&2; summary; exit 130' INT TERM
+
+# Checked before anything is touched. Discovering the installer is missing one
+# machine into a sweep would leave the run half-done for no reason.
+[ -f "$INSTALLER" ] || {
+    echo "no installer at $INSTALLER" >&2
+    echo "run this from the multiSSH checkout, or set MULTISSH_INSTALLER" >&2
+    exit 2
+}
 
 echo "==> asking $PROXY what is connected"
 ALL_TARGETS=$(targets)
@@ -353,14 +402,15 @@ for entry in $TODO; do
             FAILED="$FAILED $name"; continue
         fi
         remote="/tmp/multissh-agent.update.$$"
-        echo "    pushing $osarch binary ($(wc -c <"$localbin") bytes)"
-        if ! push_binary "$name" "$localbin" "$remote"; then
-            echo "    could not push the binary over sftp; skipped" >&2
+        remote_installer="/tmp/multissh-install.update.$$"
+        echo "    pushing $osarch binary ($(wc -c <"$localbin") bytes) and installer"
+        if ! push_files "$name" "$localbin" "$remote" "$INSTALLER" "$remote_installer"; then
+            echo "    could not push the binary and installer over sftp; skipped" >&2
             FAILED="$FAILED $name"; continue
         fi
         if ! run_bounded "$CMD_TIMEOUT" \
                 $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
-                "update@$name" "$(posix_push_update "$remote")" 2>&1 | strip_pty; then
+                "update@$name" "$(posix_push_update "$remote" "$remote_installer")" 2>&1 | strip_pty; then
             echo "    (command ended early -- checking whether it took anyway)"
         fi
     fi

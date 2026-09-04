@@ -1032,10 +1032,23 @@ func TestUpdateAgentsPushesRatherThanFetches(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(data)
-	for _, want := range []string{"detect_osarch", "push_binary", "MULTISSH_UPDATE_FROM=", "$SFTP"} {
+	for _, want := range []string{"detect_osarch", "push_files", "MULTISSH_UPDATE_FROM=", "$SFTP"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("update-agents.sh is missing %q; the trusted push path is incomplete", want)
 		}
+	}
+	// The installer must be pushed and run alongside the binary. Delegating to
+	// the target's saved manage.sh made the update only as capable as the copy
+	// frozen there at install time: an agent installed before this path existed
+	// ignores the pushed binary, falls back to a proxy download, and checks it
+	// against its install-time hash -- which cannot match a later build.
+	for _, want := range []string{"$INSTALLER", "MULTISSH_INSTALLER"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("update-agents.sh is missing %q; the pushed update still depends on whatever the target already had", want)
+		}
+	}
+	if strings.Contains(s, `sh "$d/manage.sh" --update`) {
+		t.Error("the pushed update still runs the target's saved manage.sh, so it inherits that copy's age")
 	}
 	if !strings.Contains(s, "windows_update_command") {
 		t.Error("the Windows proxy-fetch path was removed; it must stay until the pushed path is proven on Windows")
@@ -1044,5 +1057,70 @@ func TestUpdateAgentsPushesRatherThanFetches(t *testing.T) {
 	// PTY, which would corrupt the bytes.
 	if !strings.Contains(s, "no PTY to corrupt") {
 		t.Error("the rationale for sftp over exec is gone; a refactor may have reintroduced PTY transfer")
+	}
+}
+
+// Regression. The saved manage.sh carries VERSION and HASHES frozen in as
+// literals from the moment it was written, and only the install path ever
+// wrote it -- so every update replaced the binary and the manifest while
+// leaving that copy at its install-time values. Verified directly against
+// them, a later build can only fail: "checksum mismatch: expected ..., got
+// ...", where "got" is the correct binary and "expected" is a hash from
+// whenever the agent was first installed.
+//
+// install.ps1 had refreshed its own saved copy on update all along; this is
+// the POSIX side catching up, the same asymmetry as the fail-closed hash check.
+func TestSavedScriptIsRefreshedOnUpdate(t *testing.T) {
+	script := installerSource(t)
+
+	if !strings.Contains(script, "save_manage_copy()") {
+		t.Fatal("nothing refreshes the saved copy; its frozen VERSION and HASHES can only drift further from what the proxy serves")
+	}
+
+	body := section(t, script, `^if \[ "\$MODE" = update \]; then`, `^fi`)
+	saved := strings.Index(body, "save_manage_copy")
+	restart := strings.Index(body, "svc_restart")
+	if saved < 0 {
+		t.Error("the update path does not refresh the saved copy, so it stays at its install-time version forever")
+	} else if restart >= 0 && saved > restart {
+		// Driven over the agent's own tunnel, the restart tears down the cgroup
+		// this script runs in. Anything after it may simply not happen.
+		t.Error("the saved copy is refreshed after svc_restart; the restart can kill the script before it gets there")
+	}
+
+	// Scoped to the update block first: download_binary tests the same variable
+	// higher up, and an unanchored search finds that one instead and asserts
+	// nothing.
+	pushed := section(t, withoutComments(body), `^    if \[ -n "\$\{MULTISSH_UPDATE_FROM:-\}" \]; then`, `^    fi`)
+	if strings.Contains(pushed, "save_manage_copy") {
+		t.Error("the pushed path writes the saved copy, but all it has to write is the operator's raw template")
+	}
+}
+
+// Regression, found by running the sweep rather than by reading it. Pushing the
+// installer meant the script executing on the target was the one from the
+// operator's checkout -- still carrying __BASE_URL__, __CA__, __VERSION__ and
+// __HASHES__, which the proxy substitutes only as it serves the file. Saving
+// that over the agent's manage.sh left a copy that could not re-fetch, check
+// the authority, or uninstall against the right proxy: a worse outcome than the
+// staleness being fixed, and silent.
+func TestTheSavedCopyIsNeverAnUnsubstitutedTemplate(t *testing.T) {
+	body := section(t, installerSource(t), `^save_manage_copy\(\) \{`, `^\}`)
+
+	// Written as "BASE_URL must be a real URL", not as a search for the
+	// placeholder: the substitution rewrites that token everywhere in the file,
+	// so naming it here would turn this guard into a check for the proxy's own
+	// URL and invert what it does.
+	if strings.Contains(body, "__BASE_URL__") {
+		t.Error("save_manage_copy names the placeholder, which the substitution rewrites; the guard would then reject substituted scripts and accept nothing")
+	}
+	if !strings.Contains(body, `grep -q "^BASE_URL='https\?://"`) {
+		t.Error("save_manage_copy does not require a substituted BASE_URL, so a pushed template would be saved verbatim")
+	}
+	// The check has to come before the copy, or it is decoration.
+	guard := strings.Index(body, "BASE_URL='https")
+	write := strings.Index(body, `cp "$_src"`)
+	if guard >= 0 && write >= 0 && guard > write {
+		t.Error("the template check runs after the copy has already been written")
 	}
 }

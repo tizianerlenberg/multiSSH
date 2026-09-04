@@ -67,6 +67,21 @@ case "$0" in
     *)   SELF_DIR= ;;
 esac
 
+# The path of this copy of the script, used to keep the copy saved beside the
+# agent in step with whatever is actually running. Same guard as SELF_DIR:
+# piped from curl there is no file to copy from, so this stays empty and the
+# caller falls back to fetching.
+#
+# This was referenced further down but never assigned, so it was always empty
+# and the install path silently took the fetch branch instead. Harmless at
+# install time -- the proxy's copy is the current one -- but it is why the
+# saved copy could never be refreshed afterwards.
+if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/${0##*/}" ]; then
+    SCRIPT_SELF="$SELF_DIR/${0##*/}"
+else
+    SCRIPT_SELF=
+fi
+
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -239,6 +254,52 @@ set_manifest_version() {
     _v=$1
     sed "s|^M_VERSION=.*|M_VERSION='$_v'|" "$MANIFEST" > "$MANIFEST.tmp" &&
         mv "$MANIFEST.tmp" "$MANIFEST"
+}
+
+# save_manage_copy keeps $STATE/manage.sh in step with the script running now.
+#
+# The saved copy carries VERSION and HASHES frozen in as literals at the moment
+# it was written. Updating only ever replaced the binary and the manifest, so
+# that copy stayed at its install-time values forever, and the hashes it checks
+# a download against drifted further from what the proxy serves with every
+# release. Verified against them directly it can only fail, which is what
+# "checksum mismatch: expected ..., got ..." was: not a corrupted download, a
+# script comparing this month's binary to last month's hash.
+#
+# Refreshing it here is what makes an update converge instead of accumulating
+# that drift. --allow-fetch is for the paths that already talk to the proxy;
+# the pushed path must not, so it omits the flag and simply skips the refresh
+# when there is no local file to copy from.
+save_manage_copy() { # save_manage_copy [--allow-fetch]
+    _dest="$STATE/manage.sh"
+    _src=
+    # Copying a file onto itself fails, and running the saved copy in place is
+    # the ordinary case for --update.
+    if [ -n "${SCRIPT_SELF:-}" ] && [ -f "$SCRIPT_SELF" ] && [ "$SCRIPT_SELF" != "$_dest" ]; then
+        _src=$SCRIPT_SELF
+    fi
+    # Only ever save a script the proxy has already filled in. It substitutes
+    # BASE_URL, CA_KEY, VERSION and HASHES as it serves this file; the copy in
+    # the repository still holds the placeholders, and an operator-pushed
+    # installer is exactly that copy. Saving it would leave the agent with a
+    # manage.sh that cannot re-fetch, cannot check the authority and cannot
+    # uninstall against the right proxy: worse than the staleness being fixed,
+    # and silent.
+    #
+    # Asserted as "BASE_URL is a real URL" rather than by naming the
+    # placeholder. The substitution rewrites every occurrence of that token in
+    # the file, this function included, so a check written the obvious way round
+    # would be edited into checking for the proxy's own URL and would then
+    # reject exactly the scripts it is meant to accept.
+    if [ -n "$_src" ] && ! grep -q "^BASE_URL='https\?://" "$_src" 2>/dev/null; then
+        _src=
+    fi
+    if [ -n "$_src" ]; then
+        cp "$_src" "$_dest.tmp" && mv "$_dest.tmp" "$_dest"
+    elif [ "${1:-}" = --allow-fetch ]; then
+        fetch "$BASE_URL/install.sh" "$_dest" || true
+    fi
+    chmod 0700 "$_dest" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- uninstall
@@ -427,6 +488,12 @@ if [ "$MODE" = update ]; then
         [ -n "$NEWVER" ] || NEWVER=pushed
         download_binary
         set_manifest_version "$NEWVER"
+        # The saved copy is deliberately left as it is. What is running here is
+        # the operator's own template, placeholders and all, so there is nothing
+        # usable to replace it with -- and nothing may be fetched from the proxy
+        # on this path to fill them. It costs nothing: a pushed update no longer
+        # runs the saved copy at all, and the first --update through the proxy
+        # refreshes it. See save_manage_copy.
         svc_restart
         echo "updated from a pushed binary ($NEWVER); keys and certificate untouched"
         exit 0
@@ -439,6 +506,9 @@ if [ "$MODE" = update ]; then
     # workstation with deploy/update-agents.sh, which pushes the binary itself.
     download_binary
     set_manifest_version "$VERSION"
+    # Reached via the re-fetch handover above, so this is the installer the
+    # proxy is serving now: exactly what the stale copy should become.
+    save_manage_copy --allow-fetch
     svc_restart
     echo "updated to $VERSION; keys and certificate untouched"
     exit 0
@@ -600,12 +670,7 @@ EOF
 chmod 0600 "$MANIFEST"
 
 # Keep a copy so update and uninstall work with the proxy gone.
-if [ -n "${SCRIPT_SELF:-}" ] && [ -f "$SCRIPT_SELF" ]; then
-    cp "$SCRIPT_SELF" "$STATE/manage.sh"
-else
-    fetch "$BASE_URL/install.sh" "$STATE/manage.sh" || true
-fi
-chmod 0700 "$STATE/manage.sh" 2>/dev/null || true
+save_manage_copy --allow-fetch
 
 svc_start
 
