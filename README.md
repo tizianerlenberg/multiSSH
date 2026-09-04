@@ -21,7 +21,75 @@ in.
 
 ---
 
+## What it's for
+
+Some machines you cannot SSH into, not for want of credentials, but because
+nothing can open a connection *to* them:
+
+- a box at home behind CGNAT, where port forwarding is not yours to configure
+- a laptop that moves between networks and is never at a fixed address
+- a machine on a network you do not control: a client site, a conference, a hotel
+- a server where you just edited `sshd_config`, reloaded, and locked yourself out
+
+The usual answers are a VPN or an overlay network like Tailscale, and where
+those work they are the better tool. multiSSH is for when they do not: when the
+VPN is the thing that broke, when you cannot install an overlay on the machine,
+or when what you need to repair *is* the SSH daemon.
+
+## Compared with a normal jump host
+
+From your side, there is no difference at all. Same command, same client,
+nothing to install:
+
+```bash
+ssh -J proxy you@laptop
+```
+
+The difference is the last hop. A normal jump host **dials the target**, so the
+target has to have a listening `sshd` that the bastion can reach:
+
+```mermaid
+flowchart LR
+    C["you<br/>stock ssh"] -->|"ssh -J"| B["bastion<br/>public IP"]
+    B ==>|"dials the target:<br/>needs a reachable, listening sshd"| T["target<br/>port 22 open<br/>to the bastion"]
+```
+
+multiSSH turns that last arrow around. The target dials the proxy and holds the
+connection open, so when you connect the proxy never dials anything: it splices
+your session into a tunnel that already exists.
+
+```mermaid
+flowchart LR
+    C["you<br/>stock ssh"] -->|"ssh -J"| P["proxy<br/>public IP"]
+    T["target<br/>NO open ports"] ==>|"dials OUT first,<br/>connection held open"| P
+    P -.->|"splices you into<br/>the existing tunnel"| T
+```
+
+Hence *reverse* jump host: everything about the first hop is ordinary, and only
+the direction of the second one changes.
+
+| | normal jump host | multiSSH |
+|---|---|---|
+| client software | stock `ssh` | stock `ssh`, identical command |
+| how the last hop happens | the bastion dials the target | the target already dialled the proxy |
+| open ports on the target | at least one, reachable from the bastion | **none** |
+| behind NAT or CGNAT | needs port forwarding or a VPN | works as-is |
+| the target's address | resolved and dialled | a label looked up in a registry, never dialled |
+| if the target's system `sshd` is broken | you are locked out | unaffected, the agent has its own |
+| the target must be | reachable at connect time | *connected*, which it does on its own and re-does after a drop |
+
+What it does **not** replace: a bastion in front of infrastructure you already
+control, where inbound reachability is a given and audit and access control are
+the point. multiSSH has neither audit trails nor per-user access control (see
+[Known gaps](docs/security.md#known-gaps)). It solves reachability, not
+governance.
+
+---
+
 ## How it works
+
+The rest of this section is the mechanism. Skip it if you only wanted to know
+what the thing is.
 
 ```mermaid
 flowchart LR
