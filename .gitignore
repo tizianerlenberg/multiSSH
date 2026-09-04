@@ -6,3 +6,18 @@ run/
 # deploy/build.sh drops the proxy binary here; it was committed once already.
 /multissh-proxy
 /dist/
+
+# Proxy runtime state, created in the working directory the proxy is started
+# from. Running it once in a checkout is enough to drop the certificate
+# authority's PRIVATE key here, so these are ignored by name rather than left
+# to be noticed: see the flag defaults in cmd/proxy/main.go.
+/proxy_ca_key
+/proxy_ca_key.pub
+/proxy_host_key
+/proxy_host_key.pub
+/proxy_host_key-cert.pub
+/users_authorized_keys
+/enrol_passwords.json
+/revoked_keys
+/friendly_labels
+/last_seen
