@@ -91,28 +91,55 @@ governance.
 The rest of this section is the mechanism. Skip it if you only wanted to know
 what the thing is.
 
+### The pieces, and what talks to what
+
+Three machines, two programs, and six channels between them. Everything the
+proxy serves over HTTP rides the same listener the agents connect to, which is
+bound to loopback and fronted by TLS; the user-facing SSH port is separate and
+does not go through it.
+
 ```mermaid
-flowchart LR
-    subgraph you["your machine"]
-        C["stock ssh client"]
-    end
-    subgraph px["proxy — public IP, exactly 2 listeners"]
-        U[":22 users"]
-        A[":2223 agents"]
-        R[("registry<br/>label to conn")]
-    end
-    subgraph tgt["target — behind NAT, zero open ports"]
-        AG["agent"]
-        E["embedded SSH server<br/>+ PTY"]
+flowchart TB
+    subgraph ws["your workstation — nothing installed"]
+        SSH["stock ssh"]
+        DEP["deploy/ scripts"]
     end
 
-    C -->|"1 - dials in"| U
-    AG -->|"2 - dials OUT, held open"| A
-    U --- R
-    A --- R
-    U -.->|"3 - tunnel channel over (2)"| AG
-    AG --> E
+    subgraph host["proxy host — the only public IP"]
+        RP["TLS reverse proxy<br/>(Caddy, or none)"]
+        P["<b>multissh-proxy</b><br/>· user SSH listener<br/>· agent WebSocket listener<br/>· HTTP: installers, /dist, /enroll<br/>· certificate authority<br/>· registry: label → live connection"]
+    end
+
+    subgraph tgt["target — zero open ports"]
+        AG["<b>multissh-agent</b>"]
+        EM["embedded SSH server<br/>PTY · exec · sftp"]
+    end
+
+    SSH -->|"① ssh -J proxy you@target"| P
+    AG ==>|"② wss://…/agent<br/>dialled OUT, held open"| RP
+    AG -->|"③ POST /enroll, once at install"| RP
+    RP --> P
+    P -.->|"④ tunnel channel, opened back down ②"| AG
+    AG --> EM
+    DEP -->|"⑤ ssh: deploy the proxy"| host
+    DEP -.->|"⑥ ssh -J + sftp: push a new agent binary"| AG
 ```
+
+| | Direction | Carries | When |
+|---|---|---|---|
+| ① | you → proxy | your SSH session; the proxy sees a `direct-tcpip` naming the target | every connection |
+| ② | agent → proxy | registration, then tunnels. WebSocket, so it looks like HTTPS | always, re-dialled after a drop |
+| ③ | agent → proxy | enrolment: the target gets an identity certificate signed by the CA | once, at install |
+| ④ | proxy → agent | a new channel *inside* ②, spliced onto ① | per connection |
+| ⑤ | you → proxy host | the proxy binary and the agent builds it serves | when you deploy |
+| ⑥ | you → agent | a new agent binary, end-to-end through ① and ④ | when you update |
+
+Note which arrows never exist: nothing ever dials the target, and the proxy
+never dials anything at all. ⑥ is worth a second look — an update travels to the
+target through the tunnel the target itself opened, encrypted to its host key,
+so the proxy relays bytes it cannot alter.
+
+### Why the label is not an address
 
 The trick is that `ssh -J proxy user@laptop` makes your client send the proxy a
 `direct-tcpip` request naming `laptop` — **verbatim, without resolving it**. So
