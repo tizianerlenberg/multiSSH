@@ -108,7 +108,9 @@ read -r answer </dev/tty || answer=
 case "$answer" in y|Y|yes) ;; *) echo "nothing changed."; exit 0 ;; esac
 
 # One session for everything, with a terminal so sudo may ask for a password.
-# Run as the service account: -forget rewrites the ledger and the last-seen
+# Run as the service account (through runuser, so a sudoers entry that only
+# covers root is enough), which is also the only one allowed into its
+# state directory: -forget rewrites the ledger and the last-seen
 # file, and written as root they would no longer be readable by the proxy.
 # shellcheck disable=SC2086 # $chosen is a validated, space-separated list
-$SSH -t "$ADMIN" "cd '$STATE_DIR' && for n in $chosen; do echo \"== \$n\"; sudo -u '$RUNAS' '$BIN' -forget \"\$n\" | grep -v -e 'reload the proxy' -e 'systemctl reload' -e '^\$' || true; done && sudo systemctl reload '$SERVICE' && echo && echo 'reloaded $SERVICE'"
+$SSH -t "$ADMIN" "for n in $chosen; do echo \"== \$n\"; sudo runuser -u '$RUNAS' -- sh -c 'cd \"\$1\" && exec \"\$2\" -forget \"\$3\"' _ '$STATE_DIR' '$BIN' \"\$n\" | grep -v -e 'reload the proxy' -e 'systemctl reload' -e '^\$' || true; done && sudo systemctl reload '$SERVICE' && echo && echo 'reloaded $SERVICE'"
