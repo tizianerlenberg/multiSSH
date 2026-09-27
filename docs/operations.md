@@ -226,6 +226,25 @@ no fingerprints. It shares a public hostname with the installer, and which
 machines exist is itself worth something to an attacker. Names live in the
 authenticated listing.
 
+### Clearing out machines that are gone
+
+An uninstalled agent stays in the listing as not connected until the proxy is
+told to forget it. `deploy/forget.sh` walks every target that is not connected
+right now and asks about each one — Enter forgets, `s` skips, `q` stops:
+
+```bash
+sh deploy/forget.sh multissh server@vps            # every target not connected
+sh deploy/forget.sh multissh server@vps --stale    # only those past -stale-after
+```
+
+The first argument is how you reach the proxy's ssh listener, for the listing;
+the second is a login with sudo on the machine the proxy runs on. Nothing
+changes until the whole list has been answered and the choice confirmed once
+more; then every chosen name goes through `multissh-proxy -forget` as the
+service account, in one ssh session, followed by a single reload. Connected
+targets are never offered, and forgetting revokes nothing: a machine that comes
+back simply shows up again.
+
 ## Standby proxies
 
 Verifying a certificate needs only the authority's public key; issuing one
