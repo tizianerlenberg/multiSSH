@@ -414,6 +414,19 @@ func managePasswords(path, add, remove string, list bool, validity time.Duration
 		if len(secret) < 8 {
 			return fmt.Errorf("use at least 8 characters")
 		}
+		// Typed blind, and only its hash is kept, so a typo would otherwise
+		// only show up when the first machine fails to enrol. Asked twice when
+		// it comes from the terminal; a password from the environment was not
+		// typed and needs no second look.
+		if os.Getenv("MULTISSH_NEW_PASSWORD") == "" {
+			again, err := readSecret("repeat enrollment password for " + add + ": ")
+			if err != nil {
+				return err
+			}
+			if again != secret {
+				return fmt.Errorf("the two entries differ; nothing was created")
+			}
+		}
 		p, err := newPassword(add, secret, validity)
 		if err != nil {
 			return err
