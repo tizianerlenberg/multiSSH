@@ -56,7 +56,8 @@ workstation sweep for anything you want to keep out of the proxy's reach.
 Either way, updates are **operator-driven** — nothing is pushed on its own, and
 the agent has no self-update path.
 
-It asks two things — the machine's name, defaulting to the hostname, and the
+It asks two things — the machine's name, defaulting to `ms-` and the hostname
+(so it never shadows the machine's ordinary ssh name), and the
 enrollment password — shows every path it will touch, and takes one
 confirmation. Answering `c` walks each setting. Scope follows reality: root
 installs system-wide, anyone else installs for themselves.

@@ -518,6 +518,11 @@ fi
 
 DEFAULT_NAME=$(hostname 2>/dev/null || echo machine)
 DEFAULT_NAME=$(echo "$DEFAULT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/\..*//; s/[^a-z0-9-]/-/g')
+# Prefixed, so the friendly name never shadows the machine's own hostname: a
+# `Host laptop` in ~/.ssh/config for the ordinary route and the multiSSH name
+# "laptop" would otherwise be the same word for two different ways in. The
+# hostname part is cut to fit the 63-character label limit.
+case "$DEFAULT_NAME" in ms-*) ;; *) DEFAULT_NAME="ms-$(printf '%s' "$DEFAULT_NAME" | cut -c1-60)" ;; esac
 ask NAME "name for this machine" "${MULTISSH_NAME:-$DEFAULT_NAME}"
 PROXY_LIST=${MULTISSH_PROXY:-$PROXIES}
 

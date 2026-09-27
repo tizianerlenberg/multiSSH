@@ -580,6 +580,11 @@ if ($existing -and -not $Reenroll) {
 
 if (-not $Name) {
     $default = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9-]', '-'
+    # Prefixed, as on Linux and macOS, so the friendly name never shadows the
+    # machine's own hostname in the user's ssh config. Cut to the label limit.
+    if (-not $default.StartsWith('ms-')) {
+        $default = 'ms-' + $default.Substring(0, [Math]::Min(60, $default.Length))
+    }
 
     # When the other scope is already installed on this machine, steer the
     # default name away from the one it holds. Two agents can both ask for a
