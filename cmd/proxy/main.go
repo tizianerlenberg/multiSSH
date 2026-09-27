@@ -357,6 +357,8 @@ func main() {
 		// deliberately here rather than one a proxy upgrade makes for you.
 		maxUsers  = flag.Int("max-user-connections", 64, "connections in flight on the user listener; 0 is unlimited")
 		maxAgents = flag.Int("max-agent-connections", 2048, "connections in flight on the agent listener; 0 is unlimited")
+		// 0 sizes it from the memory available at start; see enrolSlots.
+		enrolConc = flag.Int("enrol-concurrency", 0, "enrolment password checks run at once, 64 MiB each; 0 fits them to available memory")
 		minProto  = flag.Int("min-agent-protocol", sshx.LegacyProtocol, "refuse agents older than this protocol version")
 		// Only these peers' X-Forwarded-For is believed. The default matches
 		// the documented deployment -- a reverse proxy on loopback -- so an
@@ -713,6 +715,8 @@ func main() {
 			if len(pws) == 0 {
 				log.Printf("no enrolment passwords yet; create one with -add-password")
 			}
+			argonSlots = make(chan struct{}, enrolSlots(*enrolConc))
+			log.Printf("enrolment checks at most %d at once", cap(argonSlots))
 			hashes, version := dist.snapshot()
 			log.Printf("installer at %s/install.sh, %d build(s), version %s", *publicURL, len(hashes), version)
 			extra = &httpExtras{

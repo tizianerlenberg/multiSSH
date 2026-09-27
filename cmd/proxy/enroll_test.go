@@ -281,3 +281,12 @@ func TestAddPasswordRejectsDuplicateNameBeforePrompting(t *testing.T) {
 		t.Errorf("the error does not say how to fix it: %q", err)
 	}
 }
+
+func TestEnrolSlotsStayBounded(t *testing.T) {
+	if got := enrolSlots(2); got != 2 {
+		t.Fatalf("explicit value ignored: got %d", got)
+	}
+	if got := enrolSlots(0); got < 1 || got > argonParallelism {
+		t.Fatalf("automatic value out of range: got %d", got)
+	}
+}

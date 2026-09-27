@@ -40,13 +40,49 @@ const (
 	argonThreads = 4
 	argonKeyLen  = 32
 
-	// argonParallelism caps concurrent verifications so peak memory from them
-	// is bounded (this many times argonMemory) regardless of request volume.
+	// argonParallelism is the most verifications ever run at once, so peak
+	// memory from them is bounded (this many times argonMemory) regardless of
+	// request volume. A small machine gets fewer; see enrolSlots.
 	argonParallelism = 4
 )
 
 // argonSlots bounds concurrent argon2id work across every enrolment request.
+// main replaces it once the flags are read.
 var argonSlots = make(chan struct{}, argonParallelism)
+
+// enrolSlots picks how many verifications may run at once. An explicit value
+// wins. Otherwise it is what fits in half the memory available at start, at
+// least one and at most argonParallelism: four at 64 MiB each is a quarter of
+// a gigabyte, which on a small VPS without swap is enough for the kernel to
+// kill the proxy -- and every agent connection with it -- during an ordinary
+// rollout, let alone a deliberate burst.
+func enrolSlots(explicit int) int {
+	if explicit > 0 {
+		return explicit
+	}
+	avail, ok := memAvailable()
+	if !ok {
+		return argonParallelism
+	}
+	n := int(avail / 2 / (argonMemory * 1024))
+	return max(1, min(argonParallelism, n))
+}
+
+// memAvailable reads MemAvailable from /proc/meminfo, in bytes. Elsewhere it
+// reports nothing and the caller keeps its default.
+func memAvailable() (uint64, bool) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		var kb uint64
+		if _, err := fmt.Sscanf(line, "MemAvailable: %d kB", &kb); err == nil {
+			return kb * 1024, true
+		}
+	}
+	return 0, false
+}
 
 // password is one enrolment credential. Stored hashed, with an expiry.
 type password struct {

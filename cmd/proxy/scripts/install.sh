@@ -570,7 +570,9 @@ REQ=$(printf '{"password":"%s","name":"%s","identity_key":"%s","host_key":"%s","
     "$VERSION" "$PLATFORM")
 
 echo "enrolling..."
-RESP=$(printf '%s' "$REQ" | curl -fsSL -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE_URL/enroll") \
+# --retry covers the proxy shedding load (503 while its password checks are
+# all busy); the request body is read once, so it can be sent again.
+RESP=$(printf '%s' "$REQ" | curl -fsSL --retry 4 --retry-delay 5 -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE_URL/enroll") \
     || die "enrolment refused (wrong or expired password?)"
 
 field() { printf '%s' "$RESP" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" | head -1; }
