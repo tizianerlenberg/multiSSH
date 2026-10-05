@@ -67,6 +67,17 @@ b64() { base64 | tr -d '\n'; }
 
 listing() { run_bounded 30 $SSH $SSHOPTS "$PROXY" 2>/dev/null | tr -d '\r' || true; }
 
+# The agent runs every command in a pseudo-terminal. On Linux that only adds
+# \r; Windows' ConPTY also opens with terminal setup sequences and a window
+# title, glued to the first line of output. Unstripped, that line no longer
+# starts with "#" and was taken for an unknown key and put up for removal.
+# ESC and BEL are made with printf so the sed stays POSIX (no \x1b in BSD sed).
+ESC=$(printf '\033'); BEL=$(printf '\007')
+strip_pty() {
+    tr -d '\r' | sed -e "s/${ESC}][^${BEL}]*${BEL}//g" \
+                      -e "s/${ESC}\[[0-9;?]*[a-zA-Z]//g"
+}
+
 # targets extracts "<canonical> <platform>" from the ONLINE section only, the
 # same parse update-agents.sh uses so the two agree on what is reachable.
 targets() {
@@ -174,7 +185,10 @@ fingerprint() { # fingerprint "type blob"
 
 ask() { # ask PROMPT ; yes -> 0
     if [ -n "$ASSUME_YES" ]; then return 0; fi
-    { : >/dev/tty; } 2>/dev/null || return 1   # no terminal -> no
+    # In a subshell: a failed redirection on ":" (a special built-in) makes a
+    # POSIX shell exit outright, which killed the whole sweep with status 2
+    # whenever there was a question and no terminal to ask it on.
+    ( : >/dev/tty ) 2>/dev/null || return 1   # no terminal -> no
     printf '%s [y/N]: ' "$1" > /dev/tty
     read -r _a < /dev/tty || _a=
     case "$_a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
@@ -225,7 +239,7 @@ for line in $ALL_TARGETS; do
 
     if ! run_bounded "$CMD_TIMEOUT" \
             $SSH $SSHOPTS -J "$PROXY" -o StrictHostKeyChecking=accept-new \
-            "authorize@$name" "$(read_command "$platform")" 2>/dev/null | tr -d '\r' > "$WORK/current"; then
+            "authorize@$name" "$(read_command "$platform")" 2>/dev/null | strip_pty > "$WORK/current"; then
         echo "    could not read the current keys; skipped" >&2
         FAILED="$FAILED $name"; continue
     fi

@@ -39,6 +39,9 @@ if [ -z "$is_jump" ]; then
     printf ' multiSSH proxy\n\n ONLINE (1)\n\n   laptop  laptop.aaaaaaaaaaaa  linux  v1 current\n'
     exit 0
 fi
+# MULTISSH_SHIM_CONPTY prints what Windows' ConPTY puts in front of every
+# command's output: setup sequences and a window title, no newline after.
+[ -n "${MULTISSH_SHIM_CONPTY:-}" ] && printf '\033[?9001h\033[?1004h\033[?25l\033[2J\033[m\033[H\033]0;Administrator: powershell.exe\007\033[?25h'
 MULTISSH_AGENT_DIRS='` + agentDir + `' sh -c "$cmd"
 `
 	if err := os.WriteFile(path, []byte(shim), 0o755); err != nil {
@@ -238,5 +241,44 @@ func TestAuthorizeOnlyTouchesNamedTargets(t *testing.T) {
 		if added := strings.Contains(string(got), "AAAAtwokeyBBBB"); added != tc.want {
 			t.Errorf("names %v: key added = %v, want %v\n%s", tc.names, added, tc.want, out)
 		}
+	}
+}
+
+// Windows' ConPTY glues terminal setup sequences and a window title onto the
+// first line of output. That must not be read as a key: a target whose keys
+// already match is left alone instead of being "updated" to drop the noise.
+func TestAuthorizeIgnoresConPTYNoise(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "state")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keyA := "ssh-ed25519 AAAAonekeyAAAA alice@laptop"
+	authFile := filepath.Join(agentDir, "agent_authorized_keys")
+	before := "# login keys\n" + keyA + "\n"
+	if err := os.WriteFile(authFile, []byte(before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keysFile := filepath.Join(dir, "want")
+	if err := os.WriteFile(keysFile, []byte(keyA+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(dir, "ssh")
+	writeSSHShim(t, shim, agentDir)
+	t.Setenv("MULTISSH_SHIM_CONPTY", "1")
+
+	out := runAuthorize(t, shim, keysFile, agentDir)
+	if !strings.Contains(out, "already matches") {
+		t.Errorf("terminal noise was taken for a key:\n%s", out)
+	}
+	got, err := os.ReadFile(authFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != before {
+		t.Errorf("file was rewritten:\n%q", got)
 	}
 }
