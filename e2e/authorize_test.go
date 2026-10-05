@@ -27,7 +27,12 @@ func writeSSHShim(t *testing.T, path, agentDir string) {
 is_jump=
 cmd=
 for a in "$@"; do
-    case "$a" in -J) is_jump=1 ;; esac
+    case "$a" in
+        -J) is_jump=1 ;;
+        # Like the real client: options glued into one word are refused, which
+        # is how an unsplit $SSHOPTS shows up.
+        -*' '*) echo "unknown option -- ' '" >&2; exit 255 ;;
+    esac
     cmd=$a   # the last argument is the remote command on a jump
 done
 if [ -z "$is_jump" ]; then
@@ -50,9 +55,10 @@ func repoFile(t *testing.T, rel string) string {
 	return filepath.Join(wd, "..", rel)
 }
 
-func runAuthorize(t *testing.T, shim, keysFile, agentDir string) string {
+func runAuthorize(t *testing.T, shim, keysFile, agentDir string, names ...string) string {
 	t.Helper()
-	cmd := exec.Command("sh", repoFile(t, "deploy/authorize.sh"), "proxy", keysFile, "--yes")
+	args := append([]string{repoFile(t, "deploy/authorize.sh"), "proxy", keysFile}, names...)
+	cmd := exec.Command("sh", append(args, "--yes")...)
 	cmd.Env = append(os.Environ(),
 		"MULTISSH_SSH="+shim,
 		"MULTISSH_YES=1",
@@ -188,5 +194,49 @@ func TestAuthorizeRefusesToEmptyTheKeys(t *testing.T) {
 	got, _ := os.ReadFile(authFile)
 	if !strings.Contains(string(got), "AAAAonekeyAAAA") {
 		t.Errorf("the target's keys were altered despite the refusal:\n%s", got)
+	}
+}
+
+// Naming targets narrows the sweep: a matching name (canonical or the short
+// label) is updated, a name that matches nothing leaves every target alone.
+func TestAuthorizeOnlyTouchesNamedTargets(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	for _, tc := range []struct {
+		names []string
+		want  bool
+	}{
+		{[]string{"laptop"}, true},
+		{[]string{"laptop.aaaaaaaaaaaa"}, true},
+		{[]string{"desktop", "laptop"}, true},
+		{[]string{"desktop"}, false},
+	} {
+		dir := t.TempDir()
+		agentDir := filepath.Join(dir, "state")
+		if err := os.MkdirAll(agentDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		keyA := "ssh-ed25519 AAAAonekeyAAAA alice@laptop"
+		keyB := "ssh-ed25519 AAAAtwokeyBBBB bob@desktop"
+		authFile := filepath.Join(agentDir, "agent_authorized_keys")
+		if err := os.WriteFile(authFile, []byte(keyA+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		keysFile := filepath.Join(dir, "want")
+		if err := os.WriteFile(keysFile, []byte(keyA+"\n"+keyB+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		shim := filepath.Join(dir, "ssh")
+		writeSSHShim(t, shim, agentDir)
+
+		out := runAuthorize(t, shim, keysFile, agentDir, tc.names...)
+		got, err := os.ReadFile(authFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if added := strings.Contains(string(got), "AAAAtwokeyBBBB"); added != tc.want {
+			t.Errorf("names %v: key added = %v, want %v\n%s", tc.names, added, tc.want, out)
+		}
 	}
 }

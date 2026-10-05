@@ -206,8 +206,9 @@ for line in $ALL_TARGETS; do
     # shellcheck disable=SC2086
     set -- $line
     name=$1; platform=${2:-unknown}
-    IFS='
-'
+    # The body runs with the ordinary IFS: $SSH $SSHOPTS and $NAMES must split
+    # on spaces. The loop's word list was expanded once, up front, so it does
+    # not care what IFS is from here on.
     matches "$name" || continue
 
     if [ "$(date +%s)" -ge "$DEADLINE" ]; then
